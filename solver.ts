@@ -35,9 +35,9 @@ const PROMPT = `Ты решаешь школьные задания (10 клас
 4. Решай задание полностью. Перед отправкой про себя проверь каждое вычисление и ответ (подставь ответ в условие, проверь единицы). В ответ пиши только верное решение.
 5. В задачах минимум слов и все нужные вычисления. Каждое преобразование с новой строки. Не пропускай действия, без которых непонятно, откуда взялось число.
 
-Формат для каждого задания. Первая строка: номер задания, если он виден на фото. Дальше решение по шагам: «Дано» и «Найти» коротко, если это задача, потом вычисления, каждое с новой строки. Последняя строка: «Ответ: ...» с единицами измерения. В тесте укажи номер или букву варианта.
+Формат для каждого задания. Первая строка: заголовок, какое это задание: «Вариант 1 · №3». Если вариантов нет, просто «№3». Если номера нет, «Задание 1». Дальше решение по шагам: «Дано» и «Найти» коротко, если это задача, потом вычисления, каждое с новой строки. Последняя строка: «Ответ: ...» с единицами измерения. В тесте укажи номер или букву варианта.
 
-Реши ВСЕ задания, которые видно на фото, и все варианты (вариант 1, вариант 2 и так далее), ничего не пропускай. Решай по порядку, перед каждым вариантом пиши строку «Вариант N», задания разделяй пустой строкой. Если часть условия не читается, ничего не выдумывай: реши то, что видно, и в конце напиши «Не видно: ... Пересними ближе.». Если на фото нет задания, ответь одной строкой: «Не разобрал фото. Пересними ближе.». Если пришёл текстовый вопрос, ответь по тем же правилам. Учитывай прошлые сообщения этого чата: если просят объяснить шаг, решить задание с прошлого фото или пишут «дальше», продолжай с того места, где остановился.
+Реши ВСЕ задания, которые видно на фото, и все варианты (вариант 1, вариант 2 и так далее), ничего не пропускай. Решай по порядку. Между заданиями ставь отдельную строку @@@ (по ней каждое задание уйдёт отдельным сообщением), после последнего задания @@@ не ставь. Если часть условия не читается, ничего не выдумывай: реши то, что видно, и в конце напиши «Не видно: ... Пересними ближе.». Если на фото нет задания, ответь одной строкой: «Не разобрал фото. Пересними ближе.». Если пришёл текстовый вопрос, ответь по тем же правилам. Учитывай прошлые сообщения этого чата: если просят объяснить шаг, решить задание с прошлого фото или пишут «дальше», продолжай с того места, где остановился.
 
 Рисунки. К каждой задаче по геометрии (и планиметрия, и стереометрия) рисунок нужен обязательно. Ещё рисуй, если помогает картинка (график функции, схема по физике, структурная формула в химии) или тебя просят нарисовать. Рисунок ставь сразу после решения своей задачи: блок от <svg до </svg>. Про сам рисунок в тексте не пиши.
 Стиль ВСЕХ рисунков (геометрия, графики, физика, химия) один и тот же, как в учебнике, тёмная тема:
@@ -273,7 +273,13 @@ function claudeError(status: number, msg: string, retryAfter: string | null = "1
 }
 
 // Ответ идёт потоком: если время кончается, отдаём то, что успело написаться
-async function askClaude(messages: unknown[], until: number, effort = EFFORT): Promise<string> {
+// onChunk получает каждое готовое задание сразу, как только модель его дописала (разделитель @@@)
+async function askClaude(
+  messages: unknown[],
+  until: number,
+  onChunk?: (t: string) => Promise<void>,
+  effort = EFFORT,
+): Promise<string> {
   const body: any = { model: MODEL, max_tokens: 64000, system: PROMPT, messages, stream: true };
   if (effort) body.output_config = { effort };
   const ctrl = new AbortController();
@@ -299,11 +305,12 @@ async function askClaude(messages: unknown[], until: number, effort = EFFORT): P
       const msg = String(j?.error?.message ?? "");
       if (r.status === 400 && effort && /output_config|effort/i.test(msg)) {
         clearTimeout(timer);
-        return askClaude(messages, until, ""); // модель не знает effort
+        return askClaude(messages, until, onChunk, ""); // модель не знает effort
       }
       throw new Error(claudeError(r.status, msg, r.headers.get("retry-after")));
     }
-    let text = "", stop = "", buf = "";
+    let text = "", stop = "", buf = "", pending = "", sentAny = false;
+    const SPLIT = /(?:^|\n)\s*@@@[^\n]*\n/;
     try {
       const reader = r.body!.pipeThrough(new TextDecoderStream()).getReader();
       ctrl.signal.addEventListener("abort", () => reader.cancel().catch(() => {}));
@@ -322,8 +329,20 @@ async function askClaude(messages: unknown[], until: number, effort = EFFORT): P
           } catch {
             continue;
           }
-          if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") text += ev.delta.text;
-          else if (ev.type === "message_delta" && ev.delta?.stop_reason) stop = ev.delta.stop_reason;
+          if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+            text += ev.delta.text;
+            if (!onChunk) continue;
+            pending += ev.delta.text;
+            let m;
+            while ((m = pending.match(SPLIT))) {
+              const chunk = pending.slice(0, m.index);
+              pending = pending.slice(m.index! + m[0].length);
+              if (chunk.trim()) {
+                await onChunk(chunk);
+                sentAny = true;
+              }
+            }
+          } else if (ev.type === "message_delta" && ev.delta?.stop_reason) stop = ev.delta.stop_reason;
           else if (ev.type === "error") {
             throw new Error(claudeError(ev.error?.type === "overloaded_error" ? 529 : 500, String(ev.error?.message ?? "")));
           }
@@ -337,13 +356,14 @@ async function askClaude(messages: unknown[], until: number, effort = EFFORT): P
       if (!text.trim()) throw timeout();
       stop = "cut";
     }
-    text = text.trim();
-    if (stop === "refusal") return "Модель не стала это решать. Пересними задание.";
-    if (!text) {
+    const rest = (onChunk ? pending : text).replace(/\n\s*@@@\s*$/, "").trim();
+    const cut = stop === "cut" || stop === "max_tokens";
+    if (stop === "refusal" && !sentAny) return "Модель не стала это решать. Пересними задание.";
+    if (!rest && !sentAny) {
       return stop === "max_tokens" ? "Задание слишком длинное. Сфоткай одно задание." : "Пустой ответ. Пришли фото ещё раз.";
     }
-    if (stop === "cut" || stop === "max_tokens") return `${text}\n\n(не успел дописать, напиши «дальше»)`;
-    return text;
+    if (cut) return `${rest}\n\n(не успел дописать, напиши «дальше»)`.trim();
+    return rest;
   } finally {
     clearTimeout(timer);
   }
@@ -356,17 +376,22 @@ const NUDGE = new Set(["videoMessage", "audioMessage", "documentMessage", "stick
 async function solve(chatId: string, content: unknown[], origin: string, end: number) {
   const history = await loadHistory(chatId);
   const turns = [...history, { role: "user", content }];
-  const answer = await askClaude(turns, end - 9_000);
-  const svgs = answer.match(/<svg[\s\S]*?<\/svg>/gi) ?? [];
-  const text = prettyMath(answer)
-    .replace(/```[a-z]*\s*(<svg[\s\S]*?<\/svg>)\s*```/gi, "$1")
-    .replace(/<svg[\s\S]*?<\/svg>/gi, "")
-    .replace(/(```[a-z]*\s*)?<svg[\s\S]*$/i, "") // недописанный рисунок
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  await send(chatId, text || "Рисунок ниже 👇", left(end, 2_000));
-  if (svgs.length) await sendDrawings(chatId, svgs, origin, end);
-  await saveHistory(chatId, [...turns, { role: "assistant", content: text || "[рисунок]" }]);
+  const parts: string[] = [];
+  const deliver = async (raw: string) => {
+    const svgs = raw.match(/<svg[\s\S]*?<\/svg>/gi) ?? [];
+    const text = prettyMath(raw)
+      .replace(/```[a-z]*\s*(<svg[\s\S]*?<\/svg>)\s*```/gi, "$1")
+      .replace(/<svg[\s\S]*?<\/svg>/gi, "")
+      .replace(/(```[a-z]*\s*)?<svg[\s\S]*$/i, "") // недописанный рисунок
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    if (text) await send(chatId, text, left(end, 2_000));
+    if (svgs.length) await sendDrawings(chatId, svgs, origin, end);
+    parts.push(text || "[рисунок]");
+  };
+  const rest = await askClaude(turns, end - 9_000, deliver);
+  if (rest) await deliver(rest);
+  await saveHistory(chatId, [...turns, { role: "assistant", content: parts.join("\n\n") || "…" }]);
 }
 
 // GREEN-API ждёт ответ 180 с, потом шлёт то же сообщение ещё раз: повторы пропускаем
