@@ -9,6 +9,7 @@ const GREEN_ID = env("GREEN_ID").replace(/\D/g, "");
 const GREEN_TOKEN = env("GREEN_TOKEN");
 const MODEL = env("MODEL", "claude-opus-5-5");
 const EFFORT = env("EFFORT", "medium");
+let FAST = env("FAST") === "1"; // быстрый режим Opus: ответ пишется до 2,5 раза быстрее, но дороже
 const LIMIT = (Number(env("LIMIT", "57")) || 57) * 1000; // Val Town Free обрывает запрос на 60 с, на Pro можно 590
 
 // Секрет для вебхука: выводится из GREEN_TOKEN, но сам токен не раскрывает
@@ -282,6 +283,7 @@ async function askClaude(
 ): Promise<string> {
   const body: any = { model: MODEL, max_tokens: 64000, system: PROMPT, messages, stream: true };
   if (effort) body.output_config = { effort };
+  if (FAST) body.speed = "fast";
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), left(until, 3_000));
   const timeout = () => new DOMException("время вышло", "TimeoutError");
@@ -290,7 +292,12 @@ async function askClaude(
     try {
       r = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        headers: { "x-api-key": CLAUDE_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        headers: {
+          "x-api-key": CLAUDE_KEY,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+          ...(FAST ? { "anthropic-beta": "fast-mode-2026-02-01" } : {}),
+        },
         body: JSON.stringify(body),
         signal: ctrl.signal,
       });
@@ -306,6 +313,11 @@ async function askClaude(
       if (r.status === 400 && effort && /output_config|effort/i.test(msg)) {
         clearTimeout(timer);
         return askClaude(messages, until, onChunk, ""); // модель не знает effort
+      }
+      if (FAST && r.status === 400 && /speed|fast/i.test(msg)) {
+        clearTimeout(timer);
+        FAST = false; // быстрый режим недоступен: дальше работаем обычным
+        return askClaude(messages, until, onChunk, effort);
       }
       throw new Error(claudeError(r.status, msg, r.headers.get("retry-after")));
     }
