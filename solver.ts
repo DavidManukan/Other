@@ -1,0 +1,188 @@
+// Solver: фото задания в WhatsApp -> Claude -> ответ обратно в WhatsApp.
+// Val Town, HTTP val. Ключи сюда НЕ писать: они живут в Environment variables.
+
+const env = (k: string, d = "") => (Deno.env.get(k) ?? d).trim();
+const CLAUDE_KEY = env("ANTHROPIC_API_KEY");
+const GREEN_URL = env("GREEN_URL").replace(/\/+$/, "");
+const GREEN_ID = env("GREEN_ID").replace(/\D/g, "");
+const GREEN_TOKEN = env("GREEN_TOKEN");
+const MODEL = env("MODEL", "claude-sonnet-5-5");
+const EFFORT = env("EFFORT", "medium");
+
+const PROMPT = `Ты решаешь школьные задания (10 класс) по фото. Фото сделано камерой очков, поэтому оно может быть под углом, с бликами или мелким шрифтом. Внимательно прочитай условие и реши задание только школьными методами.
+
+Ответ читают на маленьком экране очков. Пиши по-русски обычным текстом, как SMS. Не используй Markdown (звёздочки, решётки, таблицы) и LaTeX (знаки $, \\frac, \\sqrt). Формулы пиши обычными символами: x², x³, √, ·, /, ±, ≈, ≠, ≤, ≥, π, °, Δ. Индексы пиши так: v0, H2O.
+
+Формат для каждого задания. Первая строка: номер задания, если он виден на фото. Дальше короткое решение из 2–6 шагов, каждый шаг с новой строки и начинается с «1)», «2)» и так далее. Одна мысль на строку, без вступлений и без пересказа условия. Последняя строка: «Ответ: ...» с единицами измерения. В тесте укажи номер или букву варианта.
+
+Если заданий несколько, решай по порядку и разделяй их пустой строкой. Если часть условия не читается, ничего не выдумывай: реши то, что видно, и последней строкой напиши «Не видно: ... Пересними ближе.». Если на фото нет задания, ответь одной строкой: «Не разобрал фото. Пересними ближе.». Если пришёл текстовый вопрос, ответь так же коротко.`;
+
+// ---------- GREEN-API (WhatsApp бота) ----------
+async function green(method: string, body?: unknown): Promise<any> {
+  const r = await fetch(`${GREEN_URL}/waInstance${GREEN_ID}/${method}/${GREEN_TOKEN}`, {
+    method: body === undefined ? "GET" : "POST",
+    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const t = await r.text();
+  if (!r.ok) throw new Error(`GREEN-API ${method}: ${r.status} ${t.slice(0, 150)}`);
+  try {
+    return JSON.parse(t);
+  } catch {
+    return t;
+  }
+}
+
+const send = (chatId: string, message: string) => green("sendMessage", { chatId, message, linkPreview: false });
+
+async function getPhoto(chatId: string, idMessage: string, url?: string): Promise<Uint8Array> {
+  const load = async (u: string) => {
+    const r = await fetch(u, { signal: AbortSignal.timeout(10_000) });
+    if (!r.ok) throw new Error(`фото не скачалось: ${r.status}`);
+    return new Uint8Array(await r.arrayBuffer());
+  };
+  if (url) {
+    try {
+      return await load(url);
+    } catch (e) {
+      console.log("downloadUrl не сработал, пробую downloadFile", e);
+    }
+  }
+  const j = await green("downloadFile", { chatId, idMessage });
+  if (!j?.downloadUrl) throw new Error("GREEN-API не дал ссылку на фото");
+  return await load(j.downloadUrl);
+}
+
+function imageType(b: Uint8Array): string | null {
+  if (b[0] === 0xff && b[1] === 0xd8) return "image/jpeg";
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png";
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return "image/gif";
+  if (b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "image/webp";
+  return null;
+}
+
+function base64(b: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode(...b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+// ---------- Claude ----------
+function claudeError(status: number, msg: string): string {
+  if (status === 401) return "Неверный ключ Claude. Проверь ANTHROPIC_API_KEY.";
+  if (status === 404) return `Нет модели ${MODEL}. Исправь MODEL.`;
+  if (/credit|balance/i.test(msg)) return "На балансе Claude кончились деньги.";
+  if (status === 429 || status >= 500) return "Claude занят. Пришли ещё раз через минуту.";
+  return `Ошибка Claude ${status}: ${msg.slice(0, 120)}`;
+}
+
+async function askClaude(content: unknown[], effort = EFFORT): Promise<string> {
+  const body: any = { model: MODEL, max_tokens: 8000, system: PROMPT, messages: [{ role: "user", content }] };
+  if (effort) body.output_config = { effort };
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": CLAUDE_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(42_000),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = String(j?.error?.message ?? "");
+    if (r.status === 400 && effort && /output_config|effort/i.test(msg)) return askClaude(content, ""); // модель не знает effort
+    throw new Error(claudeError(r.status, msg));
+  }
+  if (j.stop_reason === "refusal") return "Модель не стала это решать. Пересними задание.";
+  const text = (j.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n").trim();
+  if (!text) return "Пустой ответ. Пришли фото ещё раз.";
+  return j.stop_reason === "max_tokens" ? `${text}\n(ответ обрезан)` : text;
+}
+
+// ---------- сообщение из WhatsApp ----------
+async function handle(h: any) {
+  if (h?.typeWebhook !== "incomingMessageReceived") return;
+  const chatId = String(h.senderData?.chatId ?? "");
+  if (!/@(c\.us|lid)$/.test(chatId)) return; // группы, статусы и каналы пропускаем
+  const md = h.messageData ?? {};
+  const type = String(md.typeMessage ?? "");
+  try {
+    if (type === "imageMessage") {
+      const fd = md.fileMessageData ?? {};
+      const bytes = await getPhoto(chatId, String(h.idMessage ?? ""), fd.downloadUrl);
+      const media_type = imageType(bytes);
+      if (!media_type) return await send(chatId, "Не понял формат фото. Пришли обычное фото.");
+      const caption = String(fd.caption ?? "").trim();
+      await send(chatId, await askClaude([
+        { type: "image", source: { type: "base64", media_type, data: base64(bytes) } },
+        { type: "text", text: caption ? `Реши задания на фото. Подпись: ${caption}` : "Реши задания на фото." },
+      ]));
+    } else if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
+      const text = String(md.textMessageData?.textMessage ?? md.extendedTextMessageData?.text ?? "").trim();
+      if (!text) return;
+      if (/^(ping|пинг)$/i.test(text)) return await send(chatId, `pong ✅ модель ${MODEL}`);
+      await send(chatId, await askClaude([{ type: "text", text }]));
+    } else {
+      await send(chatId, "Пришли фото задания.");
+    }
+  } catch (e: any) {
+    console.log(e);
+    const why = e?.name === "TimeoutError" ? "Не успел решить. Пришли фото ещё раз (лучше одно задание)." : String(e?.message ?? e);
+    await send(chatId, `⚠️ ${why}`).catch(console.log);
+  }
+}
+
+// ---------- страница настройки: открой ссылку вала в Safari ----------
+async function setupPage(url: URL): Promise<Response> {
+  const hook = `${url.origin}/?k=${GREEN_TOKEN}`;
+  const rows: string[] = [];
+  const miss = ["ANTHROPIC_API_KEY", "GREEN_URL", "GREEN_ID", "GREEN_TOKEN"].filter((k) => !env(k));
+  if (miss.length) {
+    rows.push(`❌ Не заполнено: ${miss.join(", ")}`);
+  } else {
+    try {
+      const s = (await green("getStateInstance"))?.stateInstance;
+      rows.push(s === "authorized" ? "✅ WhatsApp бота подключён" : `❌ WhatsApp бота не подключён (${s}). Привяжи номер заново.`);
+    } catch (e: any) {
+      rows.push(`❌ GREEN-API не отвечает: ${e.message}. Проверь GREEN_URL, GREEN_ID, GREEN_TOKEN.`);
+    }
+    try {
+      const s = await green("getSettings");
+      if (s?.webhookUrl === hook && s?.incomingWebhook === "yes" && url.searchParams.get("fix") !== "1") {
+        rows.push("✅ Вебхук настроен");
+      } else {
+        await green("setSettings", {
+          webhookUrl: hook,
+          incomingWebhook: "yes",
+          outgoingWebhook: "no",
+          outgoingMessageWebhook: "no",
+          outgoingAPIMessageWebhook: "no",
+          stateWebhook: "no",
+          incomingCallWebhook: "no",
+        });
+        rows.push("⏳ Вебхук только что настроен. Подожди 5 минут и обнови страницу.");
+      }
+    } catch (e: any) {
+      rows.push(`❌ Не смог настроить вебхук: ${e.message}`);
+    }
+    const r = await fetch(`https://api.anthropic.com/v1/models/${MODEL}`, {
+      headers: { "x-api-key": CLAUDE_KEY, "anthropic-version": "2023-06-01" },
+    }).catch(() => null);
+    const err = r && !r.ok ? String((await r.json().catch(() => ({})))?.error?.message ?? "") : "";
+    rows.push(r?.ok ? `✅ Ключ Claude работает, модель ${MODEL}` : `❌ ${r ? claudeError(r.status, err) : "Claude не отвечает"}`);
+  }
+  const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Solver</title><body style="font:18px/1.5 -apple-system,sans-serif;margin:16px">
+<h2>Solver: проверка</h2>${rows.map((r) => `<p>${r.replace(/</g, "&lt;")}</p>`).join("")}
+<p><a href="?fix=1">Настроить вебхук заново</a></p></body>`;
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+// ---------- вход ----------
+export default async function (req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  if (req.method === "GET") return await setupPage(url);
+  if (!GREEN_TOKEN || url.searchParams.get("k") !== GREEN_TOKEN) return new Response("no");
+  const h = await req.json().catch(() => null);
+  await handle(h); // GREEN-API ждёт ответ до 180 с
+  return new Response("ok"); // всегда 200, иначе GREEN-API пришлёт то же сообщение ещё раз
+}
