@@ -26,9 +26,9 @@ const PROMPT = `Ты решаешь школьные задания (10 клас
 
 Формат для каждого задания. Первая строка: номер задания, если он виден на фото. Дальше короткое решение из 2–6 шагов, каждый шаг с новой строки и начинается с «1)», «2)» и так далее. Одна мысль на строку, без вступлений и без пересказа условия. Последняя строка: «Ответ: ...» с единицами измерения. В тесте укажи номер или букву варианта.
 
-Если заданий несколько, решай по порядку и разделяй их пустой строкой. Если заданий больше трёх, реши первые три и последней строкой напиши «Остальные пришли отдельным фото.». Если часть условия не читается, ничего не выдумывай: реши то, что видно, и последней строкой напиши «Не видно: ... Пересними ближе.». Если на фото нет задания, ответь одной строкой: «Не разобрал фото. Пересними ближе.». Если пришёл текстовый вопрос, ответь так же коротко. Учитывай прошлые сообщения этого чата: если просят объяснить шаг или решить другое задание с прошлого фото, продолжай с ним.
+Реши ВСЕ задания, которые видно на фото, и все варианты (вариант 1, вариант 2 и так далее), ничего не пропускай. Решай по порядку, перед каждым вариантом пиши строку «Вариант N», задания разделяй пустой строкой. Если часть условия не читается, ничего не выдумывай: реши то, что видно, и в конце напиши «Не видно: ... Пересними ближе.». Если на фото нет задания, ответь одной строкой: «Не разобрал фото. Пересними ближе.». Если пришёл текстовый вопрос, ответь так же коротко. Учитывай прошлые сообщения этого чата: если просят объяснить шаг, решить задание с прошлого фото или пишут «дальше», продолжай с того места, где остановился.
 
-Если к заданию полезен рисунок (геометрия, график функции, схема по физике) или тебя просят нарисовать, в самом конце ответа добавь один рисунок в формате SVG: блок от <svg до </svg> с xmlns="http://www.w3.org/2000/svg" и viewBox="0 0 800 600", белый фон, чёрные линии толщиной 3, подписи font-size 28, оси и точки подписаны. Без рисунка, если он не нужен. Про сам рисунок в тексте не пиши.`;
+Рисунки. К каждой задаче по геометрии рисунок нужен обязательно. Ещё рисуй, если помогает картинка (график функции, схема по физике) или тебя просят нарисовать. Рисунок ставь сразу после решения своей задачи: блок от <svg до </svg> с xmlns="http://www.w3.org/2000/svg" и viewBox="0 0 800 600", белый фон, чёрные линии толщиной 3, подписи font-size 28. Подпиши вершины, известные длины и углы, отметь искомое красным, в левом верхнем углу напиши номер задачи. Один рисунок на задачу. Про сам рисунок в тексте не пиши.`;
 
 // ---------- память чата (Val Town Blob) ----------
 const HISTORY_TTL = 2 * 3600_000; // через 2 часа без сообщений чат начинается заново
@@ -90,18 +90,25 @@ function getRenderer() {
 }
 
 // Рисунок кладём в Blob и отдаём по ссылке /?img=..., GREEN-API забирает его сам
-async function sendDrawing(chatId: string, svg: string, origin: string, ms: number) {
-  try {
-    const png = (await getRenderer())(svg);
-    const id = crypto.randomUUID().replace(/-/g, "");
-    await blob.set(`solver_img_${id}`, new Blob([png as Uint8Array<ArrayBuffer>], { type: "image/png" }));
-    await green("sendFileByUrl", { chatId, urlFile: `${origin}/?img=${id}`, fileName: "risunok.png" }, ms);
-    // старые рисунки (старше суток) удаляем
+async function sendDrawings(chatId: string, svgs: string[], origin: string, end: number) {
+  let failed = 0;
+  for (const svg of svgs.slice(0, 8)) {
+    try {
+      const png = (await getRenderer())(svg);
+      const id = crypto.randomUUID().replace(/-/g, "");
+      await blob.set(`solver_img_${id}`, new Blob([png as Uint8Array<ArrayBuffer>], { type: "image/png" }));
+      await green("sendFileByUrl", { chatId, urlFile: `${origin}/?img=${id}`, fileName: "risunok.png" }, left(end, 2_000));
+    } catch (e) {
+      console.log("drawing:", hide(e));
+      failed++;
+    }
+  }
+  if (failed) await send(chatId, `(рисунков не получилось: ${failed})`, 3_000).catch(() => {});
+  try { // старые рисунки (старше суток) удаляем
     const old = (await blob.list("solver_img_")).filter((b) => Date.now() - Date.parse(b.lastModified) > 86_400_000);
     await Promise.all(old.map((b) => blob.delete(b.key)));
   } catch (e) {
-    console.log("drawing:", hide(e));
-    await send(chatId, "(рисунок не получился)", 3_000).catch(() => {});
+    console.log("cleanup:", e);
   }
 }
 
@@ -181,31 +188,81 @@ function claudeError(status: number, msg: string, retryAfter: string | null = "1
   return `Ошибка Claude ${status}: ${msg.slice(0, 120)}`;
 }
 
+// Ответ идёт потоком: если время кончается, отдаём то, что успело написаться
 async function askClaude(messages: unknown[], until: number, effort = EFFORT): Promise<string> {
-  const body: any = { model: MODEL, max_tokens: 8000, system: PROMPT, messages };
+  const body: any = { model: MODEL, max_tokens: 16000, system: PROMPT, messages, stream: true };
   if (effort) body.output_config = { effort };
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "x-api-key": CLAUDE_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(left(until, 3_000)),
-  });
-  const raw = await r.text(); // если время вышло, тут вылетит TimeoutError
-  let j: any = {};
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), left(until, 3_000));
+  const timeout = () => new DOMException("время вышло", "TimeoutError");
   try {
-    j = JSON.parse(raw);
-  } catch { /* не JSON */ }
-  if (!r.ok) {
-    const msg = String(j?.error?.message ?? "");
-    if (r.status === 400 && effort && /output_config|effort/i.test(msg)) return askClaude(messages, until, ""); // модель не знает effort
-    throw new Error(claudeError(r.status, msg, r.headers.get("retry-after")));
+    let r: Response;
+    try {
+      r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": CLAUDE_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      throw ctrl.signal.aborted ? timeout() : e;
+    }
+    if (!r.ok) {
+      let j: any = {};
+      try {
+        j = JSON.parse(await r.text());
+      } catch { /* не JSON */ }
+      const msg = String(j?.error?.message ?? "");
+      if (r.status === 400 && effort && /output_config|effort/i.test(msg)) {
+        clearTimeout(timer);
+        return askClaude(messages, until, ""); // модель не знает effort
+      }
+      throw new Error(claudeError(r.status, msg, r.headers.get("retry-after")));
+    }
+    let text = "", stop = "", buf = "";
+    try {
+      const reader = r.body!.pipeThrough(new TextDecoderStream()).getReader();
+      ctrl.signal.addEventListener("abort", () => reader.cancel().catch(() => {}));
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let i;
+        while ((i = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 1);
+          if (!line.startsWith("data:")) continue;
+          let ev: any;
+          try {
+            ev = JSON.parse(line.slice(5));
+          } catch {
+            continue;
+          }
+          if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") text += ev.delta.text;
+          else if (ev.type === "message_delta" && ev.delta?.stop_reason) stop = ev.delta.stop_reason;
+          else if (ev.type === "error") {
+            throw new Error(claudeError(ev.error?.type === "overloaded_error" ? 529 : 500, String(ev.error?.message ?? "")));
+          }
+        }
+      }
+    } catch (e) {
+      if (!text.trim()) throw ctrl.signal.aborted ? timeout() : e;
+      stop = "cut";
+    }
+    if (ctrl.signal.aborted && !stop) {
+      if (!text.trim()) throw timeout();
+      stop = "cut";
+    }
+    text = text.trim();
+    if (stop === "refusal") return "Модель не стала это решать. Пересними задание.";
+    if (!text) {
+      return stop === "max_tokens" ? "Задание слишком длинное. Сфоткай одно задание." : "Пустой ответ. Пришли фото ещё раз.";
+    }
+    if (stop === "cut" || stop === "max_tokens") return `${text}\n\n(не успел дописать, напиши «дальше»)`;
+    return text;
+  } finally {
+    clearTimeout(timer);
   }
-  if (j.stop_reason === "refusal") return "Модель не стала это решать. Пересними задание.";
-  const text = (j.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n").trim();
-  if (!text) {
-    return j.stop_reason === "max_tokens" ? "Задание слишком длинное. Сфоткай одно задание." : "Пустой ответ. Пришли фото ещё раз.";
-  }
-  return j.stop_reason === "max_tokens" ? `${text}\n(ответ обрезан)` : text;
 }
 
 // ---------- сообщение из WhatsApp ----------
@@ -216,10 +273,15 @@ async function solve(chatId: string, content: unknown[], origin: string, end: nu
   const history = await loadHistory(chatId);
   const turns = [...history, { role: "user", content }];
   const answer = await askClaude(turns, end - 9_000);
-  const svg = answer.match(/<svg[\s\S]*?<\/svg>/i)?.[0];
-  const text = answer.replace(/```(?:svg|xml|html)?\s*<svg[\s\S]*?<\/svg>\s*```/gi, "").replace(/<svg[\s\S]*?<\/svg>/gi, "").trim();
+  const svgs = answer.match(/<svg[\s\S]*?<\/svg>/gi) ?? [];
+  const text = answer
+    .replace(/```[a-z]*\s*(<svg[\s\S]*?<\/svg>)\s*```/gi, "$1")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, "")
+    .replace(/(```[a-z]*\s*)?<svg[\s\S]*$/i, "") // недописанный рисунок
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
   await send(chatId, text || "Рисунок ниже 👇", left(end, 2_000));
-  if (svg) await sendDrawing(chatId, svg, origin, left(end, 2_000));
+  if (svgs.length) await sendDrawings(chatId, svgs, origin, end);
   await saveHistory(chatId, [...turns, { role: "assistant", content: text || "[рисунок]" }]);
 }
 
