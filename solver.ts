@@ -1,5 +1,6 @@
 // Solver: фото задания в WhatsApp -> Claude -> ответ обратно в WhatsApp.
 // Val Town, HTTP val. Ключи сюда НЕ писать: они живут в Env vars.
+import { blob } from "https://esm.town/v/std/blob/main.ts";
 
 const env = (k: string, d = "") => (Deno.env.get(k) ?? d).trim();
 const CLAUDE_KEY = env("ANTHROPIC_API_KEY");
@@ -25,7 +26,84 @@ const PROMPT = `Ты решаешь школьные задания (10 клас
 
 Формат для каждого задания. Первая строка: номер задания, если он виден на фото. Дальше короткое решение из 2–6 шагов, каждый шаг с новой строки и начинается с «1)», «2)» и так далее. Одна мысль на строку, без вступлений и без пересказа условия. Последняя строка: «Ответ: ...» с единицами измерения. В тесте укажи номер или букву варианта.
 
-Если заданий несколько, решай по порядку и разделяй их пустой строкой. Если заданий больше трёх, реши первые три и последней строкой напиши «Остальные пришли отдельным фото.». Если часть условия не читается, ничего не выдумывай: реши то, что видно, и последней строкой напиши «Не видно: ... Пересними ближе.». Если на фото нет задания, ответь одной строкой: «Не разобрал фото. Пересними ближе.». Если пришёл текстовый вопрос, ответь так же коротко.`;
+Если заданий несколько, решай по порядку и разделяй их пустой строкой. Если заданий больше трёх, реши первые три и последней строкой напиши «Остальные пришли отдельным фото.». Если часть условия не читается, ничего не выдумывай: реши то, что видно, и последней строкой напиши «Не видно: ... Пересними ближе.». Если на фото нет задания, ответь одной строкой: «Не разобрал фото. Пересними ближе.». Если пришёл текстовый вопрос, ответь так же коротко. Учитывай прошлые сообщения этого чата: если просят объяснить шаг или решить другое задание с прошлого фото, продолжай с ним.
+
+Если к заданию полезен рисунок (геометрия, график функции, схема по физике) или тебя просят нарисовать, в самом конце ответа добавь один рисунок в формате SVG: блок от <svg до </svg> с xmlns="http://www.w3.org/2000/svg" и viewBox="0 0 800 600", белый фон, чёрные линии толщиной 3, подписи font-size 28, оси и точки подписаны. Без рисунка, если он не нужен. Про сам рисунок в тексте не пиши.`;
+
+// ---------- память чата (Val Town Blob) ----------
+const HISTORY_TTL = 2 * 3600_000; // через 2 часа без сообщений чат начинается заново
+const HISTORY_MAX = 12; // последние 6 вопросов и ответов
+const histKey = (chatId: string) => `solver_hist_${chatId.replace(/\W/g, "_")}`;
+
+async function loadHistory(chatId: string): Promise<any[]> {
+  try {
+    const h: any = await blob.getJSON(histKey(chatId));
+    return h && Date.now() - h.at < HISTORY_TTL && Array.isArray(h.turns) ? h.turns : [];
+  } catch (e) {
+    console.log("history load:", e);
+    return [];
+  }
+}
+
+async function saveHistory(chatId: string, turns: any[]) {
+  // фото храним только последнее, старые заменяем пометкой
+  let seenImage = false;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (!Array.isArray(turns[i].content)) continue;
+    turns[i] = {
+      ...turns[i],
+      content: turns[i].content.map((b: any) => {
+        if (b.type !== "image") return b;
+        if (!seenImage) return (seenImage = true, b);
+        return { type: "text", text: "[фото задания]" };
+      }),
+    };
+  }
+  let t = turns.slice(-HISTORY_MAX);
+  while (t.length && t[0].role !== "user") t = t.slice(1);
+  try {
+    await blob.setJSON(histKey(chatId), { at: Date.now(), turns: t });
+  } catch (e) {
+    console.log("history save:", e);
+  }
+}
+
+// ---------- рисунки: SVG от Claude -> PNG ----------
+let renderer: Promise<(svg: string) => Uint8Array> | null = null;
+function getRenderer() {
+  renderer ??= (async () => {
+    const { initWasm, Resvg } = await import("npm:@resvg/resvg-wasm@2.6.2");
+    const [, font] = await Promise.all([
+      initWasm(fetch("https://unpkg.com/@resvg/resvg-wasm@2.6.2/index_bg.wasm")),
+      fetch("https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans.ttf").then((r) => r.arrayBuffer()),
+    ]);
+    const fontBuffers = [new Uint8Array(font)];
+    return (svg: string) =>
+      new Resvg(svg, {
+        font: { fontBuffers, defaultFontFamily: "DejaVu Sans" },
+        fitTo: { mode: "width", value: 1200 },
+        background: "white",
+      }).render().asPng();
+  })();
+  renderer.catch(() => (renderer = null));
+  return renderer;
+}
+
+// Рисунок кладём в Blob и отдаём по ссылке /?img=..., GREEN-API забирает его сам
+async function sendDrawing(chatId: string, svg: string, origin: string, ms: number) {
+  try {
+    const png = (await getRenderer())(svg);
+    const id = crypto.randomUUID().replace(/-/g, "");
+    await blob.set(`solver_img_${id}`, new Blob([png as Uint8Array<ArrayBuffer>], { type: "image/png" }));
+    await green("sendFileByUrl", { chatId, urlFile: `${origin}/?img=${id}`, fileName: "risunok.png" }, ms);
+    // старые рисунки (старше суток) удаляем
+    const old = (await blob.list("solver_img_")).filter((b) => Date.now() - Date.parse(b.lastModified) > 86_400_000);
+    await Promise.all(old.map((b) => blob.delete(b.key)));
+  } catch (e) {
+    console.log("drawing:", hide(e));
+    await send(chatId, "(рисунок не получился)", 3_000).catch(() => {});
+  }
+}
 
 // ---------- GREEN-API (WhatsApp бота) ----------
 async function green(method: string, body?: unknown, ms = 10_000): Promise<any> {
@@ -103,8 +181,8 @@ function claudeError(status: number, msg: string, retryAfter: string | null = "1
   return `Ошибка Claude ${status}: ${msg.slice(0, 120)}`;
 }
 
-async function askClaude(content: unknown[], until: number, effort = EFFORT): Promise<string> {
-  const body: any = { model: MODEL, max_tokens: 8000, system: PROMPT, messages: [{ role: "user", content }] };
+async function askClaude(messages: unknown[], until: number, effort = EFFORT): Promise<string> {
+  const body: any = { model: MODEL, max_tokens: 8000, system: PROMPT, messages };
   if (effort) body.output_config = { effort };
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -119,7 +197,7 @@ async function askClaude(content: unknown[], until: number, effort = EFFORT): Pr
   } catch { /* не JSON */ }
   if (!r.ok) {
     const msg = String(j?.error?.message ?? "");
-    if (r.status === 400 && effort && /output_config|effort/i.test(msg)) return askClaude(content, until, ""); // модель не знает effort
+    if (r.status === 400 && effort && /output_config|effort/i.test(msg)) return askClaude(messages, until, ""); // модель не знает effort
     throw new Error(claudeError(r.status, msg, r.headers.get("retry-after")));
   }
   if (j.stop_reason === "refusal") return "Модель не стала это решать. Пересними задание.";
@@ -133,7 +211,19 @@ async function askClaude(content: unknown[], until: number, effort = EFFORT): Pr
 // ---------- сообщение из WhatsApp ----------
 const NUDGE = new Set(["videoMessage", "audioMessage", "documentMessage", "stickerMessage", "locationMessage", "contactMessage"]);
 
-async function handle(h: any, t0: number) {
+// Вопрос + память чата -> Claude -> текст и (если есть) рисунок
+async function solve(chatId: string, content: unknown[], origin: string, end: number) {
+  const history = await loadHistory(chatId);
+  const turns = [...history, { role: "user", content }];
+  const answer = await askClaude(turns, end - 9_000);
+  const svg = answer.match(/<svg[\s\S]*?<\/svg>/i)?.[0];
+  const text = answer.replace(/```(?:svg|xml|html)?\s*<svg[\s\S]*?<\/svg>\s*```/gi, "").replace(/<svg[\s\S]*?<\/svg>/gi, "").trim();
+  await send(chatId, text || "Рисунок ниже 👇", left(end, 2_000));
+  if (svg) await sendDrawing(chatId, svg, origin, left(end, 2_000));
+  await saveHistory(chatId, [...turns, { role: "assistant", content: text || "[рисунок]" }]);
+}
+
+async function handle(h: any, t0: number, origin: string) {
   if (h?.typeWebhook === "quotaExceeded") return console.log("GREEN-API: лимит чатов тарифа исчерпан", JSON.stringify(h));
   if (h?.typeWebhook !== "incomingMessageReceived") return;
   const chatId = String(h.senderData?.chatId ?? "");
@@ -148,16 +238,19 @@ async function handle(h: any, t0: number) {
       const media_type = imageType(bytes);
       if (!media_type) return await send(chatId, "Не понял формат фото. Пришли обычное фото.");
       const caption = String(fd.caption ?? "").trim();
-      const answer = await askClaude([
+      await solve(chatId, [
         { type: "image", source: { type: "base64", media_type, data: base64(bytes) } },
         { type: "text", text: caption ? `Реши задания на фото. Подпись: ${caption}` : "Реши задания на фото." },
-      ], end - 7_000);
-      await send(chatId, answer, left(end, 2_000));
+      ], origin, end);
     } else if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
       const text = String(md.textMessageData?.textMessage ?? md.extendedTextMessageData?.text ?? "").trim();
       if (!text) return;
       if (/^(ping|пинг)$/i.test(text)) return await send(chatId, `pong ✅ модель ${MODEL}`);
-      await send(chatId, await askClaude([{ type: "text", text }], end - 7_000), left(end, 2_000));
+      if (/^(сброс|новое|reset)$/i.test(text)) {
+        await saveHistory(chatId, []);
+        return await send(chatId, "Память чата очищена ✅");
+      }
+      await solve(chatId, [{ type: "text", text }], origin, end);
     } else if (NUDGE.has(type)) {
       await send(chatId, "Пришли фото задания.");
     } // реакции, правки, удаления: молча пропускаем
@@ -235,10 +328,20 @@ async function setupPage(url: URL): Promise<Response> {
 export default async function (req: Request): Promise<Response> {
   const t0 = Date.now();
   const url = new URL(req.url);
+  const img = url.searchParams.get("img");
+  if (req.method === "GET" && img) {
+    if (!/^[0-9a-f]{32}$/.test(img)) return new Response("no", { status: 404 });
+    try {
+      const r = await blob.get(`solver_img_${img}`);
+      return new Response(r.body, { headers: { "content-type": "image/png" } });
+    } catch {
+      return new Response("no", { status: 404 });
+    }
+  }
   if (req.method === "GET") return await setupPage(url);
   const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
   if (!HOOK_KEY || (url.searchParams.get("k") !== HOOK_KEY && bearer !== HOOK_KEY)) return new Response("no");
   const h = await req.json().catch(() => null);
-  await handle(h, t0);
+  await handle(h, t0, url.origin);
   return new Response("ok"); // всегда 200, иначе GREEN-API пришлёт то же сообщение ещё раз
 }
