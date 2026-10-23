@@ -209,7 +209,7 @@ function claudeError(status: number, msg: string, retryAfter: string | null = "1
 
 // Ответ идёт потоком: если время кончается, отдаём то, что успело написаться
 async function askClaude(messages: unknown[], until: number, effort = EFFORT): Promise<string> {
-  const body: any = { model: MODEL, max_tokens: 16000, system: PROMPT, messages, stream: true };
+  const body: any = { model: MODEL, max_tokens: 64000, system: PROMPT, messages, stream: true };
   if (effort) body.output_config = { effort };
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), left(until, 3_000));
@@ -304,11 +304,25 @@ async function solve(chatId: string, content: unknown[], origin: string, end: nu
   await saveHistory(chatId, [...turns, { role: "assistant", content: text || "[рисунок]" }]);
 }
 
+// GREEN-API ждёт ответ 180 с, потом шлёт то же сообщение ещё раз: повторы пропускаем
+async function alreadySeen(id: string): Promise<boolean> {
+  if (!id) return false;
+  try {
+    const seen: string[] = ((await blob.getJSON("solver_seen")) as string[] | undefined) ?? [];
+    if (seen.includes(id)) return true;
+    await blob.setJSON("solver_seen", [...seen, id].slice(-200));
+  } catch (e) {
+    console.log("seen:", e);
+  }
+  return false;
+}
+
 async function handle(h: any, t0: number, origin: string) {
   if (h?.typeWebhook === "quotaExceeded") return console.log("GREEN-API: лимит чатов тарифа исчерпан", JSON.stringify(h));
   if (h?.typeWebhook !== "incomingMessageReceived") return;
   const chatId = String(h.senderData?.chatId ?? "");
   if (!/@(c\.us|lid)$/.test(chatId)) return; // группы, статусы и каналы пропускаем
+  if (await alreadySeen(String(h.idMessage ?? ""))) return;
   const end = t0 + LIMIT;
   const md = h.messageData ?? {};
   const type = String(md.typeMessage ?? "");
