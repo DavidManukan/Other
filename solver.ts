@@ -40,40 +40,78 @@ const PROMPT = `Ты решаешь школьные задания (10 клас
 Реши ВСЕ задания, которые видно на фото, и все варианты (вариант 1, вариант 2 и так далее), ничего не пропускай. Решай по порядку, перед каждым вариантом пиши строку «Вариант N», задания разделяй пустой строкой. Если часть условия не читается, ничего не выдумывай: реши то, что видно, и в конце напиши «Не видно: ... Пересними ближе.». Если на фото нет задания, ответь одной строкой: «Не разобрал фото. Пересними ближе.». Если пришёл текстовый вопрос, ответь по тем же правилам. Учитывай прошлые сообщения этого чата: если просят объяснить шаг, решить задание с прошлого фото или пишут «дальше», продолжай с того места, где остановился.
 
 Рисунки. К каждой задаче по геометрии (и планиметрия, и стереометрия) рисунок нужен обязательно. Ещё рисуй, если помогает картинка (график функции, схема по физике, структурная формула в химии) или тебя просят нарисовать. Рисунок ставь сразу после решения своей задачи: блок от <svg до </svg>. Про сам рисунок в тексте не пиши.
-Стиль рисунка строго такой, как в учебнике, тёмная тема:
+Стиль ВСЕХ рисунков (геометрия, графики, физика, химия) один и тот же, как в учебнике, тёмная тема:
 - <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 H" font-family="DejaVu Sans">, H от 500 до 1000 по размеру рисунка, первым элементом <rect width="800" height="H" fill="#171717"/>;
 - в левом верхнем углу номер задачи: <text x="40" y="50" fill="#fff" font-size="34">№3</text>;
 - плоскости: параллелограммы без заливки, stroke="#D9D9D0" stroke-width="2", буква плоскости (α, β) серым у правого края;
 - главные отрезки и фигуры из условия (то, что ищем или о чём задача): stroke="#D5643C" stroke-width="4";
 - остальные линии: stroke="#fff" stroke-width="2"; невидимые и вспомогательные линии пунктиром stroke-dasharray="8 6";
-- точки: белые кружки r="7"; подписи белым font-size="32" рядом с точкой, чтобы не налезали на линии; индексы через <tspan font-size="20" dy="8">1</tspan>;
+- точки: белые кружки r="7"; подписи белым font-size="32" рядом с точкой, чтобы не налезали на линии; индексы и степени только так: A<tspan baseline-shift="sub" font-size="65%">1</tspan>, x<tspan baseline-shift="super" font-size="65%">2</tspan>;
 - известные длины и углы подписывай серым font-size="26" у отрезка;
+- графики: оси и сетка серым #D9D9D0 stroke-width="1", подписи осей x и y, сам график #D5643C stroke-width="4", важные точки белыми кружками с координатами;
+- физика: тела белым, силы и скорости стрелками #D5643C с подписью (F, mg, N, v₀);
 - стереометрию рисуй в перспективе как в учебнике: плоскости наклонными параллелограммами, параллельные прямые параллельно.
 Пример (две параллельные плоскости и отрезки AB и CD между ними):
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 640" font-family="DejaVu Sans"><rect width="800" height="640" fill="#171717"/><text x="40" y="50" fill="#fff" font-size="34">№1</text><polygon points="200,90 700,90 600,190 100,190" fill="none" stroke="#D9D9D0" stroke-width="2"/><text x="650" y="125" fill="#D9D9D0" font-size="30">α</text><polygon points="200,430 700,430 600,530 100,530" fill="none" stroke="#D9D9D0" stroke-width="2"/><text x="650" y="465" fill="#D9D9D0" font-size="30">β</text><line x1="270" y1="140" x2="520" y2="140" stroke="#fff" stroke-width="2" stroke-dasharray="8 6"/><line x1="330" y1="480" x2="580" y2="480" stroke="#fff" stroke-width="2" stroke-dasharray="8 6"/><line x1="270" y1="140" x2="330" y2="480" stroke="#D5643C" stroke-width="4"/><line x1="520" y1="140" x2="580" y2="480" stroke="#D5643C" stroke-width="4"/><g fill="#fff"><circle cx="270" cy="140" r="7"/><circle cx="520" cy="140" r="7"/><circle cx="330" cy="480" r="7"/><circle cx="580" cy="480" r="7"/></g><g fill="#fff" font-size="32"><text x="235" y="125">A</text><text x="535" y="125">C</text><text x="300" y="525">B</text><text x="590" y="525">D</text></g></svg>
 
 Химия. Если в задании есть органическое вещество (назвать вещество, написать формулу по названию, изомеры, гомологи, реакции органики), обязательно нарисуй структурную формулу, как учитель на доске. В том же стиле и тёмной теме:
-- группы атомов текстом font-size="34" text-anchor="middle": CH₃, CH₂, CH, C, OH, COOH, Cl; индексы через <tspan font-size="22" dy="8">3</tspan>;
+- группы атомов текстом font-size="34" text-anchor="middle": CH₃, CH₂, CH, C, OH, COOH, Cl; индексы только так: CH<tspan baseline-shift="sub" font-size="65%">3</tspan>, никогда не пиши CH3 обычными цифрами;
 - связи линиями между группами: одинарная одна линия, двойная две параллельные, тройная три; линии не налезают на буквы;
 - главная цепь (по которой даётся название) и её связи цветом #D5643C stroke-width="4", боковые радикалы белым, связи к ним stroke-width="2";
 - над атомами главной цепи номера углерода серым #D9D9D0 font-size="22";
 - внизу по центру название вещества серым font-size="28";
 - если веществ несколько (изомеры, реакция), рисуй их по очереди сверху вниз или слева направо со стрелкой →.
 Пример (2-метилбутан):
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 520" font-family="DejaVu Sans"><rect width="800" height="520" fill="#171717"/><text x="40" y="50" fill="#fff" font-size="34">№2</text><g font-size="34" text-anchor="middle" fill="#D5643C"><text x="120" y="270">CH<tspan font-size="22" dy="8">3</tspan></text><text x="290" y="270">CH</text><text x="460" y="270">CH<tspan font-size="22" dy="8">2</tspan></text><text x="630" y="270">CH<tspan font-size="22" dy="8">3</tspan></text></g><text x="290" y="400" fill="#fff" font-size="34" text-anchor="middle">CH<tspan font-size="22" dy="8">3</tspan></text><g stroke="#D5643C" stroke-width="4"><line x1="170" y1="258" x2="250" y2="258"/><line x1="335" y1="258" x2="410" y2="258"/><line x1="510" y1="258" x2="580" y2="258"/></g><line x1="290" y1="282" x2="290" y2="365" stroke="#fff" stroke-width="2"/><g fill="#D9D9D0" font-size="22" text-anchor="middle"><text x="120" y="225">1</text><text x="290" y="225">2</text><text x="460" y="225">3</text><text x="630" y="225">4</text></g><text x="400" y="480" fill="#D9D9D0" font-size="28" text-anchor="middle">2-метилбутан</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 520" font-family="DejaVu Sans"><rect width="800" height="520" fill="#171717"/><text x="40" y="50" fill="#fff" font-size="34">№2</text><g font-size="34" text-anchor="middle" fill="#D5643C"><text x="120" y="270">CH<tspan baseline-shift="sub" font-size="65%">3</tspan></text><text x="290" y="270">CH</text><text x="460" y="270">CH<tspan baseline-shift="sub" font-size="65%">2</tspan></text><text x="630" y="270">CH<tspan baseline-shift="sub" font-size="65%">3</tspan></text></g><text x="290" y="400" fill="#fff" font-size="34" text-anchor="middle">CH<tspan baseline-shift="sub" font-size="65%">3</tspan></text><g stroke="#D5643C" stroke-width="4"><line x1="170" y1="258" x2="250" y2="258"/><line x1="335" y1="258" x2="410" y2="258"/><line x1="510" y1="258" x2="580" y2="258"/></g><line x1="290" y1="282" x2="290" y2="365" stroke="#fff" stroke-width="2"/><g fill="#D9D9D0" font-size="22" text-anchor="middle"><text x="120" y="225">1</text><text x="290" y="225">2</text><text x="460" y="225">3</text><text x="630" y="225">4</text></g><text x="400" y="480" fill="#D9D9D0" font-size="28" text-anchor="middle">2-метилбутан</text></svg>
 В тексте ответа для органики: название по ИЮПАК и коротко, как его получили (самая длинная цепь, нумерация, радикалы).`;
 
 // ---------- красивые степени и индексы, если модель всё же написала ^ или _ ----------
 const SUP: Record<string, string> = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻", "−": "⁻", "=": "⁼", "(": "⁽", ")": "⁾", n: "ⁿ", i: "ⁱ", x: "ˣ", y: "ʸ", a: "ᵃ", b: "ᵇ", c: "ᶜ", d: "ᵈ", e: "ᵉ", k: "ᵏ", m: "ᵐ", p: "ᵖ", t: "ᵗ", " ": "" };
 const SUB: Record<string, string> = { "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉", "+": "₊", "-": "₋", "−": "₋", "=": "₌", "(": "₍", ")": "₎", a: "ₐ", e: "ₑ", o: "ₒ", x: "ₓ", n: "ₙ", m: "ₘ", k: "ₖ", t: "ₜ", " ": "" };
 const conv = (t: string, map: Record<string, string>) => [...t].every((c) => c in map) ? [...t].map((c) => map[c]).join("") : null;
+// Химические формулы и индексы: CH3 -> CH₃, H2SO4 -> H₂SO₄, A1B1 -> A₁B₁, x1 -> x₁ (коэффициент 2H2O не трогаем)
+const CHEM = /(?<![A-Za-z0-9_.,])(\d*)((?:[A-Z][a-z]?\d*|\((?:[A-Z][a-z]?\d*)+\)\d*)+)(?![A-Za-z0-9])/g;
+const IDX = /(?<![A-Za-zА-Яа-я0-9])([a-z])(\d{1,2})(?![\d.,]?\d)/g;
+function subscripts(text: string, sub: (d: string) => string): string {
+  return text
+    .replace(CHEM, (_m: string, k: string, tok: string) => k + (/\d/.test(tok) ? tok.replace(/(?<=[A-Za-z)])\d+/g, sub) : tok))
+    .replace(IDX, (_m: string, l: string, d: string) => l + sub(d));
+}
+
 function prettyMath(text: string): string {
   const fix = (re: RegExp, map: Record<string, string>) => (m: string, g1?: string, g2?: string) => conv(g1 ?? g2 ?? "", map) ?? m;
+  text = subscripts(text, (d) => conv(d, SUB) ?? d)
+    .replace(/(?<![А-Яа-я])(мм|см|дм|км|м)([23])(?!\d)/g, (_m, u, d) => u + SUP[d]); // см2 -> см²
   return text
     .replace(/\^\{([^{}]{1,12})\}|\^\(([^()]{1,12})\)/g, (m, a, b) => (b ? conv(`(${b})`, SUP) : conv(a, SUP)) ?? m)
     .replace(/\^([−-]?[0-9]+|[nixyabcdekmpt](?![a-zA-Z]))/g, fix(/./, SUP))
     .replace(/_\{([^{}]{1,12})\}/g, fix(/./, SUB))
     .replace(/(?<=[A-Za-zА-Яа-я)\]])_([0-9]+|[aeoxnmkt](?![a-zA-Z]))/g, fix(/./, SUB));
+}
+
+// Все рисунки в одном стиле: тёмный фон, светлые линии, нормальные индексы и степени
+const SUB_DIGITS = "₀₁₂₃₄₅₆₇₈₉", SUP_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+const tsSub = (d: string) => `<tspan baseline-shift="sub" font-size="65%">${d}</tspan>`;
+const tsSup = (d: string) => `<tspan baseline-shift="super" font-size="65%">${d}</tspan>`;
+function fixSvgText(t: string): string {
+  t = t.replace(/\^\(?([−\-+]?[0-9a-z]{1,4})\)?/g, (_m, d) => tsSup(d))
+    .replace(/[₀-₉]+/g, (m) => tsSub([...m].map((c) => SUB_DIGITS.indexOf(c)).join("")))
+    .replace(/[⁰¹²³⁴-⁹]+/g, (m) => tsSup([...m].map((c) => SUP_DIGITS.indexOf(c)).join("")));
+  return subscripts(t, tsSub);
+}
+function fixSvg(svg: string): string {
+  svg = svg
+    // индекс через dy сдвигает весь текст после него: меняем на baseline-shift
+    .replace(/<tspan\b[^>]*\bdy="[\d.]+"[^>]*>([^<]{1,4})<\/tspan>/g, (_m, d) => tsSub(d))
+    .replace(/<tspan\b[^>]*\bdy="-[\d.]+"[^>]*>([^<]{1,4})<\/tspan>/g, (_m, d) => tsSup(d))
+    // чёрное на тёмном фоне не видно
+    .replace(/(stroke|fill)="(?:black|#000|#000000)"/gi, '$1="#fff"')
+    .replace(/(<rect\b[^>]*fill=")(?:white|#fff|#ffffff)(")/i, "$1#171717$2")
+    // текст внутри <text>/<tspan>
+    .replace(/(<text\b[^>]*>|<tspan\b[^>]*>|<\/tspan>)([^<]+)/g, (_m, tag, t) => tag + fixSvgText(t));
+  if (!/fill="#171717"/i.test(svg)) svg = svg.replace(/(<svg\b[^>]*>)/i, '$1<rect width="100%" height="100%" fill="#171717"/>');
+  if (!/<svg\b[^>]*font-family=/i.test(svg)) svg = svg.replace(/<svg\b/i, '<svg font-family="DejaVu Sans"');
+  return svg;
 }
 
 // ---------- память чата (Val Town Blob) ----------
@@ -140,7 +178,7 @@ async function sendDrawings(chatId: string, svgs: string[], origin: string, end:
   let failed = 0;
   for (const svg of svgs.slice(0, 8)) {
     try {
-      const png = (await getRenderer())(svg);
+      const png = (await getRenderer())(fixSvg(svg));
       const id = crypto.randomUUID().replace(/-/g, "");
       await blob.set(`solver_img_${id}`, new Blob([png as Uint8Array<ArrayBuffer>], { type: "image/png" }));
       await green("sendFileByUrl", { chatId, urlFile: `${origin}/?img=${id}`, fileName: "risunok.png" }, left(end, 2_000));
