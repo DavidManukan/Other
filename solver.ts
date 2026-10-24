@@ -317,6 +317,7 @@ async function askClaude(
       if (FAST && r.status === 400 && /speed|fast/i.test(msg)) {
         clearTimeout(timer);
         FAST = false; // быстрый режим недоступен: дальше работаем обычным
+        console.log("FAST недоступен:", msg);
         return askClaude(messages, until, onChunk, effort);
       }
       throw new Error(claudeError(r.status, msg, r.headers.get("retry-after")));
@@ -444,7 +445,7 @@ async function handle(h: any, t0: number, origin: string) {
     } else if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
       const text = String(md.textMessageData?.textMessage ?? md.extendedTextMessageData?.text ?? "").trim();
       if (!text) return;
-      if (/^(ping|пинг)$/i.test(text)) return await send(chatId, `pong ✅ модель ${MODEL}`);
+      if (/^(ping|пинг)$/i.test(text)) return await send(chatId, `pong ✅ модель ${MODEL}, effort ${EFFORT || "—"}, fast ${FAST ? "вкл" : "выкл"}`);
       if (/^(сброс|новое|reset)$/i.test(text)) {
         await saveHistory(chatId, []);
         return await send(chatId, "Память чата очищена ✅");
