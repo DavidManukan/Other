@@ -9,6 +9,8 @@ const GREEN_ID = env("GREEN_ID").replace(/\D/g, "");
 const GREEN_TOKEN = env("GREEN_TOKEN");
 const MODEL = env("MODEL", "claude-opus-5-5");
 const EFFORT = env("EFFORT", "medium");
+const MODE = env("MODE", "direct").toLowerCase(); // agent = Claude Managed Agents: решает сколько нужно, без лимита 60 с
+const WEBHOOK_KEY = env("ANTHROPIC_WEBHOOK_SIGNING_KEY"); // секрет вебхука из консоли Claude (только для MODE=agent)
 const AUTO_MAX = Number(env("AUTO_MAX", "5")) || 0; // сколько раз бот сам продолжает длинный ответ (каждый раз свежие 60 с)
 let FAST = env("FAST") === "1"; // быстрый режим Opus: ответ пишется до 2,5 раза быстрее, но дороже
 const LIMIT = (Number(env("LIMIT", "57")) || 57) * 1000; // Val Town Free обрывает запрос на 60 с, на Pro можно 590
@@ -222,7 +224,7 @@ async function green(method: string, body?: unknown, ms = 10_000): Promise<any> 
   }
 }
 
-const send = (chatId: string, message: string, ms = 10_000) =>
+const send = (chatId: string, message: string, ms = 10_000): Promise<any> =>
   green("sendMessage", {
     chatId,
     message: message.length > 19_000 ? message.slice(0, 19_000) + "\n(обрезано)" : message,
@@ -386,6 +388,18 @@ async function askClaude(
 }
 
 // ---------- сообщение из WhatsApp ----------
+// Текст ответа модели -> чистый текст для WhatsApp + рисунки отдельно
+function splitAnswer(raw: string): { text: string; svgs: string[] } {
+  const svgs = raw.match(/<svg[\s\S]*?<\/svg>/gi) ?? [];
+  const text = prettyMath(raw)
+    .replace(/```[a-z]*\s*(<svg[\s\S]*?<\/svg>)\s*```/gi, "$1")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, "")
+    .replace(/(```[a-z]*\s*)?<svg[\s\S]*$/i, "") // недописанный рисунок
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { text, svgs };
+}
+
 const NUDGE = new Set(["videoMessage", "audioMessage", "documentMessage", "stickerMessage", "locationMessage", "contactMessage"]);
 
 // Вопрос + память чата -> Claude -> текст и (если есть) рисунок
@@ -405,13 +419,7 @@ async function solve(chatId: string, content: unknown[], origin: string, end: nu
   const parts: string[] = [];
   const drawings: string[] = []; // картинки рисуем после всех ответов
   const deliver = async (raw: string) => {
-    const svgs = raw.match(/<svg[\s\S]*?<\/svg>/gi) ?? [];
-    const text = prettyMath(raw)
-      .replace(/```[a-z]*\s*(<svg[\s\S]*?<\/svg>)\s*```/gi, "$1")
-      .replace(/<svg[\s\S]*?<\/svg>/gi, "")
-      .replace(/(```[a-z]*\s*)?<svg[\s\S]*$/i, "") // недописанный рисунок
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+    const { text, svgs } = splitAnswer(raw);
     if (text) await send(chatId, text, left(end, 2_000));
     drawings.push(...svgs);
     if (text) parts.push(text);
@@ -467,6 +475,122 @@ async function alreadySeen(id: string): Promise<boolean> {
   return false;
 }
 
+// ---------- MODE=agent: Claude Managed Agents ----------
+// Фото уходит в сессию агента на серверах Anthropic и решается там сколько нужно.
+// Когда агент закончил, Anthropic присылает вебхук session.status_idled, и бот отправляет ответ.
+async function ma(path: string, body?: unknown, method = body === undefined ? "GET" : "POST"): Promise<any> {
+  const r = await fetch(`https://api.anthropic.com/v1/${path}`, {
+    method,
+    headers: {
+      "x-api-key": CLAUDE_KEY,
+      "anthropic-version": "2026-10-21",
+      "anthropic-beta": "managed-agents-2026-04-01",
+      "content-type": "application/json",
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(20_000),
+  });
+  const t = await r.text();
+  let j: any = {};
+  try {
+    j = JSON.parse(t);
+  } catch { /* не JSON */ }
+  if (!r.ok) throw new Error(claudeError(r.status, String(j?.error?.message ?? t.slice(0, 120)), r.headers.get("retry-after")));
+  return j;
+}
+
+const sha = async (x: string) =>
+  [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(x)))].slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
+const chatKey = (chatId: string) => chatId.replace(/\W/g, "_");
+
+// Агент и среда создаются сами при первом запуске и пересоздаются, если поменяли MODEL или промпт
+async function ensureAgent(): Promise<{ agentId: string; envId: string; key: string }> {
+  const key = await sha(MODEL + "\n" + PROMPT);
+  const saved: any = await blob.getJSON("solver_agent").catch(() => undefined);
+  if (saved?.key === key && saved.agentId && saved.envId) return saved;
+  const envId = saved?.envId ||
+    (await ma("environments", { name: "solver-env", config: { type: "cloud", networking: { type: "limited", allow_package_managers: false } } })).id;
+  const agentId = (await ma("agents", { name: "Solver", model: MODEL, system: PROMPT })).id;
+  const a = { agentId, envId, key };
+  await blob.setJSON("solver_agent", a);
+  return a;
+}
+
+async function agentAsk(chatId: string, content: unknown[]) {
+  const a = await ensureAgent();
+  const sk = `solver_sess_${chatKey(chatId)}`;
+  let s: any = await blob.getJSON(sk).catch(() => undefined);
+  // новая сессия: если старая устарела, в ней много фото или поменялся агент
+  if (!s?.id || Date.now() - s.at > HISTORY_TTL || s.turns >= 6 || s.agentKey !== a.key) {
+    const ses = await ma("sessions", { agent: a.agentId, environment_id: a.envId, title: "Solver" });
+    s = { id: ses.id, turns: 0, agentKey: a.key };
+    await blob.setJSON(`solver_map_${ses.id}`, { chatId });
+  }
+  await ma(`sessions/${s.id}/events`, { events: [{ type: "user.message", content }] });
+  await blob.setJSON(sk, { ...s, turns: s.turns + 1, at: Date.now() });
+}
+
+// Подпись вебхука Anthropic (стандарт Standard Webhooks)
+async function verifyAnthropic(raw: string, headers: Headers): Promise<boolean> {
+  const id = headers.get("webhook-id"), ts = headers.get("webhook-timestamp"), sig = headers.get("webhook-signature");
+  if (!WEBHOOK_KEY || !id || !ts || !sig) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const secret = Uint8Array.from(atob(WEBHOOK_KEY.replace(/^whsec_/, "")), (c) => c.charCodeAt(0));
+  const k = await crypto.subtle.importKey("raw", secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(`${id}.${ts}.${raw}`)));
+  const expected = btoa(String.fromCharCode(...mac));
+  return sig.split(" ").some((p) => p.split(",")[1] === expected);
+}
+
+// Ответ целиком: каждое задание (разделитель @@@) отдельным сообщением, потом все рисунки
+async function deliverAnswer(chatId: string, answer: string, origin: string, end: number) {
+  const drawings: string[] = [];
+  for (const chunk of answer.split(/(?:^|\n)\s*@@@[^\n]*(?:\n|$)/)) {
+    const { text, svgs } = splitAnswer(chunk);
+    if (text) await send(chatId, text, left(end, 2_000));
+    drawings.push(...svgs);
+  }
+  if (drawings.length) await sendDrawings(chatId, drawings, origin, end);
+}
+
+async function onAgentWebhook(ev: any, t0: number, origin: string) {
+  const type = String(ev?.data?.type ?? ""), sid = String(ev?.data?.id ?? "");
+  if (type !== "session.status_idled" && type !== "session.status_terminated") return;
+  if (await alreadySeen(String(ev?.id ?? ""))) return;
+  const map: any = await blob.getJSON(`solver_map_${sid}`).catch(() => undefined);
+  if (!map?.chatId) return;
+  const chatId = String(map.chatId), end = t0 + LIMIT;
+  try {
+    if (type === "session.status_terminated") {
+      await blob.delete(`solver_sess_${chatKey(chatId)}`).catch(() => {});
+      return await send(chatId, "⚠️ Сессия Claude оборвалась. Пришли фото ещё раз.");
+    }
+    const list = await ma(`sessions/${sid}/events?order=desc&limit=100`);
+    const evs: any[] = list?.data ?? [];
+    const idle = evs.find((e) => e.type === "session.status_idle");
+    if (idle?.stop_reason?.type && idle.stop_reason.type !== "end_turn") return;
+    // сообщения агента после последнего вопроса и после того, что уже отправили
+    const texts: string[] = [];
+    let seenIdle = false;
+    for (const e of evs) {
+      if (e.id && e.id === map.lastId) break;
+      if (e.type === "user.message") break;
+      if (e.type === "session.status_idle") {
+        if (seenIdle) break;
+        seenIdle = true;
+      }
+      if (e.type === "agent.message") texts.unshift(...(e.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text));
+    }
+    if (evs[0]?.id) await blob.setJSON(`solver_map_${sid}`, { ...map, lastId: evs[0].id });
+    const answer = texts.join("\n").trim();
+    if (!answer) return;
+    await deliverAnswer(chatId, answer, origin, end);
+  } catch (e: any) {
+    console.log(hide(e?.stack ?? e));
+    await send(chatId, `⚠️ ${hide(e?.message ?? e)}`, left(end, 2_000)).catch((e2) => console.log(hide(e2)));
+  }
+}
+
 async function handle(h: any, t0: number, origin: string) {
   if (h?.typeWebhook === "quotaExceeded") return console.log("GREEN-API: лимит чатов тарифа исчерпан", JSON.stringify(h));
   if (h?.typeWebhook === "outgoingAPIMessageReceived") return await continueAnswer(t0, origin);
@@ -484,19 +608,23 @@ async function handle(h: any, t0: number, origin: string) {
       const media_type = imageType(bytes);
       if (!media_type) return await send(chatId, "Не понял формат фото. Пришли обычное фото.");
       const caption = String(fd.caption ?? "").trim();
-      await solve(chatId, [
+      const content = [
         { type: "image", source: { type: "base64", media_type, data: base64(bytes) } },
         { type: "text", text: caption ? `Реши задания на фото. Подпись: ${caption}` : "Реши задания на фото." },
-      ], origin, end);
+      ];
+      if (MODE === "agent") await agentAsk(chatId, content);
+      else await solve(chatId, content, origin, end);
     } else if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
       const text = String(md.textMessageData?.textMessage ?? md.extendedTextMessageData?.text ?? "").trim();
       if (!text) return;
-      if (/^(ping|пинг)$/i.test(text)) return await send(chatId, `pong ✅ модель ${MODEL}, effort ${EFFORT || "—"}, fast ${FAST ? "вкл" : "выкл"}`);
+      if (/^(ping|пинг)$/i.test(text)) return await send(chatId, `pong ✅ модель ${MODEL}, режим ${MODE === "agent" ? "агент (без лимита)" : `обычный, effort ${EFFORT || "—"}, fast ${FAST ? "вкл" : "выкл"}`}`);
       if (/^(сброс|новое|reset)$/i.test(text)) {
         await saveHistory(chatId, []);
+        await blob.delete(`solver_sess_${chatKey(chatId)}`).catch(() => {});
         return await send(chatId, "Память чата очищена ✅");
       }
-      await solve(chatId, [{ type: "text", text }], origin, end);
+      if (MODE === "agent") await agentAsk(chatId, [{ type: "text", text }]);
+      else await solve(chatId, [{ type: "text", text }], origin, end);
     } else if (NUDGE.has(type)) {
       await send(chatId, "Пришли фото задания.");
     } // реакции, правки, удаления: молча пропускаем
@@ -562,6 +690,17 @@ async function setupPage(url: URL): Promise<Response> {
     else if (!r.ok) rows.push(`❌ ${claudeError(r.status, String(mj?.error?.message ?? ""), r.headers.get("retry-after"))}`);
     else if (mj?.lifecycle === "retired") rows.push(`❌ Модель ${MODEL} больше не работает. Исправь MODEL.`);
     else rows.push(`✅ Ключ Claude принят, модель ${MODEL}. Баланс смотри на platform.claude.com`);
+    if (MODE === "agent") {
+      try {
+        const a = await ensureAgent();
+        rows.push(`✅ Режим агента: агент ${a.agentId.slice(-6)} готов`);
+      } catch (e: any) {
+        rows.push(`❌ Режим агента не включился: ${e.message}`);
+      }
+      rows.push(WEBHOOK_KEY.startsWith("whsec_")
+        ? `✅ Секрет вебхука есть. В консоли Claude вебхук должен вести на ${url.origin}/`
+        : "❌ Нет ANTHROPIC_WEBHOOK_SIGNING_KEY (секрет whsec_… из консоли Claude → Webhooks)");
+    }
   }
   const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Solver</title><body style="font:18px/1.5 -apple-system,sans-serif;margin:16px">
@@ -585,6 +724,13 @@ export default async function (req: Request): Promise<Response> {
     }
   }
   if (req.method === "GET") return await setupPage(url);
+  if (req.headers.get("webhook-signature")) {
+    // вебхук от Anthropic (MODE=agent)
+    const raw = await req.text();
+    if (!(await verifyAnthropic(raw, req.headers))) return new Response("bad signature", { status: 400 });
+    await onAgentWebhook(JSON.parse(raw), t0, url.origin);
+    return new Response(null, { status: 204 });
+  }
   const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
   if (!HOOK_KEY || (url.searchParams.get("k") !== HOOK_KEY && bearer !== HOOK_KEY)) return new Response("no");
   const h = await req.json().catch(() => null);
