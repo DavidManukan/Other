@@ -505,12 +505,20 @@ const chatKey = (chatId: string) => chatId.replace(/\W/g, "_");
 
 // Агент и среда создаются сами при первом запуске и пересоздаются, если поменяли MODEL или промпт
 async function ensureAgent(): Promise<{ agentId: string; envId: string; key: string }> {
-  const key = await sha(MODEL + "\n" + PROMPT);
+  const key = await sha(MODEL + (FAST ? ":fast" : "") + "\n" + PROMPT);
   const saved: any = await blob.getJSON("solver_agent").catch(() => undefined);
   if (saved?.key === key && saved.agentId && saved.envId) return saved;
   const envId = saved?.envId ||
     (await ma("environments", { name: "solver-env", config: { type: "cloud", networking: { type: "limited", allow_package_managers: false } } })).id;
-  const agentId = (await ma("agents", { name: "Solver", model: MODEL, system: PROMPT })).id;
+  let agentId: string;
+  try {
+    // FAST=1: быстрый режим модели (ответ пишется быстрее, токены дороже)
+    agentId = (await ma("agents", { name: "Solver", model: FAST ? { id: MODEL, speed: "fast" } : MODEL, system: PROMPT })).id;
+  } catch (e) {
+    if (!FAST) throw e;
+    console.log("FAST для агента недоступен:", e);
+    agentId = (await ma("agents", { name: "Solver", model: MODEL, system: PROMPT })).id;
+  }
   const a = { agentId, envId, key };
   await blob.setJSON("solver_agent", a);
   return a;
@@ -617,7 +625,7 @@ async function handle(h: any, t0: number, origin: string) {
     } else if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
       const text = String(md.textMessageData?.textMessage ?? md.extendedTextMessageData?.text ?? "").trim();
       if (!text) return;
-      if (/^(ping|пинг)$/i.test(text)) return await send(chatId, `pong ✅ модель ${MODEL}, режим ${MODE === "agent" ? "агент (без лимита)" : `обычный, effort ${EFFORT || "—"}, fast ${FAST ? "вкл" : "выкл"}`}`);
+      if (/^(ping|пинг)$/i.test(text)) return await send(chatId, `pong ✅ модель ${MODEL}, режим ${MODE === "agent" ? `агент (без лимита), fast ${FAST ? "вкл" : "выкл"}` : `обычный, effort ${EFFORT || "—"}, fast ${FAST ? "вкл" : "выкл"}`}`);
       if (/^(сброс|новое|reset)$/i.test(text)) {
         await saveHistory(chatId, []);
         await blob.delete(`solver_sess_${chatKey(chatId)}`).catch(() => {});
