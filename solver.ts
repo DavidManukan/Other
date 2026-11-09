@@ -275,7 +275,7 @@ function claudeError(status: number, msg: string, retryAfter: string | null = "1
 }
 
 // Ответ идёт потоком: если время кончается, отдаём то, что успело написаться
-const CUT_NOTE = "(не успел дописать, напиши «дальше»)";
+const CUT_NOTE = "(ответ слишком длинный: пришли фото по частям)";
 
 // onChunk получает каждое готовое задание сразу, как только модель его дописала (разделитель @@@)
 async function askClaude(
@@ -389,7 +389,17 @@ async function askClaude(
 const NUDGE = new Set(["videoMessage", "audioMessage", "documentMessage", "stickerMessage", "locationMessage", "contactMessage"]);
 
 // Вопрос + память чата -> Claude -> текст и (если есть) рисунок
-async function solve(chatId: string, content: unknown[], origin: string, end: number, step = 0) {
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const lower = (e: string) => EFFORTS[Math.max(0, EFFORTS.indexOf(e) - 1)] ?? "low";
+
+// Ставит метку «продолжить» и шлёт сообщение: GREEN-API пришлёт вебхук об этом исходящем
+// сообщении, и новый запуск со свежими 60 с продолжит. Писать ничего не нужно.
+async function scheduleContinue(chatId: string, next: Record<string, unknown>, note: string, end: number) {
+  await blob.setJSON("solver_cont", { chatId, at: Date.now(), ...next });
+  await send(chatId, note, left(end, 2_000));
+}
+
+async function solve(chatId: string, content: unknown[], origin: string, end: number, step = 0, effort = EFFORT) {
   const history = await loadHistory(chatId);
   const turns = [...history, { role: "user", content }];
   const parts: string[] = [];
@@ -406,18 +416,22 @@ async function solve(chatId: string, content: unknown[], origin: string, end: nu
     drawings.push(...svgs);
     if (text) parts.push(text);
   };
-  let rest = await askClaude(turns, end - 9_000, deliver);
+  let rest: string;
+  try {
+    rest = await askClaude(turns, end - 9_000, deliver, effort);
+  } catch (e: any) {
+    // Модель долго думала и ничего не успела написать, или Claude занят: сами пробуем снова
+    const timeout = e?.name === "TimeoutError";
+    if (parts.length || step >= AUTO_MAX || !(timeout || /занят/.test(String(e?.message)))) throw e;
+    const next = { step: step + 1, content, effort: timeout ? lower(effort) : effort };
+    return await scheduleContinue(chatId, next, timeout ? "⏳ долго думаю, решаю быстрее…" : "⏳ Claude занят, пробую ещё раз…", end);
+  }
   const more = rest.endsWith(CUT_NOTE) && step < AUTO_MAX;
   if (more) rest = rest.slice(0, -CUT_NOTE.length).trim();
   if (rest) await deliver(rest);
   if (drawings.length) await sendDrawings(chatId, drawings, origin, end);
   await saveHistory(chatId, [...turns, { role: "assistant", content: parts.join("\n\n") || "…" }]);
-  if (more) {
-    // Не успел за один запуск. Ставим метку и шлём сообщение: GREEN-API пришлёт вебхук
-    // об этом исходящем сообщении, и новый запуск со свежими 60 с продолжит ответ.
-    await blob.setJSON("solver_cont", { chatId, step: step + 1, at: Date.now() });
-    await send(chatId, "⏳ продолжаю…", left(end, 2_000));
-  }
+  if (more) await scheduleContinue(chatId, { step: step + 1, effort }, "⏳ продолжаю…", end);
 }
 
 async function continueAnswer(t0: number, origin: string) {
@@ -431,10 +445,11 @@ async function continueAnswer(t0: number, origin: string) {
   }
   const end = t0 + LIMIT;
   try {
-    await solve(String(c.chatId), [{ type: "text", text: "дальше" }], origin, end, Number(c.step) || 1);
+    const content = Array.isArray(c.content) ? c.content : [{ type: "text", text: "дальше" }];
+    await solve(String(c.chatId), content, origin, end, Number(c.step) || 1, String(c.effort ?? EFFORT));
   } catch (e: any) {
     console.log(hide(e?.stack ?? e));
-    const why = e?.name === "TimeoutError" ? "Не успел. Напиши «дальше»." : String(e?.message ?? e);
+    const why = e?.name === "TimeoutError" ? "Не успел решить. Пришли фото ещё раз (лучше одно задание)." : String(e?.message ?? e);
     await send(String(c.chatId), `⚠️ ${hide(why)}`, left(end, 2_000)).catch((e2) => console.log(hide(e2)));
   }
 }
