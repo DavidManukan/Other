@@ -9,6 +9,7 @@ const GREEN_ID = env("GREEN_ID").replace(/\D/g, "");
 const GREEN_TOKEN = env("GREEN_TOKEN");
 const MODEL = env("MODEL", "claude-opus-5-5");
 const EFFORT = env("EFFORT", "medium");
+const AUTO_MAX = Number(env("AUTO_MAX", "5")) || 0; // сколько раз бот сам продолжает длинный ответ (каждый раз свежие 60 с)
 let FAST = env("FAST") === "1"; // быстрый режим Opus: ответ пишется до 2,5 раза быстрее, но дороже
 const LIMIT = (Number(env("LIMIT", "57")) || 57) * 1000; // Val Town Free обрывает запрос на 60 с, на Pro можно 590
 
@@ -274,6 +275,8 @@ function claudeError(status: number, msg: string, retryAfter: string | null = "1
 }
 
 // Ответ идёт потоком: если время кончается, отдаём то, что успело написаться
+const CUT_NOTE = "(не успел дописать, напиши «дальше»)";
+
 // onChunk получает каждое готовое задание сразу, как только модель его дописала (разделитель @@@)
 async function askClaude(
   messages: unknown[],
@@ -375,7 +378,7 @@ async function askClaude(
     if (!rest && !sentAny) {
       return stop === "max_tokens" ? "Задание слишком длинное. Сфоткай одно задание." : "Пустой ответ. Пришли фото ещё раз.";
     }
-    if (cut) return `${rest}\n\n(не успел дописать, напиши «дальше»)`.trim();
+    if (cut) return `${rest}\n\n${CUT_NOTE}`.trim();
     return rest;
   } finally {
     clearTimeout(timer);
@@ -386,7 +389,7 @@ async function askClaude(
 const NUDGE = new Set(["videoMessage", "audioMessage", "documentMessage", "stickerMessage", "locationMessage", "contactMessage"]);
 
 // Вопрос + память чата -> Claude -> текст и (если есть) рисунок
-async function solve(chatId: string, content: unknown[], origin: string, end: number) {
+async function solve(chatId: string, content: unknown[], origin: string, end: number, step = 0) {
   const history = await loadHistory(chatId);
   const turns = [...history, { role: "user", content }];
   const parts: string[] = [];
@@ -403,10 +406,37 @@ async function solve(chatId: string, content: unknown[], origin: string, end: nu
     drawings.push(...svgs);
     if (text) parts.push(text);
   };
-  const rest = await askClaude(turns, end - 9_000, deliver);
+  let rest = await askClaude(turns, end - 9_000, deliver);
+  const more = rest.endsWith(CUT_NOTE) && step < AUTO_MAX;
+  if (more) rest = rest.slice(0, -CUT_NOTE.length).trim();
   if (rest) await deliver(rest);
   if (drawings.length) await sendDrawings(chatId, drawings, origin, end);
   await saveHistory(chatId, [...turns, { role: "assistant", content: parts.join("\n\n") || "…" }]);
+  if (more) {
+    // Не успел за один запуск. Ставим метку и шлём сообщение: GREEN-API пришлёт вебхук
+    // об этом исходящем сообщении, и новый запуск со свежими 60 с продолжит ответ.
+    await blob.setJSON("solver_cont", { chatId, step: step + 1, at: Date.now() });
+    await send(chatId, "⏳ продолжаю…", left(end, 2_000));
+  }
+}
+
+async function continueAnswer(t0: number, origin: string) {
+  let c: any;
+  try {
+    c = await blob.getJSON("solver_cont");
+    if (!c || Date.now() - c.at > 5 * 60_000) return;
+    await blob.delete("solver_cont");
+  } catch {
+    return;
+  }
+  const end = t0 + LIMIT;
+  try {
+    await solve(String(c.chatId), [{ type: "text", text: "дальше" }], origin, end, Number(c.step) || 1);
+  } catch (e: any) {
+    console.log(hide(e?.stack ?? e));
+    const why = e?.name === "TimeoutError" ? "Не успел. Напиши «дальше»." : String(e?.message ?? e);
+    await send(String(c.chatId), `⚠️ ${hide(why)}`, left(end, 2_000)).catch((e2) => console.log(hide(e2)));
+  }
 }
 
 // GREEN-API ждёт ответ 180 с, потом шлёт то же сообщение ещё раз: повторы пропускаем
@@ -424,6 +454,7 @@ async function alreadySeen(id: string): Promise<boolean> {
 
 async function handle(h: any, t0: number, origin: string) {
   if (h?.typeWebhook === "quotaExceeded") return console.log("GREEN-API: лимит чатов тарифа исчерпан", JSON.stringify(h));
+  if (h?.typeWebhook === "outgoingAPIMessageReceived") return await continueAnswer(t0, origin);
   if (h?.typeWebhook !== "incomingMessageReceived") return;
   const chatId = String(h.senderData?.chatId ?? "");
   if (!/@(c\.us|lid)$/.test(chatId)) return; // группы, статусы и каналы пропускаем
@@ -486,7 +517,7 @@ async function setupPage(url: URL): Promise<Response> {
     try {
       const s = await green("getSettings");
       const cur = String(s?.webhookUrl ?? "");
-      if (/^https:\/\/[^/]+\.val\.run\/\?k=/.test(cur) && cur.endsWith(`?k=${HOOK_KEY}`) && s?.incomingWebhook === "yes") {
+      if (/^https:\/\/[^/]+\.val\.run\/\?k=/.test(cur) && cur.endsWith(`?k=${HOOK_KEY}`) && s?.incomingWebhook === "yes" && s?.outgoingAPIMessageWebhook === "yes") {
         rows.push("✅ Вебхук настроен");
       } else {
         await green("setSettings", {
@@ -495,7 +526,7 @@ async function setupPage(url: URL): Promise<Response> {
           incomingWebhook: "yes",
           outgoingWebhook: "no",
           outgoingMessageWebhook: "no",
-          outgoingAPIMessageWebhook: "no",
+          outgoingAPIMessageWebhook: "yes", // нужен, чтобы бот сам продолжал длинные ответы
           stateWebhook: "no",
           incomingCallWebhook: "no",
           editedMessageWebhook: "no",
