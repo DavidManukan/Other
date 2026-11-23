@@ -11,12 +11,13 @@
 import { DurableObject } from "cloudflare:workers";
 import type Anthropic from "@anthropic-ai/sdk";
 import { type Cfg, type Effort, type Env, chatStub, config, hider, isEffort, logKey, lower } from "./config.ts";
-import { type Answer, ask, Busy, Fatal, Stopped, tasks, Timeout } from "./claude.ts";
+import { type Answer, type Spent, ask, Busy, Fatal, inputTokens, Stopped, tasks, Timeout } from "./claude.ts";
+import { CHECK_PROMPT, judgeText } from "./prompt.ts";
 import { CAPTION_MAX, Green, GreenError, permanent, TooBig } from "./green.ts";
 import { renderPng } from "./render.ts";
 import { type SelfTest, SAMPLE_PARTS, SAMPLE_SVG, status } from "./status.ts";
-import { card, compose, plainText, seam, splitAnswer } from "./text.ts";
-import { base64, clock, fingerprint, imageSize, imageType } from "./util.ts";
+import { card, compose, plainText, seam, splitAnswer, verdict } from "./text.ts";
+import { type FileType, base64, clock, fileType, fingerprint, imageSize, imageType } from "./util.ts";
 
 const SEGMENT = 13 * 60_000; // столько работает один кусок (потолок будильника 15 минут)
 const SEGMENT_TAIL = 45_000; // запас в конце куска на отправку и сохранение
@@ -39,10 +40,17 @@ const MAX_PHOTOS = 10; // столько последних фото бот по
 const MSG_MAX = 12_000; // ответ идёт одним сообщением; длиннее этого делим по границам заданий
 const PHOTO_CHUNK = 1_000_000; // значение в хранилище ограничено по размеру, фото режем на части
 const PHOTO_MAX = 5_000_000; // больше не берём: такое фото не нужно и бьёт по памяти
+const PDF_TOKENS = 150_000; // файл PDF длиннее этого (примерно 60 страниц) в одно решение не берём: это очень дорого и почти всегда ошибка
 const PHOTO_BUDGET = 12_000_000; // столько байт фото уходит в один запрос: в памяти их одновременно лежит несколько копий
 const MAX_FETCHES = 3; // столько раз заново пробуем скачать фото, если шлюз временно не отдаёт
 const IMG_TTL = 86_400_000; // рисунки храним сутки
 const LOG_MAX = 12;
+const CHECK_TRIES = 3; // столько раз пробуем вторую проверку, если Claude занят или ответил не по форме
+const CHECK_TTL = 86_400_000; // вторую проверку ждём не дольше суток
+const GATE_TTL = 30_000; // столько чат помнит общие настройки (доступ, лимит), не спрашивая служебный объект
+const SPEND_DAYS = 40; // за столько дней хранится расход
+const FIX_TITLE = "⚠️ Исправление после перепроверки";
+const FIX_TURN = "(бот сам перепроверил своё решение и прислал исправление)";
 const CUT_NOTE = "(ответ получился слишком длинным и оборван: пришли оставшиеся задания отдельным фото)";
 const CONT = "Ответ оборвался. Продолжай со следующей строки после уже написанного: написанное не повторяй, незаконченный рисунок начни заново целиком.";
 export const STATUS = "__status"; // имя служебного объекта: журнал, страница проверки, хозяин бота
@@ -63,10 +71,56 @@ interface Opts {
   effort?: Effort;
   fast?: boolean;
   pages?: boolean; // решение картинкой (страницы) или текстом
+  check?: boolean; // вторая, независимая проверка готового решения
 }
+// Расход за сутки (UTC). Лежит в служебном объекте.
+interface Day {
+  usd: number;
+  tokens: number;
+  n: number; // запросов к Claude
+  browser: number; // мс работы браузера, который снимает страницы
+  unpriced?: number; // запросов на модели, цену которой бот не знает
+}
+// Общие настройки бота из служебного объекта
+interface Gate {
+  closed: boolean; // доступ закрыт: бот отвечает только хозяину
+  cap: number | null; // дневной лимит расходов, доллары
+  today: number; // потрачено сегодня
+  owner: string | null;
+}
+// Вторая проверка. В объекте чата лежит то, что нужно проверить; очередь проверок ведёт отдельный объект «чат#check»,
+// чтобы проверка шла параллельно со следующими заданиями и не задерживала их.
+interface CheckInput {
+  turn: Block[];
+  body: string;
+  effort: Effort;
+  at: number;
+}
+interface Check {
+  ref: string;
+  chatId: string;
+  phase: "check" | "judge"; // проверяющая модель, затем (если она нашла ошибку) арбитраж основной модели
+  tries: number;
+  issues?: string;
+  after?: number;
+}
+// То, что получает объект проверок: вопрос с фото в виде запроса к Claude и отправленное решение
+interface CheckWork {
+  question: Anthropic.Beta.BetaContentBlockParam[];
+  body: string;
+  effort: Effort;
+}
+interface CheckResult {
+  ok?: boolean;
+  fix?: string; // исправленное решение заданий, где была ошибка
+  failed?: string;
+}
+const day = (t: number) => new Date(t).toISOString().slice(0, 10);
+const money = (x: number) => `$${x.toFixed(2)}`;
+
 interface PhotoMeta {
   id: string;
-  type: "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+  type: FileType; // фото или PDF
   n: number;
   size?: number; // байт
 }
@@ -75,6 +129,7 @@ interface Shot {
   url?: string;
   caption?: string;
   fwd?: boolean; // фото переслано из другого чата: подпись к нему писал не владелец
+  pdf?: boolean; // это файл PDF, а не фото
   at: number;
   size?: string; // «1600×1200», для журнала: по нему видно, в каком качестве приходят фото
   hash?: string; // отпечаток содержимого: одно и то же фото, отправленное дважды, считаем один раз
@@ -89,7 +144,7 @@ interface Outcome {
 interface Job {
   id: string;
   at: number;
-  kind: "image" | "text";
+  kind: "image" | "text" | "fix"; // fix: готовое исправление после второй проверки, его нужно только доставить
   text?: string;
   fwd?: boolean; // текст переслан из другого чата
   shots: Shot[]; // фото этой работы по порядку
@@ -120,6 +175,7 @@ interface Job {
   started?: number;
   msgs: number;
   tokens: number;
+  usd?: number; // примерная цена всех запросов к Claude по этой работе
   checks: number; // сколько раз модель пересчитывала вычисления кодом
   model?: string;
 }
@@ -138,6 +194,14 @@ const stamp = (id: string) => [...id.replace(/\W/g, "").slice(-8)].map((ch) => [
 // так он не сможет выдать себя за слова владельца
 const foreign = (s: string) => `<пересланное>${s.replace(/</g, "‹").replace(/>/g, "›")}</пересланное>`;
 
+// «3 фото», «2 файла», «3 (фото и файлы)»
+function count(shots: Shot[]): string {
+  const n = shots.length, files = shots.filter((x) => x.pdf).length;
+  if (!files) return `${n} фото`;
+  if (files < n) return `${n} (фото и файлы)`;
+  return `${n} ${n % 10 === 1 && n % 100 !== 11 ? "файл" : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? "файла" : "файлов"}`;
+}
+
 class Delivery extends Error {} // ответ готов, но шлюз его сейчас не принимает: Claude не переспрашиваем, ждём шлюз
 class Added extends Error {} // к заданию добавили фото или уточнение: решение начинается заново со всем сразу
 
@@ -153,6 +217,8 @@ export class Chat extends DurableObject<Env> {
   private epoch = 0; // растёт на «сброс»: решение, начатое до сброса, память уже не трогает
   private owner: boolean | undefined; // этот чат принадлежит хозяину бота
   private k: number; // масштаб времени: 1 в работе, больше только в локальных тестах
+  private gateAt = 0;
+  private gateVal: Gate = { closed: false, cap: null, today: 0, owner: null };
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -171,6 +237,9 @@ export class Chat extends DurableObject<Env> {
     const chatId = String(h?.senderData?.chatId ?? "");
     const id = String(h?.idMessage ?? "");
     if (!chatId) return;
+    // доступ закрыт хозяином: чужие чаты бот не слушает и ничего о них не хранит
+    const gate = await this.gate();
+    if (gate.closed && !this.mine(chatId, gate)) return;
     const seen = (await this.db.get<string[]>("seen")) ?? [];
     if (id && seen.includes(id)) return; // шлюз иногда присылает одно сообщение дважды
     const meta: Meta = { chatId, origin };
@@ -181,8 +250,9 @@ export class Chat extends DurableObject<Env> {
     const type = String(md.typeMessage ?? "");
     const fd = md.fileMessageData ?? {};
     try {
-      if (type === "imageMessage" || (type === "documentMessage" && /^image\//.test(String(fd.mimeType ?? "")))) {
-        const shot: Shot = { id, url: fd.downloadUrl ? String(fd.downloadUrl) : undefined, caption: String(fd.caption ?? "").trim().slice(0, 2000) || undefined, fwd: forwarded(fd) || undefined, at: Date.now() };
+      const pdf = type === "documentMessage" && (/pdf/i.test(String(fd.mimeType ?? "")) || /\.pdf$/i.test(String(fd.fileName ?? "")));
+      if (type === "imageMessage" || pdf || (type === "documentMessage" && /^image\//.test(String(fd.mimeType ?? "")))) {
+        const shot: Shot = { id, url: fd.downloadUrl ? String(fd.downloadUrl) : undefined, caption: String(fd.caption ?? "").trim().slice(0, 2000) || undefined, fwd: forwarded(fd) || undefined, pdf: pdf || undefined, at: Date.now() };
         return await this.photoIn(chatId, shot, mark);
       }
       if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
@@ -195,7 +265,7 @@ export class Chat extends DurableObject<Env> {
           return await this.textIn(chatId, id, text + about, forwarded(md.extendedTextMessageData) || forwarded(md.textMessageData), mark);
         }
       } else if (NUDGE.has(type)) {
-        await this.green.send(chatId, "Пришли фото задания.");
+        await this.green.send(chatId, "Пришли фото задания или файл PDF.");
       } // реакции, правки, удаления: молча пропускаем
       await this.markSeen(id, meta);
     } catch (e: any) {
@@ -250,10 +320,11 @@ export class Chat extends DurableObject<Env> {
       await this.db.put({ ...mark, [key]: job });
       if (live) this.stop?.abort(new Added("добавлено фото"));
       await this.db.setAlarm(job.after!);
-      return await this.say(chatId, `➕ Добавил к прошлому: теперь ${job.shots.length} фото. Решение пришлю одним ответом.`);
+      return await this.say(chatId, `➕ Добавил к прошлому: теперь ${count(job.shots)}. Решение пришлю одним ответом.`);
     }
     const busy = await this.enqueue({ kind: "image", id: shot.id, shots: [shot] }, mark);
-    await this.say(chatId, busy ? "📥 Принял фото, решу сразу после текущего." : "📥 Принял фото, решаю.");
+    const what = shot.pdf ? "файл" : "фото";
+    await this.say(chatId, busy ? `📥 Принял ${what}, решу сразу после текущего.` : `📥 Принял ${what}, решаю.`);
   }
 
   private async textIn(chatId: string, id: string, text: string, fwd: boolean, mark: Record<string, unknown>) {
@@ -277,9 +348,44 @@ export class Chat extends DurableObject<Env> {
     await this.db.put({ seen: id ? [...seen.filter((x) => x !== id), id].slice(-200) : seen, meta });
   }
 
-  private async options(): Promise<{ effort: Effort; fast: boolean; pages: boolean }> {
+  private async options(): Promise<{ effort: Effort; fast: boolean; pages: boolean; check: boolean }> {
     const o = (await this.db.get<Opts>("opts")) ?? {};
-    return { effort: o.effort ?? this.c.effort, fast: o.fast ?? this.c.fast, pages: o.pages ?? this.c.pages };
+    return { effort: o.effort ?? this.c.effort, fast: o.fast ?? this.c.fast, pages: o.pages ?? this.c.pages, check: o.check ?? this.c.check };
+  }
+
+  // Общие настройки (доступ, дневной лимит, сегодняшний расход) лежат в служебном объекте; чат помнит их полминуты
+  private async gate(fresh = false): Promise<Gate> {
+    if (fresh || Date.now() - this.gateAt > GATE_TTL / this.k) {
+      try {
+        this.gateVal = await chatStub(this.env, STATUS).gateInfo();
+        this.gateAt = Date.now();
+      } catch (e) {
+        console.log("gate:", this.hide(e));
+      }
+    }
+    return this.gateVal;
+  }
+
+  // Чат хозяина? В отличие от isOwner, никого хозяином не назначает
+  private mine(chatId: string, g: Gate): boolean {
+    const same = (o: string) => o === chatId || o.replace(/\D/g, "") === chatId.replace(/\D/g, "");
+    return this.c.owners.length ? this.c.owners.some(same) : g.owner === chatId;
+  }
+
+  // Записывает расход: в работу (для журнала) и в общий счёт за сутки
+  private async bill(job: Job | null, list: Spent[]) {
+    if (!list.length) return;
+    const tokens = list.reduce((n, s) => n + s.in + s.out + s.read + s.write, 0);
+    const usd = list.reduce((n, s) => n + (s.usd ?? 0), 0);
+    if (job) {
+      job.tokens += tokens;
+      job.usd = (job.usd ?? 0) + usd;
+    }
+    try {
+      await chatStub(this.env, STATUS).spend({ usd, tokens, requests: list.length, unpriced: list.filter((s) => s.usd === null).length });
+    } catch (e) {
+      console.log("spend:", this.hide(e));
+    }
   }
 
   // Режим (а значит и расходы) меняет только хозяин: чаты из OWNER, а без неё первый чат, который написал боту «ping» или сменил режим
@@ -303,15 +409,16 @@ export class Chat extends DurableObject<Env> {
       const mine = await this.isOwner(chatId);
       await this.green.send(
         chatId,
-        `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}, пересчёт кодом ${this.c.code ? "вкл" : "выкл"}, решение: ${o.pages ? "картинкой" : "текстом"}${queue ? `, в работе: ${queue}` : ""}\n` +
+        `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}, пересчёт кодом ${this.c.code ? "вкл" : "выкл"}, вторая проверка ${o.check ? "вкл" : "выкл"}, решение: ${o.pages ? "картинкой" : "текстом"}${queue ? `, в работе: ${queue}` : ""}\n` +
           (mine
-            ? `Команды: решай, стоп, сброс, картинкой / текстом, быстро / средне / умно / макс, fast вкл / fast выкл\nЖурнал: ${origin}/?k=${await logKey(this.c)}`
+            ? `Команды: решай, стоп, сброс, картинкой / текстом, быстро / средне / умно / макс, fast вкл / fast выкл, проверка вкл / выкл, расход, лимит 3 / лимит выкл, доступ закрыть / открыть\nЖурнал: ${origin}/?k=${await logKey(this.c)}`
             : "Команды: решай, стоп, сброс, картинкой / текстом"),
       );
       return true;
     }
     if (/^(сброс|новое|reset)$/.test(t)) {
       await this.forget();
+      await this.dropChecks(chatId);
       await this.green.send(chatId, "Память чата очищена ✅");
       return true;
     }
@@ -319,6 +426,7 @@ export class Chat extends DurableObject<Env> {
       const jobs = await this.db.list({ prefix: "job:" });
       await this.db.delete([...jobs.keys()]);
       this.stop?.abort(new Stopped("стоп"));
+      await this.dropChecks(chatId);
       await this.green.send(chatId, jobs.size ? "Остановил ✅" : "Сейчас ничего не решаю.");
       return true;
     }
@@ -344,6 +452,40 @@ export class Chat extends DurableObject<Env> {
       const pages = look[1] !== "текстом";
       await this.db.put<Opts>("opts", { ...((await this.db.get<Opts>("opts")) ?? {}), pages });
       await this.green.send(chatId, pages ? "Решения присылаю картинкой ✅" : "Решения присылаю текстом ✅");
+      return true;
+    }
+    // расходы, лимит, доступ и вторая проверка: всё это про деньги хозяина, поэтому только ему
+    const spendWord = /^(расход|расходы|траты|стоимость)$/.test(t);
+    const lim = t.match(/^лимит\s+(\S+)$/);
+    const acc = t.match(/^доступ\s+(закрыть|закрой|закрыт|открыть|открой|открыт)$/);
+    const chk = t.match(/^(?:проверка|перепроверка)\s+(вкл|выкл|on|off)$/);
+    if (spendWord || lim || acc || chk) {
+      if (!(await this.isOwner(chatId))) {
+        await this.green.send(chatId, `Это доступно только хозяину бота. Если это ты, добавь в Cloudflare переменную OWNER со значением ${chatId}`);
+        return true;
+      }
+      const hub = chatStub(this.env, STATUS);
+      if (spendWord) await this.green.send(chatId, await hub.report());
+      else if (lim) {
+        const off = /^(выкл|нет|off|0)$/.test(lim[1]);
+        const cap = off ? null : Number(lim[1].replace(",", ".").replace(/^\$|\$$/g, ""));
+        if (cap !== null && !(cap > 0 && cap <= 10_000)) {
+          await this.green.send(chatId, "Не понял сумму. Пример: «лимит 3» это 3 доллара в сутки, «лимит выкл» снимает лимит.");
+          return true;
+        }
+        await hub.setGate({ cap });
+        this.gateAt = 0;
+        await this.green.send(chatId, cap === null ? "Дневной лимит снят ✅" : `Дневной лимит: ${money(cap)} ✅ Когда он исчерпан, бот ждёт следующих суток (сутки считаются по UTC).`);
+      } else if (acc) {
+        const closed = acc[1].startsWith("закр");
+        await hub.setGate({ closed });
+        this.gateAt = 0;
+        await this.green.send(chatId, closed ? "Доступ закрыт ✅ Бот отвечает только тебе." : "Доступ открыт ✅ Бот отвечает всем, кто ему напишет.");
+      } else if (chk) {
+        const check = chk[1] === "вкл" || chk[1] === "on";
+        await this.db.put<Opts>("opts", { ...((await this.db.get<Opts>("opts")) ?? {}), check });
+        await this.green.send(chatId, check ? `Вторая проверка включена ✅ После ответа решение перепроверяет ${this.c.checkModel}; найдёт ошибку, пришлю исправление.` : "Вторая проверка выключена ✅");
+      }
       return true;
     }
     const m = t.match(/^(?:effort|режим)\s+(\S+)$/);
@@ -404,9 +546,17 @@ export class Chat extends DurableObject<Env> {
     try {
       const first = await this.db.list<Job>({ prefix: "job:", limit: 1 });
       const [key, job] = [...first][0] ?? [];
-      if (!key || !job) return await this.selfTest();
-      if (job.after && job.after > Date.now()) return; // пауза перед повтором или ожидание следующего фото ещё не прошли
       const watch = () => this.db.setAlarm(Date.now() + WATCHDOG / this.k).catch((e) => console.log("watchdog:", String(e)));
+      if (!key || !job) {
+        // заданий нет: это либо объект второй проверки со своей очередью, либо служебный объект с самопроверкой
+        const [ckey, chk] = [...(await this.db.list<Check>({ prefix: "chkq:", limit: 1 }))][0] ?? [];
+        if (!ckey || !chk) return await this.selfTest();
+        if (chk.after && chk.after > Date.now()) return;
+        await watch();
+        beat = setInterval(watch, BEAT / this.k);
+        return await this.runCheck(ckey, chk);
+      }
+      if (job.after && job.after > Date.now()) return; // пауза перед повтором или ожидание следующего фото ещё не прошли
       await watch();
       beat = setInterval(watch, BEAT / this.k);
       await this.run(key, job);
@@ -419,7 +569,9 @@ export class Chat extends DurableObject<Env> {
       this.posting = null;
       const next = await this.db.list<Job>({ prefix: "job:", limit: 1 });
       const job = [...next.values()][0];
+      const chk = job ? undefined : [...(await this.db.list<Check>({ prefix: "chkq:", limit: 1 })).values()][0];
       if (job) await this.db.setAlarm(Math.max(Date.now(), job.after ?? 0));
+      else if (chk) await this.db.setAlarm(Math.max(Date.now(), chk.after ?? 0));
       else await this.db.deleteAlarm();
     }
   }
@@ -492,7 +644,7 @@ export class Chat extends DurableObject<Env> {
           : e instanceof Busy
           ? "Claude занят. Пришли ещё раз через минуту."
           : e instanceof TooBig
-          ? "Фото слишком большое. Пришли обычное фото."
+          ? "Файл больше 5 МБ. Пришли обычное фото или файл поменьше."
           : String(e?.message ?? e);
         await this.note(`ошибка: ${this.hide(why).slice(0, 160)}`);
         await this.say(chatId, `⚠️ ${this.hide(why)}`);
@@ -514,6 +666,22 @@ export class Chat extends DurableObject<Env> {
       // если ответ обрезало, продолжаем его: уже написанное модель видит как свой текст
       if (job.acc) turns.push({ role: "assistant", content: job.acc }, { role: "user", content: [{ type: "text", text: CONT }] });
 
+      // Дневной лимит расходов, который задал хозяин: когда он исчерпан, новых запросов к Claude не делаем
+      const gate = await this.gate(true);
+      if (gate.cap !== null && gate.today >= gate.cap) {
+        await this.note(`дневной лимит исчерпан (${money(gate.today)} из ${money(gate.cap)}): задание не решено`);
+        return await this.finish(key, job, chatId, this.mine(chatId, gate)
+          ? `Дневной лимит расходов исчерпан: потрачено ${money(gate.today)} из ${money(gate.cap)}. Напиши «лимит выкл» или подними лимит и пришли задание ещё раз.`
+          : "На сегодня бот закончил работу. Пришли задание завтра.");
+      }
+      const messages = await this.toApi(turns);
+      // Длинный PDF (учебник целиком) в одно решение не берём: сначала бесплатно считаем, сколько он займёт
+      if (!job.acc && job.shots.some((x) => x.pdf)) {
+        const size = await inputTokens(this.c, messages);
+        if (stop.aborted) throw stop.reason;
+        if (size !== null && size > PDF_TOKENS) return await this.finish(key, job, chatId, "Файл слишком длинный для одного решения. Пришли фото нужных страниц или файл покороче.");
+      }
+
       // долгое молчание похоже на поломку: один раз даём знать, что бот жив
       const hello = job.hello ? undefined : setTimeout(() => {
         if (stop.aborted) return;
@@ -525,12 +693,13 @@ export class Chat extends DurableObject<Env> {
       job.tries++; // попытка засчитывается до запроса: если объект упадёт посреди него, счётчик это запомнит
       await save();
       let a: Answer;
+      const bills: Spent[] = [];
       try {
-        a = await ask(this.c, { messages: await this.toApi(turns), effort: job.effort, fast, until: end - SEGMENT_TAIL / this.k, stop });
+        a = await ask(this.c, { messages, effort: job.effort, fast, until: end - SEGMENT_TAIL / this.k, stop, spent: (s) => bills.push(s) });
       } finally {
         clearTimeout(hello);
+        await this.bill(job, bills); // расход считаем при любом исходе: оборванный запрос тоже стоит денег
       }
-      job.tokens += a.tokens.in + a.tokens.out;
       job.checks += a.checks;
       job.model = a.model;
       const full = job.acc ? `${job.acc}\n${a.text.replace(/^\s*\n/, "")}` : a.text; // продолжение начинается с новой строки
@@ -565,10 +734,14 @@ export class Chat extends DurableObject<Env> {
     await this.flush(key, job, chatId, origin, stop);
     // Память чата и задание без вопроса пишем одной записью: после перезапуска пара не добавится второй раз
     const turn = job.turn;
+    const solved = (job.parts ?? []).some((p) => /^Ответ:/m.test(p));
     job.turn = undefined;
     job.parts = undefined;
     if (turn && epoch === this.epoch && (job.body || job.svgs.length)) {
       await this.db.put({ hist: this.trimHistory([...(await this.history()), { role: "user", content: turn }, { role: "assistant", content: job.body || "[рисунок]" }]), [key]: job });
+      // Ответ у человека. Теперь его независимо перепроверяет вторая модель: в фоне, следующие задания это не задерживает
+      const done = job.done;
+      if (job.kind === "image" && solved && job.body && done && !done.cut && !done.refused && (await this.options()).check) await this.startCheck(job, turn, chatId);
     }
 
     // 4. Итог
@@ -600,11 +773,13 @@ export class Chat extends DurableObject<Env> {
     const { pages } = await this.options();
     // Страницы нужны решению. Разговор без формул и служебный ответ («Не разобрал фото. Пересними ближе.») остаются текстом
     const solved = parts.some((p) => /^Ответ:/m.test(p)) || job.svgs.length > 0;
-    const worth = solved && (job.kind === "image" || job.svgs.length > 0 || parts.some((p) => /\$[^$\n]+\$/.test(p)));
+    const worth = solved && (job.kind !== "text" || job.svgs.length > 0 || parts.some((p) => /\$[^$\n]+\$/.test(p)));
+    const title = job.kind === "fix" ? FIX_TITLE : undefined; // исправление после второй проверки подписано так, чтобы его не спутали с новым решением
     let shots: Uint8Array[] | null = null;
     if (pages && worth && parts.length && job.shot < 2 && (this.env.BROWSER || this.env.SHOT) && Date.now() >= ((await this.db.get<number>("nobrowser")) ?? 0)) {
       job.shot++; // попытка засчитывается заранее: если снимок уронит объект, во второй раз не пробуем
       await save();
+      const began = Date.now();
       try {
         shots = await this.snap(parts, job.svgs);
       } catch (e: any) {
@@ -612,10 +787,12 @@ export class Chat extends DurableObject<Env> {
         console.log("pages:", this.hide(e?.stack ?? e));
         await this.note(`страницы не получились, отвечаю текстом: ${this.hide(e?.message ?? e).slice(0, 140)}`);
       }
+      // у браузера 10 бесплатных минут в сутки: сколько ушло, видно по команде «расход»
+      await chatStub(this.env, STATUS).spend({ browser: Date.now() - began }).catch((e) => console.log("spend:", this.hide(e)));
       if (stop.aborted) throw stop.reason; // пока снимали, пришло ещё фото или «стоп»
     }
     if (shots?.length) {
-      const summary = card(plain);
+      const summary = card(plain, title);
       const items: Out[] = summary.length > CAPTION_MAX ? compose([summary], MSG_MAX) : []; // длинный список ответов идёт отдельным сообщением перед страницами
       for (const [i, bytes] of shots.entries()) {
         const id = imageId();
@@ -627,7 +804,7 @@ export class Chat extends DurableObject<Env> {
       job.pages = shots.length;
       job.svgs = []; // рисунки уже стоят на страницах
     } else {
-      job.outbox = compose(plain, MSG_MAX);
+      job.outbox = compose(plain, MSG_MAX, title);
     }
     job.packed = true;
     await save();
@@ -693,10 +870,11 @@ export class Chat extends DurableObject<Env> {
         let type: PhotoMeta["type"] | null = null;
         try {
           const bytes = await this.green.photo(chatId, shot.id, shot.url, Date.now() + 40_000, PHOTO_MAX);
-          if ((type = imageType(bytes))) {
+          if ((type = fileType(bytes))) {
             shot.hash = await fingerprint(bytes);
+            shot.pdf = type === "application/pdf" || undefined; // верим содержимому, а не названию файла
             const px = imageSize(bytes);
-            shot.size = `${px ? `${px.w}×${px.h}, ` : ""}${Math.round(bytes.length / 1024)} КБ`;
+            shot.size = `${shot.pdf ? "PDF, " : px ? `${px.w}×${px.h}, ` : ""}${Math.round(bytes.length / 1024)} КБ`;
             await this.savePhoto(shot.id, bytes, type);
             sizes.set(shot.id, bytes.length);
           }
@@ -716,7 +894,7 @@ export class Chat extends DurableObject<Env> {
     }
     if (!ready.length) {
       await this.db.delete(key);
-      await this.say(chatId, "Не понял формат фото. Пришли обычное фото.");
+      await this.say(chatId, "Не понял формат файла. Пришли обычное фото или PDF.");
       return null;
     }
     const lost = job.shots.filter((x) => !ready.includes(x) && !x.hash).length;
@@ -725,17 +903,22 @@ export class Chat extends DurableObject<Env> {
     const fit = ready.filter((x, i) => (weight += sizes.get(x.id) ?? 0) <= PHOTO_BUDGET || i === 0);
     const heavy = ready.length - fit.length;
     job.shots = fit; // повторы и неоткрывшиеся фото убираем, чтобы не разбираться с ними при каждом запуске
-    if (lost) await this.say(chatId, `(фото не открылось: ${lost}. Пришли его ещё раз.)`);
-    if (heavy) await this.say(chatId, `(фото слишком тяжёлые, взял первые ${fit.length}. Остальные пришли обычным фото, не файлом.)`);
+    if (lost) await this.say(chatId, `(не открылось: ${lost}. Пришли ещё раз.)`);
+    if (heavy) await this.say(chatId, `(всё вместе слишком тяжёлое, взял первые ${fit.length}. Остальное пришли обычным фото.)`);
     const n = fit.length;
     const content: Block[] = [];
     for (const [i, shot] of fit.entries()) {
-      if (n > 1) content.push({ type: "text", text: `Фото ${i + 1} из ${n}:` });
+      if (n > 1) content.push({ type: "text", text: `${shot.pdf ? "Файл" : "Фото"} ${i + 1} из ${n}:` });
       content.push({ type: "photo", id: shot.id });
     }
     const own = fit.filter((x) => !x.fwd).map((x) => x.caption).filter(Boolean).join("; ");
     const others = [...fit.filter((x) => x.fwd).map((x) => x.caption), ...(job.quotes ?? [])].filter((x): x is string => !!x);
-    const lead = n > 1 ? `Реши задания с этих ${n} фото. Это одна работа, фото идут в том порядке, в котором их сняли.` : "Реши задания с фото.";
+    const files = fit.filter((x) => x.pdf).length;
+    const lead = n === 1
+      ? files ? "Реши задания из файла PDF." : "Реши задания с фото."
+      : files
+      ? `Реши задания из этих материалов: их ${n}, фото и файлы PDF. Это одна работа, материалы идут в том порядке, в котором их прислали.`
+      : `Реши задания с этих ${n} фото. Это одна работа, фото идут в том порядке, в котором их сняли.`;
     content.push({
       type: "text",
       // чужое идёт раньше слов владельца и в тегах: строка «Сообщения владельца» внутри пересланного останется пересланным
@@ -801,6 +984,9 @@ export class Chat extends DurableObject<Env> {
       const cutoff = (Date.now() - IMG_TTL).toString(16).padStart(12, "0");
       const old = await this.db.list({ prefix: "img:", end: `img:${cutoff}`, limit: 16 });
       if (old.size) await this.db.delete([...old.keys()]);
+      // проверка, которая так и не закончилась (её объект не ответил за сутки)
+      const stale = [...(await this.db.list<CheckInput>({ prefix: "chkin:", limit: 16 }))].filter(([, v]) => Date.now() - v.at > CHECK_TTL).map(([k]) => k);
+      if (stale.length) await this.db.delete(stale);
     } catch (e) {
       console.log("sweep:", this.hide(e));
     }
@@ -818,7 +1004,7 @@ export class Chat extends DurableObject<Env> {
     const sec = Math.round((Date.now() - (job.started ?? job.at)) / 1000);
     const photos = job.shots.length ? `, фото ${job.shots.length}${job.shots[0].size ? ` (${job.shots[0].size})` : ""}` : "";
     await this.note(
-      `${message ? "без ответа" : "решено"} за ${sec} с${photos}: сообщений ${job.msgs}, страниц ${job.pages ?? 0}, рисунков ${job.drawn}, пересчётов кодом ${job.checks}, режим ${job.effort}, модель ${job.model ?? this.c.model}, токенов ${job.tokens}`,
+      `${message ? "без ответа" : "решено"} за ${sec} с${photos}: сообщений ${job.msgs}, страниц ${job.pages ?? 0}, рисунков ${job.drawn}, пересчётов кодом ${job.checks}, режим ${job.effort}, модель ${job.model ?? this.c.model}, токенов ${job.tokens}${job.usd ? `, примерно ${money(job.usd)}` : ""}`,
     );
   }
 
@@ -892,10 +1078,204 @@ export class Chat extends DurableObject<Env> {
         if (b.type === "text") return b;
         const photo = photos.get(b.id);
         return photo
-          ? { type: "image", source: { type: "base64", media_type: photo.type, data: photo.data } }
+          ? photo.type === "application/pdf"
+            ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: photo.data } }
+            : { type: "image", source: { type: "base64", media_type: photo.type, data: photo.data } }
           : { type: "text", text: metas.has(b.id) ? "[фото прошлой работы, в этот запрос не помещается]" : "[фото задания, уже не хранится]" };
       }),
     }));
+  }
+
+  // ---------- вторая проверка: сторона чата ----------
+  // Готовый ответ уже у человека. Кладём рядом то, что нужно проверить, и будим объект проверок этого чата.
+  private async startCheck(job: Job, turn: Block[], chatId: string) {
+    try {
+      const ref = imageId();
+      await this.db.put<CheckInput>(`chkin:${ref}`, { turn, body: job.body ?? "", effort: job.effort, at: Date.now() });
+      await chatStub(this.env, `${chatId}#check`).enqueueCheck(ref, chatId);
+    } catch (e) {
+      console.log("check:", this.hide(e)); // проверка это дополнение: её сбой ответу не мешает
+    }
+  }
+
+  // «стоп» и «сброс»: начатые проверки больше не нужны
+  private async dropChecks(chatId: string) {
+    try {
+      const pending = await this.db.list({ prefix: "chkin:" });
+      if (!pending.size) return;
+      await this.db.delete([...pending.keys()]);
+      await chatStub(this.env, `${chatId}#check`).cancelChecks();
+    } catch (e) {
+      console.log("check:", this.hide(e));
+    }
+  }
+
+  // Что проверять: вопрос с фото в том виде, в каком его получает Claude, и отправленное решение. null: проверка отменена или фото уже нет
+  async checkInput(ref: string): Promise<CheckWork | null> {
+    const inp = await this.db.get<CheckInput>(`chkin:${ref}`);
+    if (!inp) return null;
+    const content = (await this.toApi([{ role: "user", content: inp.turn }]))[0]?.content;
+    const question = Array.isArray(content) ? content : [];
+    if (!question.some((b) => b.type === "image" || b.type === "document")) {
+      await this.db.delete(`chkin:${ref}`);
+      return null;
+    }
+    return { question, body: inp.body, effort: inp.effort };
+  }
+
+  // Итог второй проверки. Ошибок нет: короткое подтверждение. Есть: исправление встаёт в очередь как готовый ответ.
+  async checked(ref: string, r: CheckResult): Promise<void> {
+    const inp = await this.db.get<CheckInput>(`chkin:${ref}`);
+    const meta = await this.db.get<Meta>("meta");
+    if (!inp || !meta) return; // «стоп» или «сброс» пришли раньше: результат уже не нужен
+    if (r.failed) {
+      await this.db.delete(`chkin:${ref}`);
+      return await this.note(`вторая проверка не состоялась: ${this.hide(r.failed).slice(0, 140)}`);
+    }
+    if (r.fix) {
+      const { text, svgs } = splitAnswer(r.fix);
+      const parts = tasks(text);
+      if (parts.length) {
+        const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
+        const job: Job = {
+          kind: "fix", id: `fix${ref}`, at: Date.now(), shots: [], notes: [], quotes: [], fetches: 0, phase: "solve", step: 0, tries: 0, effort: inp.effort, acc: "",
+          body: parts.join("\n\n"), parts, turn: [{ type: "text", text: FIX_TURN }], done: { cut: false, refused: false, empty: false },
+          sent: 0, outbox: [], shot: 0, pages: 0, down: 0, svgs: [...new Set(svgs)].slice(0, MAX_DRAWINGS), drawn: 0, msgs: 0, tokens: 0, checks: 0,
+        };
+        // одной записью: исправление в очереди и отметка, что проверка закрыта (повторный вызов не поставит его второй раз)
+        await this.db.put({ seq, [`job:${String(seq).padStart(9, "0")}`]: job });
+        await this.db.delete(`chkin:${ref}`);
+        await this.note("вторая проверка нашла ошибку: отправляю исправление");
+        if (!this.running) await this.db.setAlarm(Date.now());
+        return;
+      }
+    }
+    await this.db.delete(`chkin:${ref}`);
+    await this.note("вторая проверка: решение подтверждено");
+    await this.say(meta.chatId, "✅ Перепроверил решение: всё сходится.");
+  }
+
+  // ---------- вторая проверка: объект «чат#check» со своей очередью ----------
+  async enqueueCheck(ref: string, chatId: string): Promise<void> {
+    const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
+    await this.db.put({ seq, [`chkq:${String(seq).padStart(9, "0")}`]: { ref, chatId, phase: "check", tries: 0 } satisfies Check });
+    if (!this.running) await this.db.setAlarm(Date.now());
+  }
+
+  async cancelChecks(): Promise<void> {
+    const all = await this.db.list({ prefix: "chkq:" });
+    if (all.size) await this.db.delete([...all.keys()]);
+    this.stop?.abort(new Stopped("стоп"));
+  }
+
+  // Одна проверка. Сначала решение смотрит вторая модель. Нашла ошибку: спорные задания перерешивает основная модель,
+  // и только если она согласна, человеку уходит исправление. Так случайная придирка проверяющего не портит верный ответ.
+  private async runCheck(key: string, q: Check) {
+    const main = chatStub(this.env, q.chatId);
+    const stop = new AbortController();
+    this.stop = stop;
+    const close = async (r: CheckResult) => {
+      if (stop.signal.aborted) return;
+      await main.checked(q.ref, r);
+      await this.db.delete(key);
+    };
+    try {
+      if (q.tries >= CHECK_TRIES) return await close({ failed: "не получилось после нескольких попыток" });
+      q.tries++;
+      delete q.after;
+      await this.db.put(key, q);
+      const input = (await main.checkInput(q.ref)) as unknown as CheckWork | null;
+      if (!input) return void (await this.db.delete(key)); // проверку отменили («стоп», «сброс») или фото уже не хранится
+      const gate = await this.gate(true);
+      if (gate.cap !== null && gate.today >= gate.cap) return await close({ failed: "дневной лимит расходов исчерпан" });
+      const until = Date.now() + (SEGMENT - SEGMENT_TAIL) / this.k;
+      const bills: Spent[] = [];
+      const spent = (s: Spent) => void bills.push(s);
+      try {
+        if (q.phase === "check") {
+          const a = await ask(this.c, {
+            messages: [{ role: "user", content: [...input.question, { type: "text", text: `Решение, которое нужно проверить:\n\n${input.body}` }] }],
+            effort: this.c.effort, fast: false, until, stop: stop.signal, system: CHECK_PROMPT, model: this.c.checkModel, spent,
+          });
+          const v = verdict(a.text);
+          if (!v) throw new Busy("проверяющая модель ответила не по форме");
+          if (v.ok) return await close({ ok: true });
+          q.phase = "judge";
+          q.issues = v.issues.slice(0, 4000);
+          q.tries = 1;
+          await this.db.put(key, q);
+        }
+        const a = await ask(this.c, {
+          messages: [{ role: "user", content: input.question }, { role: "assistant", content: input.body }, { role: "user", content: judgeText(q.issues ?? "") }],
+          effort: input.effort, fast: false, until, stop: stop.signal, spent,
+        });
+        const fixed = /^Ответ:/m.test(a.text);
+        if (/^\s*ВС[ЕЁ] ВЕРНО/i.test(a.text) && !fixed) return await close({ ok: true });
+        if (a.refused || !fixed || (a.cut && !/Ответ:[^\n]*\n?\s*$/.test(a.text.trimEnd() + "\n"))) throw new Busy("основная модель не дописала разбор замечаний");
+        return await close({ fix: a.text });
+      } finally {
+        await this.bill(null, bills);
+      }
+    } catch (e: any) {
+      if (e instanceof Stopped || stop.signal.aborted) return;
+      console.log("check:", this.hide(e?.stack ?? e));
+      if (e instanceof Fatal) return await close({ failed: e.message }).catch((x) => console.log("check:", this.hide(x)));
+      // Claude занят, время вышло или связь оборвалась: подождём и попробуем ещё раз
+      if (await this.db.get(key)) {
+        q.after = Date.now() + (BACKOFF[q.tries - 1] ?? BACKOFF[BACKOFF.length - 1]) / this.k;
+        await this.db.put(key, q);
+      }
+    } finally {
+      if (this.stop === stop) this.stop = null;
+    }
+  }
+
+  // ---------- служебный объект: расходы, дневной лимит, доступ ----------
+  async spend(d: { usd?: number; tokens?: number; requests?: number; browser?: number; unpriced?: number }): Promise<void> {
+    const key = `spend:${day(Date.now())}`;
+    const cur = await this.db.get<Day>(key);
+    const base = cur ?? { usd: 0, tokens: 0, n: 0, browser: 0 };
+    const unpriced = (base.unpriced ?? 0) + (d.unpriced ?? 0);
+    await this.db.put<Day>(key, { usd: base.usd + (d.usd ?? 0), tokens: base.tokens + (d.tokens ?? 0), n: base.n + (d.requests ?? 0), browser: base.browser + (d.browser ?? 0), ...(unpriced ? { unpriced } : {}) });
+    if (!cur) {
+      // первая запись за сутки: заодно убираем то, что старше срока хранения
+      const old = await this.db.list({ prefix: "spend:", end: `spend:${day(Date.now() - SPEND_DAYS * 86_400_000)}`, limit: 64 });
+      if (old.size) await this.db.delete([...old.keys()]);
+    }
+  }
+
+  async gateInfo(): Promise<Gate> {
+    const key = `spend:${day(Date.now())}`;
+    const got = await this.db.get<unknown>(["closed", "cap", "owner", key]);
+    const cap = got.get("cap");
+    return { closed: got.get("closed") === true, cap: typeof cap === "number" ? cap : null, today: (got.get(key) as Day | undefined)?.usd ?? 0, owner: (got.get("owner") as string | undefined) ?? null };
+  }
+
+  async setGate(p: { closed?: boolean; cap?: number | null }): Promise<void> {
+    if (p.closed !== undefined) await this.db.put("closed", p.closed);
+    if (p.cap === null) await this.db.delete("cap");
+    else if (typeof p.cap === "number") await this.db.put("cap", p.cap);
+    await this.log(p.closed !== undefined ? (p.closed ? "доступ закрыт: бот отвечает только хозяину" : "доступ открыт") : p.cap === null ? "дневной лимит снят" : `дневной лимит: ${money(p.cap ?? 0)}`);
+  }
+
+  // Ответ на команду «расход»
+  async report(): Promise<string> {
+    const days = await this.db.list<Day>({ prefix: "spend:" });
+    const at = (back: number) => days.get(`spend:${day(Date.now() - back * 86_400_000)}`);
+    const sum = (n: number) => Array.from({ length: n }, (_, i) => at(i)?.usd ?? 0).reduce((a, b) => a + b, 0);
+    const today = at(0);
+    const g = await this.gateInfo();
+    return [
+      "Расход на Claude (примерно, по ценам API; сутки считаются по UTC)",
+      `сегодня: ${money(today?.usd ?? 0)}, запросов ${today?.n ?? 0}`,
+      `вчера: ${money(at(1)?.usd ?? 0)}`,
+      `за 7 дней: ${money(sum(7))}`,
+      `за 30 дней: ${money(sum(30))}`,
+      `Браузер для страниц сегодня: ${Math.round((today?.browser ?? 0) / 1000)} с из 600 бесплатных`,
+      `Дневной лимит: ${g.cap === null ? "не задан" : money(g.cap)} (команды: лимит 3, лимит выкл)`,
+      `Доступ: ${g.closed ? "закрыт, бот отвечает только тебе" : "открыт"} (команды: доступ закрыть, доступ открыть)`,
+      today?.unpriced ? "(часть запросов шла на модели, цену которой бот не знает: в сумму они не вошли)" : "",
+    ].filter(Boolean).join("\n");
   }
 
   // ---------- служебный объект: журнал и страница проверки ----------

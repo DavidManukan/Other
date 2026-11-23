@@ -25,6 +25,29 @@ export interface AskOptions {
   fast: boolean;
   until: number; // срок куска, мс
   stop?: AbortSignal; // «стоп» или новое фото к этому же заданию: причина лежит в signal.reason
+  system?: string; // своя инструкция вместо основной (перепроверка готового решения)
+  model?: string; // своя модель для этого запроса; недоступна на ключе: запрос идёт на основной
+  spent?: (s: Spent) => void; // вызывается после каждого обращения к Claude, чем бы оно ни кончилось: по этим цифрам считается расход
+}
+
+// Что потрачено за одно обращение: токены по видам и цена в долларах (null: цена модели неизвестна)
+export interface Spent {
+  model: string;
+  in: number;
+  out: number;
+  read: number; // прочитано из кэша
+  write: number; // записано в кэш
+  usd: number | null;
+}
+// Цена за миллион токенов, доллары: вход, выход, чтение кэша, запись в кэш на 5 минут. Fast-режим вдвое дороже.
+const PRICES: Record<string, [number, number, number, number]> = {
+  "claude-fable-5-2": [8, 40, 0.2, 10],
+  "claude-opus-5-5": [4, 20, 0.2, 5],
+  "claude-sonnet-5-5": [2, 10, 0.1, 2.5],
+};
+export function price(model: string, u: { in: number; out: number; read: number; write: number }, fast: boolean): number | null {
+  const p = PRICES[Object.keys(PRICES).find((k) => model.startsWith(k)) ?? ""];
+  return p ? ((u.in * p[0] + u.out * p[1] + u.read * p[2] + u.write * p[3]) / 1e6) * (fast ? 2 : 1) : null;
 }
 
 type StreamParams = Parameters<Anthropic["beta"]["messages"]["stream"]>[0];
@@ -80,6 +103,7 @@ export function claudeProblem(c: Cfg, e: unknown, model = c.model): Error {
     if (CREDIT.test(msg)) return new Fatal("На балансе Claude кончились деньги (platform.claude.com → Billing).");
     if (SPEND.test(msg)) return new Fatal("Claude: достигнут лимит трат, который задан в консоли (platform.claude.com → Limits).");
     if (RETENTION.test(msg)) return new Fatal(`Модель ${model} требует хранения данных 30 дней: включи его в консоли Claude или поставь другую модель в MODEL.`);
+    if (/\bpdf\b|document/i.test(msg)) return new Fatal("Не смог прочитать файл PDF (он защищён паролем, повреждён или слишком длинный). Пришли фото нужных страниц.");
     return new Fatal(`Ошибка Claude ${e.status}: ${msg.slice(0, 120)}`);
   }
   return e instanceof Error ? e : new Error(String(e));
@@ -87,6 +111,21 @@ export function claudeProblem(c: Cfg, e: unknown, model = c.model): Error {
 
 export function client(c: Cfg): Anthropic {
   return new Anthropic({ apiKey: c.claudeKey, baseURL: c.claudeBase, maxRetries: 2 });
+}
+
+// Сколько токенов займёт запрос: бесплатная проверка перед дорогим запросом с файлом PDF.
+// Infinity: запрос заведомо не помещается. null: посчитать не вышло, тогда решаем как обычно.
+export async function inputTokens(c: Cfg, messages: Anthropic.Beta.BetaMessageParam[]): Promise<number | null> {
+  try {
+    const r = await client(c).beta.messages.countTokens({ model: activeModel(c), messages }, { signal: AbortSignal.timeout(30_000) });
+    return r.input_tokens;
+  } catch (e) {
+    if (e instanceof Anthropic.ContentTooLargeError) return Infinity;
+    const msg = e instanceof Anthropic.APIError ? String(e.apiMessage ?? e.message ?? "") : "";
+    if (e instanceof Anthropic.BadRequestError && /too (long|large|many)|maximum|exceed/i.test(msg)) return Infinity;
+    console.log("подсчёт токенов не удался:", String((e as Error)?.message ?? e).slice(0, 160));
+    return null;
+  }
 }
 
 // Какой необязательный параметр не понравился модели. Если ошибка 400 не называет ни одного из них,
@@ -117,10 +156,16 @@ export async function ask(c: Cfg, o: AskOptions): Promise<Answer> {
     for (const [m, f] of removed) disabled.get(m)?.delete(f);
   };
   for (;;) {
-    const model = activeModel(c);
+    const own = o.model && (down.get(o.model) ?? 0) <= Date.now() ? o.model : undefined;
+    const model = own ?? activeModel(c);
     try {
       return await converse(c, model, o);
     } catch (e) {
+      if (own && own !== c.model && unavailable(e)) {
+        console.log(`модель ${own} недоступна, этот запрос идёт на основной:`, String((e as Error).message).slice(0, 200));
+        down.set(own, Date.now() + MODEL_RETRY);
+        continue;
+      }
       if (model === c.model && c.fallbackModel && c.fallbackModel !== c.model && unavailable(e)) {
         console.log(`модель ${model} недоступна, работаю на ${c.fallbackModel}:`, String((e as Error).message).slice(0, 200));
         down.set(c.model, Date.now() + MODEL_RETRY);
@@ -250,7 +295,7 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
     // размышления тоже идут в счёт max_tokens, на высоких ступенях им нужно больше места
     max_tokens: o.effort === "xhigh" || o.effort === "max" ? 128_000 : 64_000,
     // инструкция одна и та же для всех фото: кэшируем, следующие запросы дешевле и быстрее
-    system: [{ type: "text", text: PROMPT, cache_control: { type: "ephemeral" } }],
+    system: [{ type: "text", text: o.system ?? PROMPT, cache_control: { type: "ephemeral" } }],
     // и разговор тоже: при добавлении фото, продолжении и уточнениях старые фото читаются из кэша
     cache_control: { type: "ephemeral" },
     messages,
@@ -280,10 +325,22 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   let out = "";
   let fresh = false;
   let opened = false; // поток открылся: модель приняла запрос и начала работать
+  // Расход считаем по ходу потока: если он оборвётся, уже потраченное всё равно попадёт в учёт
+  const used = { in: 0, out: 0, read: 0, write: 0 };
+  let served = model;
+  const count = (u: { input_tokens?: number | null; output_tokens?: number | null; cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null } | undefined) => {
+    if (!u) return;
+    used.in = Math.max(used.in, u.input_tokens ?? 0);
+    used.out = Math.max(used.out, u.output_tokens ?? 0);
+    used.read = Math.max(used.read, u.cache_read_input_tokens ?? 0);
+    used.write = Math.max(used.write, u.cache_creation_input_tokens ?? 0);
+  };
   try {
     const stream = client(c).beta.messages.stream(params, { signal: ctrl.signal });
     for await (const ev of stream) {
       opened = true;
+      if (ev.type === "message_start") (count(ev.message.usage), (served = ev.message.model || served));
+      else if (ev.type === "message_delta") count(ev.usage);
       if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") out += ev.delta.text;
       else if (ev.type === "content_block_start" && isTool(ev.content_block.type as string)) {
         out = ""; // всё, что было написано до проверки, это заметки, а не ответ
@@ -291,6 +348,8 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
       }
     }
     const msg = await stream.finalMessage();
+    count(msg.usage);
+    served = msg.model || served;
     return { text: "", tokens: { in: msg.usage.input_tokens, out: msg.usage.output_tokens }, msg };
   } catch (e) {
     // «стоп» или новое фото: причину решает вызывающий
@@ -309,6 +368,13 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   } finally {
     clearTimeout(timer);
     o.stop?.removeEventListener("abort", interrupt);
+    if (used.in + used.out + used.read + used.write > 0) {
+      try {
+        o.spent?.({ model: served, ...used, usd: price(served, used, params.speed === "fast") });
+      } catch (e) {
+        console.log("учёт расхода:", String(e));
+      }
+    }
   }
 }
 

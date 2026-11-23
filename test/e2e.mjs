@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BIG, calls, claude, CONT, flags, NUDGE, settings, start } from "./mock.mjs";
+import { BIG, calls, claude, CONT, counted, flags, NUDGE, settings, start } from "./mock.mjs";
 
 const MOCK = 8788, PORT = 8787, TOKEN = "testtoken-1234567890abcdef", KEY_CLAUDE = "sk-ant-test-1234567890";
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -30,6 +30,8 @@ const hook = (chat, messageData, id = `MSG${++n}`) =>
 const text = (chat, t, id) => hook(chat, { typeMessage: "textMessage", textMessageData: { textMessage: t } }, id);
 const photo = (chat, caption = "", id, url = `http://127.0.0.1:${MOCK}/photo.jpg`, extra = {}) =>
   hook(chat, { typeMessage: "imageMessage", fileMessageData: { downloadUrl: url, caption, mimeType: "image/jpeg", ...extra } }, id);
+const pdf = (chat, caption = "", url = `http://127.0.0.1:${MOCK}/task.pdf`, extra = {}) =>
+  hook(chat, { typeMessage: "documentMessage", fileMessageData: { downloadUrl: url, caption, mimeType: "application/pdf", fileName: "домашка.pdf", ...extra } });
 const of = (chat) => calls.filter((c) => c.chatId === `${chat}@c.us`);
 const texts = (chat) => of(chat).filter((c) => c.method === "sendMessage").map((c) => c.text);
 const ACK = /^(📥|➕)/; // подтверждения «принял фото» и «добавил»
@@ -64,6 +66,7 @@ const VARS = {
   GREEN_MEDIA_URL: `http://127.0.0.1:${MOCK}/media`,
   TIME_SCALE: "60",
   PAGES: "0", // старые проверки идут в текстовом режиме; страницы-картинки включаются командой «картинкой» в своих чатах
+  CHECK: "0", // вторая проверка решения включается командой «проверка вкл» в своём чате
   SHOT: "mock", // браузера в тестах нет: вместо снимков готовые картинки
 };
 const state = mkdtempSync(join(tmpdir(), "solver-e2e-")); // каждый прогон с чистого листа
@@ -142,7 +145,7 @@ try {
 
   // --- команды ---
   await text("111", "Пинг");
-  ok(await until(() => texts("111").some((t) => t.startsWith("pong ✅ модель claude-fable-5-2, думает: high, fast выкл, пересчёт кодом вкл, решение: текстом"))), "ping", JSON.stringify(texts("111").slice(-1)));
+  ok(await until(() => texts("111").some((t) => t.startsWith("pong ✅ модель claude-fable-5-2, думает: high, fast выкл, пересчёт кодом вкл, вторая проверка выкл, решение: текстом"))), "ping", JSON.stringify(texts("111").slice(-1)));
   ok(texts("111").at(-1).includes(`Журнал: ${BASE}/?k=${LOG_KEY}`) && !texts("111").at(-1).includes(KEY), "ping хозяину: личная ссылка на журнал, секрета вебхука в ней нет", texts("111").at(-1));
   await text("912", "макс");
   ok(await until(() => texts("912").some((t) => t.startsWith("Режим меняет только хозяин бота"))), "чужой чат не может поднять режим", JSON.stringify(texts("912")));
@@ -161,7 +164,7 @@ try {
   await text("111", "новый вопрос");
   ok(await until(() => claude.length > b3) && claude[b3].messages.length === 1, "после сброса память пустая, даже если сброс пришёл посреди решения", JSON.stringify(claude[b3]?.messages).slice(0, 300));
   await hook("111", { typeMessage: "stickerMessage" });
-  ok(await until(() => texts("111").includes("Пришли фото задания.")), "стикер: просим фото");
+  ok(await until(() => texts("111").includes("Пришли фото задания или файл PDF.")), "стикер: просим фото");
   await text("917", "решай");
   ok(await until(() => texts("917").includes("Сейчас нечего решать. Пришли фото.")), "«решай» без работы: понятный ответ");
 
@@ -316,9 +319,9 @@ try {
   await photo("913", "S_BIG", undefined, `http://127.0.0.1:${MOCK}/big.jpg`);
   ok(await until(() => answers("913").some((t) => t.includes("Ответ: 5")), 30_000) && sentPhoto() === sha(BIG), "большое фото дошло до Claude без потерь");
   await photo("915", "", undefined, `http://127.0.0.1:${MOCK}/huge.jpg`);
-  ok(await until(() => answers("915").includes("⚠️ Фото слишком большое. Пришли обычное фото.")), "огромный файл: отказ без скачивания", JSON.stringify(texts("915")));
+  ok(await until(() => answers("915").includes("⚠️ Файл больше 5 МБ. Пришли обычное фото или файл поменьше.")), "огромный файл: отказ без скачивания", JSON.stringify(texts("915")));
   await photo("916", "", undefined, `http://127.0.0.1:${MOCK}/notphoto`);
-  ok(await until(() => answers("916").includes("Не понял формат фото. Пришли обычное фото.")), "не картинка: понятное сообщение", JSON.stringify(texts("916")));
+  ok(await until(() => answers("916").includes("Не понял формат файла. Пришли обычное фото или PDF.")), "не картинка: понятное сообщение", JSON.stringify(texts("916")));
 
   // --- ответ на конкретное сообщение: модель знает, на какое ---
   const bq = claude.length;
@@ -434,6 +437,123 @@ try {
   flags.sendHang = "";
   ok(await until(async () => (await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text()).includes("сообщение уже в чате: повторно не шлю"), 90_000), "шлюз молчит: бот увидел сообщение в журнале исходящих");
   ok(await until(() => drawings("960").length === 1, 30_000) && answers("960").length === 1, "шлюз молчит: ответ в чате один, рисунок дошёл следом", JSON.stringify(of("960").map((c) => c.method)));
+
+  // --- файл PDF вместо фото: уходит в Claude документом ---
+  const docs = (m) => (Array.isArray(m.content) ? m.content.filter((x) => x.type === "document") : []);
+  await pdf("970", "S_PDF");
+  ok(await until(() => answers("970").some((t) => t.includes("Ответ: 5"))), "PDF: задание решено", JSON.stringify(texts("970")));
+  ok(texts("970")[0] === "📥 Принял файл, решаю.", "PDF: подтверждение говорит про файл", texts("970")[0]);
+  const rp = reqs("S_PDF")[0];
+  const doc = docs(rp.messages.at(-1))[0];
+  ok(doc?.source?.media_type === "application/pdf" && Buffer.from(doc.source.data, "base64").toString().startsWith("%PDF-1.4") && lastText(rp).startsWith("Реши задания из файла PDF."), "PDF: в запросе документ и просьба решить файл", lastText(rp));
+  ok(counted.some((b) => JSON.stringify(b.messages).includes("S_PDF")), "PDF: перед решением бесплатно посчитан размер запроса");
+  // фото и PDF одной работой
+  await photo("971", "S_WAIT mixa");
+  ok(await until(() => reqs("mixa").length === 1), "фото и PDF: решение первого фото началось");
+  await pdf("971", "S_WAIT mixb", `http://127.0.0.1:${MOCK}/task2.pdf`);
+  ok(await until(() => texts("971").some((t) => t.startsWith("➕ Добавил к прошлому: теперь 2 (фото и файлы)."))), "фото и PDF: файл добавлен к той же работе", JSON.stringify(texts("971")));
+  ok(await until(() => answers("971").some((t) => t.includes("Ответ: 42"))), "фото и PDF: один ответ", JSON.stringify(texts("971")));
+  const rm = reqs("mixb").at(-1).messages.at(-1);
+  ok(imgs(rm) === 1 && docs(rm).length === 1 && rm.content.some((x) => x.text === "Фото 1 из 2:") && rm.content.some((x) => x.text === "Файл 2 из 2:") && rm.content.at(-1).text.includes("фото и файлы PDF"), "фото и PDF: оба материала в одном запросе и подписаны", JSON.stringify(rm.content.map((x) => `${x.type}:${x.text ?? ""}`)));
+  // слишком длинный PDF: отказ до платного запроса
+  await pdf("972", "S_BIGPDF");
+  ok(await until(() => answers("972").some((t) => t.startsWith("Файл слишком длинный для одного решения."))), "длинный PDF: понятный отказ", JSON.stringify(texts("972")));
+  ok(reqs("S_BIGPDF").length === 0, "длинный PDF: платного запроса к Claude не было");
+  // в файле с именем .pdf лежит не PDF
+  await pdf("973", "", `http://127.0.0.1:${MOCK}/notphoto`);
+  ok(await until(() => answers("973").includes("Не понял формат файла. Пришли обычное фото или PDF.")), "не PDF под видом PDF: понятное сообщение", JSON.stringify(texts("973")));
+
+  // --- расход, дневной лимит и доступ: команды хозяина ---
+  await text("912", "расход");
+  ok(await until(() => texts("912").some((t) => t.startsWith("Это доступно только хозяину бота"))), "расход: чужому чату не показываем", JSON.stringify(texts("912").slice(-1)));
+  await text("111", "расход");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Расход на Claude"))), "расход: хозяин получает отчёт");
+  const spendReport = texts("111").at(-1);
+  const spentToday = /сегодня: \$(\d+\.\d\d), запросов (\d+)/.exec(spendReport);
+  ok(spentToday && Number(spentToday[1]) > 0.3 && Number(spentToday[2]) > 10 && spendReport.includes("Дневной лимит: не задан") && spendReport.includes("Доступ: открыт") && /Браузер для страниц сегодня: \d+ с из 600/.test(spendReport), "расход: сумма за сегодня, число запросов, лимит и доступ", spendReport);
+  await text("111", "лимит много");
+  ok(await until(() => texts("111").at(-1).startsWith("Не понял сумму.")), "лимит: непонятная сумма не принимается");
+  await text("111", "лимит 0,01");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Дневной лимит: $0.01 ✅"))), "лимит: задан командой");
+  await photo("974", "S_LIMA");
+  ok(await until(() => answers("974").includes("На сегодня бот закончил работу. Пришли задание завтра.")), "лимит исчерпан: чужому чату короткий отказ", JSON.stringify(texts("974")));
+  await photo("111", "S_LIMB");
+  ok(await until(() => answers("111").some((t) => /^Дневной лимит расходов исчерпан: потрачено \$\d+\.\d\d из \$0\.01\./.test(t))), "лимит исчерпан: хозяину сумма и подсказка", JSON.stringify(texts("111").slice(-2)));
+  ok(reqs("S_LIMA").length === 0 && reqs("S_LIMB").length === 0, "лимит исчерпан: запросов к Claude нет");
+  await text("111", "лимит выкл");
+  ok(await until(() => texts("111").includes("Дневной лимит снят ✅")), "лимит: снят командой");
+  await photo("974", "S_LIMC");
+  ok(await until(() => answers("974").some((t) => t.includes("Ответ: 5"))), "после снятия лимита бот снова решает", JSON.stringify(texts("974")));
+  await text("111", "доступ закрыть");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Доступ закрыт ✅"))), "доступ: закрыт командой");
+  await photo("975", "S_SHUT");
+  await text("975", "ping");
+  await sleep(2000);
+  ok(of("975").length === 0 && reqs("S_SHUT").length === 0, "доступ закрыт: чужому чату бот не отвечает и ничего не решает", JSON.stringify(texts("975")));
+  await text("111", "ping");
+  ok(await until(() => texts("111").at(-1).startsWith("pong")), "доступ закрыт: хозяин работает как обычно");
+  await text("111", "доступ открыть");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Доступ открыт ✅"))), "доступ: открыт командой");
+  await sleep(800); // чат помнит общие настройки полсекунды (время в тестах ускорено)
+  await text("975", "ping");
+  ok(await until(() => texts("975").some((t) => t.startsWith("pong"))), "доступ открыт: чужой чат снова получает ответ", JSON.stringify(texts("975")));
+  page = await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text();
+  ok(/токенов \d+, примерно \$\d+\.\d\d/.test(page), "журнал: у решённого задания видна примерная цена", page.split("Последние события")[1]?.slice(0, 400));
+
+  // --- вторая проверка: после ответа решение перепроверяет другая модель ---
+  const isCheck = (b) => Array.isArray(b.system) && b.system[0].text.startsWith("Ты проверяешь готовое решение");
+  const isJudge = (b) => lastText(b).startsWith("Независимая перепроверка");
+  const confirms = () => texts("111").filter((t) => t === "✅ Перепроверил решение: всё сходится.").length;
+  const fixes = () => texts("111").filter((t) => t.startsWith("⚠️ Исправление после перепроверки"));
+  await text("111", "проверка вкл");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Вторая проверка включена ✅"))), "вторая проверка: включена командой");
+  await photo("111", "S_CHKOK");
+  ok(await until(() => confirms() === 1, 30_000), "вторая проверка: решение подтверждено", JSON.stringify(texts("111").slice(-3)));
+  const c1 = reqs("S_CHKOK").filter(isCheck);
+  ok(c1.length === 1 && c1[0].model === "claude-opus-5-5" && imgs(c1[0].messages[0]) === 1 && lastText(c1[0]).includes("Решение, которое нужно проверить:") && lastText(c1[0]).includes("Ответ: 5"), "вторая проверка: другой моделью, с фото и отправленным решением", JSON.stringify(c1.map((b) => [b.model, lastText(b).slice(0, 80)])));
+  const seq1 = texts("111");
+  ok(seq1.findLastIndex((t) => t.startsWith("✅ Ответы")) < seq1.lastIndexOf("✅ Перепроверил решение: всё сходится."), "вторая проверка идёт после ответа, а не вместо него");
+  // проверяющий нашёл ошибку, основная модель согласилась: приходит исправление
+  await photo("111", "S_CHKFIX");
+  ok(await until(() => fixes().length === 1, 30_000), "вторая проверка нашла ошибку: пришло исправление", JSON.stringify(texts("111").slice(-3)));
+  ok(fixes()[0] === `⚠️ Исправление после перепроверки\n№2: 7\n${RULE}\n№2\nПересчёт: 3 + 4 = 7\nОтвет: 7`, "исправление: заголовок, ответ и полное решение задания, без разметки", fixes()[0]);
+  const judge = reqs("S_CHKFIX").filter(isJudge);
+  ok(judge.length === 1 && judge[0].model === "claude-fable-5-2" && judge[0].messages.length === 3 && judge[0].messages[1].role === "assistant" && imgs(judge[0].messages[0]) === 1 && lastText(judge[0]).includes("№2: в решении 5, а получается 7"), "спорное место решает основная модель: видит фото, своё решение и замечание", JSON.stringify(judge.map((b) => [b.model, b.messages.length])));
+  await sleep(1200);
+  ok(confirms() === 1, "после исправления «всё сходится» не шлём");
+  const bFix = claude.length;
+  await text("111", "а почему во втором семь? S_AFTERFIX");
+  ok(await until(() => claude.slice(bFix).some((b) => JSON.stringify(b.messages).includes("S_AFTERFIX"))), "вопрос после исправления ушёл в Claude");
+  ok(JSON.stringify(claude.slice(bFix).find((b) => JSON.stringify(b.messages).includes("S_AFTERFIX")).messages).includes("Пересчёт: $3 + 4 = 7$"), "исправление запомнено: следующий вопрос его видит");
+  ok(await until(() => answers("111").at(-1).includes("Ответ: 5") || drawings("111").length > 0), "ответ на вопрос после исправления пришёл");
+  // проверяющий ошибся, основная модель отстояла решение
+  await photo("111", "S_CHKARG");
+  ok(await until(() => confirms() === 2, 30_000), "ложная тревога проверяющего: решение подтверждено", JSON.stringify(texts("111").slice(-3)));
+  ok(fixes().length === 1 && reqs("S_CHKARG").filter(isJudge).length === 1, "ложная тревога исправлением не стала");
+  // проверяющий отвечает не по форме: три попытки, человеку ничего лишнего
+  await photo("111", "S_CHKBAD");
+  ok(await until(() => reqs("S_CHKBAD").filter(isCheck).length === 3, 30_000), "проверяющий отвечает не по форме: три попытки", String(reqs("S_CHKBAD").filter(isCheck).length));
+  await sleep(4000);
+  page = await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text();
+  ok(reqs("S_CHKBAD").filter(isCheck).length === 3 && confirms() === 2 && fixes().length === 1 && page.includes("вторая проверка не состоялась"), "неудачная проверка: запись в журнале, в чат ничего", page.split("Последние события")[1]?.slice(0, 500));
+  // проверка идёт параллельно: следующее задание её не ждёт
+  await photo("111", "S_CHKSLOW pара");
+  ok(await until(() => reqs("S_CHKSLOW").filter(isCheck).length === 1, 30_000), "медленная проверка началась");
+  await photo("111", "S_PAR следующее");
+  ok(await until(() => reqs("S_PAR").filter((b) => !isCheck(b) && !isJudge(b)).length === 1, 3000), "вторая проверка не задерживает следующее задание");
+  ok(await until(() => fixes().length === 2 && confirms() === 3, 40_000), "обе проверки дошли до конца: исправление первой работы и подтверждение второй", JSON.stringify(texts("111").slice(-4).map((t) => t.slice(0, 50))));
+  // «стоп» отменяет начатую проверку
+  await photo("111", "S_CHKSLOW стоп S_STOPCHK");
+  ok(await until(() => reqs("S_STOPCHK").filter(isCheck).length === 1, 30_000), "стоп: проверка началась");
+  await text("111", "стоп");
+  await sleep(7000);
+  ok(fixes().length === 2 && reqs("S_STOPCHK").filter(isJudge).length === 0, "стоп во время второй проверки: исправление не приходит", JSON.stringify(texts("111").slice(-3).map((t) => t.slice(0, 50))));
+  await text("111", "проверка выкл");
+  ok(await until(() => texts("111").includes("Вторая проверка выключена ✅")), "вторая проверка: выключена командой");
+  await photo("111", "S_NOCHK");
+  ok(await until(() => answers("111").filter((t) => t.includes("Ответ: 5")).length > 0 && reqs("S_NOCHK").length === 1), "без второй проверки: обычное решение");
+  await sleep(1500);
+  ok(reqs("S_NOCHK").filter(isCheck).length === 0, "без второй проверки: лишних запросов нет");
 
   // --- загрузка файлов в шлюз не работает: рисунок уходит запасным путём, по ссылке ---
   flags.uploadBroken = true;

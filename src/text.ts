@@ -87,7 +87,7 @@ export function answerAt(rows: string[], i: number): { value: string; last: numb
 }
 
 // Короткий список ответов: в начале сообщения или подписью к первой странице. На маленьком экране видно прежде всего его.
-export function card(parts: string[]): string {
+export function card(parts: string[], title = "✅ Ответы"): string {
   const lines = parts.map((p, n) => {
     const rows = p.replace(/```[\s\S]*?```/g, "").split("\n").map((l) => l.trim());
     const head = (rows.find((l) => HEAD.test(l) && l.length <= 60) ?? `Задание ${n + 1}`).replace(/[:.]+$/, "").slice(0, 40);
@@ -113,7 +113,7 @@ export function card(parts: string[]): string {
     }
     return `${head}: ${answer}`;
   });
-  return `✅ Ответы\n${lines.join("\n")}`;
+  return `${title}\n${lines.join("\n")}`;
 }
 
 // Делит одно длинное задание по строкам. Блок кода, попавший на границу, закрываем и открываем заново:
@@ -142,9 +142,10 @@ function pieces(block: string, max: number): string[] {
 
 // Собирает ответ в одно сообщение: сверху список ответов, ниже решения по порядку.
 // Если всё не помещается в max знаков, делит на несколько сообщений по границам заданий.
-export function compose(parts: string[], max: number): string[] {
+// title: свой заголовок списка ответов («Исправление…»); с ним список стоит сверху, даже если задание одно.
+export function compose(parts: string[], max: number, title?: string): string[] {
   if (!parts.length) return [];
-  const blocks = parts.length > 1 ? [card(parts), ...parts] : [...parts];
+  const blocks = parts.length > 1 || title ? [card(parts, title), ...parts] : [...parts];
   const whole = blocks.join(`\n${RULE}\n`);
   if (whole.length <= max) return [whole];
   const out: string[] = [];
@@ -171,4 +172,13 @@ export function seam(text: string): string {
   if (open >= 0 && open > text.lastIndexOf("</svg>")) return text.slice(0, open).trimEnd();
   const nl = text.lastIndexOf("\n");
   return nl > 0 ? text.slice(0, nl).trimEnd() : "";
+}
+
+// Ответ проверяющей модели: «ВЕРДИКТ: ВЕРНО» или «ВЕРДИКТ: ОШИБКА» и список замечаний. null: ответ не по форме
+export function verdict(text: string): { ok: true } | { ok: false; issues: string } | null {
+  const m = /ВЕРДИКТ:\s*(ВЕРНО|ОШИБКА)/i.exec(text);
+  if (!m) return null;
+  if (m[1].toUpperCase() === "ВЕРНО") return { ok: true };
+  const issues = text.slice(m.index + m[0].length).trim();
+  return issues ? { ok: false, issues } : null;
 }

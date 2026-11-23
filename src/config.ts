@@ -14,6 +14,8 @@ export interface Env {
   MODEL?: string;
   FALLBACK_MODEL?: string; // запасная модель, если основная недоступна на этом ключе
   CODE?: string; // CODE=0 выключает пересчёт вычислений в песочнице Anthropic
+  CHECK?: string; // CHECK=0 выключает вторую, независимую проверку готового решения
+  CHECK_MODEL?: string; // модель для второй проверки (по умолчанию запасная: другой взгляд и вдвое дешевле)
   EFFORT?: string;
   FAST?: string;
   AUTO_MAX?: string;
@@ -39,6 +41,8 @@ export interface Cfg {
   model: string;
   fallbackModel: string;
   code: boolean;
+  check: boolean;
+  checkModel: string;
   effort: Effort;
   fast: boolean;
   autoMax: number;
@@ -62,6 +66,8 @@ export function config(env: Env): Cfg {
     model: v("MODEL", "claude-fable-5-2"),
     fallbackModel: v("FALLBACK_MODEL", "claude-opus-5-5"),
     code: v("CODE") !== "0",
+    check: v("CHECK") !== "0",
+    checkModel: v("CHECK_MODEL") || v("FALLBACK_MODEL", "claude-opus-5-5") || v("MODEL", "claude-fable-5-2"),
     effort: isEffort(effort) ? effort : "high",
     fast: v("FAST") === "1",
     autoMax: Number.isFinite(autoMax) && autoMax >= 0 ? Math.min(autoMax, 20) : 5,

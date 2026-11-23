@@ -3,6 +3,7 @@ import http from "node:http";
 
 export const calls = []; // всё, что бот отправил «в WhatsApp»
 export const claude = []; // тела запросов к «Claude»
+export const counted = []; // тела запросов на бесплатный подсчёт токенов
 export const settings = { webhookUrl: "", incomingWebhook: "no" };
 // тест может «сломать» шлюз: загрузку файлов, отправку в чат, ответ на отправку (сообщение ушло, а ответа нет), выдачу фото
 export const flags = { uploadBroken: false, uploadHang: "", sendDown: "", send466: "", sendHang: "", photoDown: 0, noFable: false };
@@ -36,7 +37,7 @@ function sse(res, events, { gap = 5 } = {}) {
 function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks = [], container, after = "" } = {}) {
   if (after) return notes(text, blocks, after, model);
   const ev = [
-    { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", model: model ?? "claude-fable-5-2", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1200, output_tokens: 1 } } },
+    { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", model: model ?? "claude-fable-5-2", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1200, output_tokens: 1, cache_read_input_tokens: 5000, cache_creation_input_tokens: 400 } } },
     { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
     think,
     { type: "content_block_stop", index: 0 },
@@ -101,6 +102,18 @@ function anthropic(req, res, body) {
     res.end(JSON.stringify({ type: "error", error: { type, message } }));
   };
   if (flags.noFable && body.model === "claude-fable-5-2") return err(404, "not_found_error", "model: claude-fable-5-2");
+  // вторая проверка готового решения (своя инструкция) и арбитраж основной модели
+  const system = Array.isArray(body.system) ? body.system.map((b) => b.text).join("") : String(body.system ?? "");
+  if (system.startsWith("Ты проверяешь готовое решение")) {
+    if (scenario === "S_CHKFIX" || scenario === "S_CHKARG") return send("ВЕРДИКТ: ОШИБКА\n№2: в решении 5, а получается 7");
+    if (scenario === "S_CHKBAD") return send("Мне кажется, тут всё хорошо, но я не уверена.");
+    if (scenario === "S_CHKSLOW") return send("ВЕРДИКТ: ОШИБКА\n№1: ответ другой", { think: 4000 });
+    return send("ВЕРДИКТ: ВЕРНО");
+  }
+  if (text.startsWith("Независимая перепроверка")) {
+    if (scenario === "S_CHKARG") return send("ВСЁ ВЕРНО");
+    return send("№2\nПересчёт: $3 + 4 = 7$\nОтвет: $7$");
+  }
   if (scenario === "S_BUSY" && n <= 3) return err(529, "overloaded_error", "Overloaded", { "x-should-retry": "false" });
   if (scenario === "S_400" && body.fallbacks) return err(400, "invalid_request_error", "fallbacks: Extra inputs are not permitted");
   if (scenario === "S_BADIMG") return err(400, "invalid_request_error", "messages.0.content.0.image: Could not process image");
@@ -226,6 +239,15 @@ export function start(port) {
         if (flags.photoDown > 0) return (flags.photoDown--, res.writeHead(503), res.end("storage is down"));
         res.writeHead(200, { "content-type": "image/jpeg" });
         return res.end(Buffer.concat([JPEG, Buffer.from([7, 7, 7])]));
+      }
+      if (url.pathname === "/task.pdf" || url.pathname === "/task2.pdf") {
+        res.writeHead(200, { "content-type": "application/pdf" });
+        return res.end(Buffer.from(`%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n% ${url.pathname}\n%%EOF\n`));
+      }
+      if (url.pathname === "/anthropic/v1/messages/count_tokens" && req.method === "POST") {
+        counted.push(body);
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ input_tokens: JSON.stringify(body.messages).includes("S_BIGPDF") ? 400_000 : 5_000 }));
       }
       if (url.pathname === "/photo.jpg") {
         res.writeHead(200, { "content-type": "image/jpeg" });

@@ -13,6 +13,17 @@ export function imageType(b: Uint8Array): "image/jpeg" | "image/png" | "image/gi
   return null;
 }
 
+// Файл с заданием: картинка или PDF. У PDF подпись «%PDF-» стоит в самом начале (перед ней бывает мусор в несколько байт)
+export type FileType = NonNullable<ReturnType<typeof imageType>> | "application/pdf";
+export function fileType(b: Uint8Array): FileType | null {
+  const img = imageType(b);
+  if (img) return img;
+  for (let i = 0; i + 4 < Math.min(b.length, 1024); i++) {
+    if (b[i] === 0x25 && b[i + 1] === 0x50 && b[i + 2] === 0x44 && b[i + 3] === 0x46 && b[i + 4] === 0x2d) return "application/pdf";
+  }
+  return null;
+}
+
 export function base64(b: Uint8Array): string {
   let s = "";
   for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode(...b.subarray(i, i + 0x8000));
