@@ -74,7 +74,8 @@ export function tex(src: string): string {
       try {
         return sound(katex.renderToString(clean, { ...KATEX, displayMode: true })); // окружения вроде align живут только в выключной формуле
       } catch {
-        return `<span class="raw">${esc(prettyMath(stripTex(texToPlain(src)), sheet || undefined))}</span>`;
+        // знак доллара, написанный в формуле нарочно (\$), помечаем заново: иначе чистка приняла бы его за обрывок разметки
+        return `<span class="raw">${esc(prettyMath(stripTex(texToPlain(src).replace(/\$/g, "\\$")), sheet || undefined))}</span>`;
       }
     }
   }

@@ -45,3 +45,9 @@ test("части разрезанного листинга сходятся бе
   assert.match(html, /pre\.go\{border-bottom:0/);
   assert.match(html, /pre\.on\{border-top:0/);
 });
+
+test("знак доллара из формулы не теряется, даже когда формулу приходится показать текстом", () => {
+  const html = tex("\\url{x} + \\$5");
+  assert.match(html, /class="raw"/);
+  assert.equal(html.replace(/<[^>]+>/g, ""), "x + $5");
+});
