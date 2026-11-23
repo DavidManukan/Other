@@ -102,6 +102,7 @@ interface Check {
   phase: "check" | "judge"; // проверяющая модель, затем (если она нашла ошибку) арбитраж основной модели
   tries: number;
   issues?: string;
+  result?: CheckResult; // итог уже получен, осталось передать его чату: платные запросы повторять не нужно
   after?: number;
 }
 // То, что получает объект проверок: вопрос с фото в виде запроса к Claude и отправленное решение
@@ -1143,8 +1144,9 @@ export class Chat extends DurableObject<Env> {
           sent: 0, outbox: [], shot: 0, pages: 0, down: 0, svgs: [...new Set(svgs)].slice(0, MAX_DRAWINGS), drawn: 0, msgs: 0, tokens: 0, checks: 0,
         };
         // одной записью: исправление в очереди и отметка, что проверка закрыта (повторный вызов не поставит его второй раз)
-        await this.db.put({ seq, [`job:${String(seq).padStart(9, "0")}`]: job });
-        await this.db.delete(`chkin:${ref}`);
+        const queued = this.db.put({ seq, [`job:${String(seq).padStart(9, "0")}`]: job });
+        const closed = this.db.delete(`chkin:${ref}`);
+        await Promise.all([queued, closed]);
         await this.note("вторая проверка нашла ошибку: отправляю исправление");
         if (!this.running) await this.db.setAlarm(Date.now());
         return;
@@ -1174,12 +1176,19 @@ export class Chat extends DurableObject<Env> {
     const main = chatStub(this.env, q.chatId);
     const stop = new AbortController();
     this.stop = stop;
+    // Итог сначала записываем, потом передаём чату: если передача сорвётся, следующий запуск повторит только её
     const close = async (r: CheckResult) => {
       if (stop.signal.aborted) return;
+      q.result = r;
+      await this.db.put(key, q);
       await main.checked(q.ref, r);
       await this.db.delete(key);
     };
     try {
+      if (q.result) {
+        if (++q.tries > 8) return void (await this.db.delete(key)); // чат так и не принял итог: дальше пробовать незачем
+        return await close(q.result);
+      }
       if (q.tries >= CHECK_TRIES) return await close({ failed: "не получилось после нескольких попыток" });
       q.tries++;
       delete q.after;
