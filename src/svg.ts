@@ -1,12 +1,19 @@
 // Приведение рисунков модели к одному стилю (без рендера, чистые функции).
+import { plainMath, stripTex } from "./tex.ts";
 import { subscripts } from "./text.ts";
 
 // Все рисунки в одном стиле: чёрный фон, белые линии, нормальные индексы и степени
 const SUB_DIGITS = "₀₁₂₃₄₅₆₇₈₉", SUP_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹";
 const tsSub = (d: string) => `<tspan baseline-shift="sub" font-size="65%">${d}</tspan>`;
 const tsSup = (d: string) => `<tspan baseline-shift="super" font-size="65%">${d}</tspan>`;
+// Подпись на рисунке с разметкой LaTeX ($\alpha$, \vec{F}, F_{тр}): переводим в обычные знаки, как и текст ответа
+function plainLabel(t: string): string {
+  if (!/[\\$]|[\^_]\{/.test(t)) return t;
+  const raw = t.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+  return stripTex(plainMath(raw)).replace(/&(?!#?\w+;)/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 function fixSvgText(t: string): string {
-  t = t.replace(/\^\(?([−\-+]?[0-9a-z]{1,4})\)?/g, (_m, d) => tsSup(d))
+  t = plainLabel(t).replace(/\^\(?([−\-+]?[0-9a-z]{1,4})\)?/g, (_m, d) => tsSup(d))
     .replace(/[₀-₉]+/g, (m) => tsSub([...m].map((c) => SUB_DIGITS.indexOf(c)).join("")))
     .replace(/[⁰¹²³⁴-⁹]+/g, (m) => tsSup([...m].map((c) => SUP_DIGITS.indexOf(c)).join("")));
   return subscripts(t, tsSub);

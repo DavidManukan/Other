@@ -1,5 +1,5 @@
 // Чистые функции оформления текста: степени, индексы, разбор ответа модели.
-import { plainMath } from "./tex.ts";
+import { normalizeMath, plainMath, stripTex } from "./tex.ts";
 
 // ---------- красивые степени и индексы, если модель всё же написала ^ или _ ----------
 const SUP: Record<string, string> = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻", "−": "⁻", "=": "⁼", "(": "⁽", ")": "⁾", n: "ⁿ", i: "ⁱ", x: "ˣ", y: "ʸ", a: "ᵃ", b: "ᵇ", c: "ᶜ", d: "ᵈ", e: "ᵉ", k: "ᵏ", m: "ᵐ", p: "ᵖ", t: "ᵗ", " ": "" };
@@ -27,7 +27,8 @@ export function prettyMath(text: string): string {
       .replace(/\^\{([^{}]{1,12})\}|\^\(([^()]{1,12})\)/g, (m, a, b) => (b ? conv(`(${b})`, SUP) : conv(a, SUP)) ?? m)
       .replace(/\^([−-]?[0-9]+|[nixyabcdekmpt](?![a-zA-Z]))/g, fix(SUP))
       .replace(/_\{([^{}]{1,12})\}/g, fix(SUB))
-      .replace(/(?<=[A-Za-zА-Яа-я)\]])_([0-9]+|[aeoxnmkt](?![a-zA-Z]))/g, fix(SUB));
+      .replace(/(?<=[A-Za-zА-Яа-я)\]])_([0-9]+|[aeoxnmkt](?![a-zA-Z]))/g, fix(SUB))
+      .replace(/([\^_])\{([^{}\n]*)\}/g, "$1($2)"); // степень без надстрочных знаков: «x^(2k+1)», фигурных скобок в тексте не остаётся
   }).join("");
 }
 
@@ -48,14 +49,15 @@ export function splitAnswer(raw: string): { text: string; svgs: string[] } {
     if (i % 2) return piece;
     let t = piece.replace(drawn(), (m) => (svgs.push(m), ""));
     if (i === last) t = t.replace(new RegExp(`${DRAWING}[\\s\\S]*$`, "i"), ""); // недописанный рисунок в самом конце
-    return t.replace(/\*\*([^*\n]+)\*\*/g, "$1").replace(/^#{1,6}\s+/gm, "");
+    // запись формул приводим к одному виду («$…$» в одной строке) здесь, один раз для страниц, подписи и текста
+    return normalizeMath(t.replace(/\*\*([^*\n]+)\*\*/g, "$1").replace(/^#{1,6}\s+/gm, ""));
   }).join("").replace(/\n{3,}/g, "\n\n").trim();
   return { text, svgs };
 }
 
 // Текст с формулами LaTeX -> текст для WhatsApp: формулы знаками Юникода, код программ как есть
 export function plainText(text: string): string {
-  return text.split(/(```[\s\S]*?```)/).map((piece, i) => (i % 2 ? piece : prettyMath(plainMath(piece)))).join("");
+  return text.split(/(```[\s\S]*?```)/).map((piece, i) => (i % 2 ? piece : prettyMath(stripTex(plainMath(piece))))).join("");
 }
 
 export const RULE = "——————————"; // черта между заданиями: длинное тире есть в любом шрифте

@@ -17,7 +17,7 @@ import size1 from "katex/dist/fonts/KaTeX_Size1-Regular.woff2";
 import size2 from "katex/dist/fonts/KaTeX_Size2-Regular.woff2";
 import size3 from "katex/dist/fonts/KaTeX_Size3-Regular.woff2";
 import size4 from "katex/dist/fonts/KaTeX_Size4-Regular.woff2";
-import { katexCss, PAGE_W, pageHtml, PAGINATE, textFont } from "./page.ts";
+import { katexCss, PAGE_DPR, PAGE_W, pageHtml, PAGINATE, textFont } from "./page.ts";
 import { base64 } from "./util.ts";
 
 const FONTS: Record<string, ArrayBuffer> = {
@@ -83,7 +83,7 @@ export async function shoot(binding: Fetcher, html: string): Promise<Uint8Array[
   const b = browser;
   const work = async () => {
     const page = await b.newPage();
-    await page.setViewport({ width: PAGE_W, height: 800, deviceScaleFactor: 2 });
+    await page.setViewport({ width: PAGE_W, height: 800, deviceScaleFactor: PAGE_DPR });
     await page.setContent(html, { waitUntil: "load", timeout: 30_000 });
     await page.evaluate("document.fonts.ready.then(() => true)");
     const n = Number(await page.evaluate(PAGINATE)) || 0;

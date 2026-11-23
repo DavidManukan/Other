@@ -4,11 +4,12 @@
 import katex from "katex";
 import "katex/contrib/mhchem"; // химическая запись \ce{…}, если модель всё же напишет формулу так
 import { fixSvg } from "./svg.ts";
-import { mathSpans, texToPlain } from "./tex.ts";
+import { mathSpans, stripTex, texToPlain } from "./tex.ts";
 import { answerAt, HEAD as TASK_HEAD, prettyMath } from "./text.ts";
 import { esc } from "./util.ts";
 
-export const PAGE_W = 560; // ширина страницы в точках CSS; снимается с плотностью 2, то есть 1120 пикселей
+export const PAGE_W = 560; // ширина страницы в точках CSS
+export const PAGE_DPR = 3; // плотность снимка: 1680 пикселей в ширину, мелкие индексы читаются и при увеличении
 export const PAGE_H = 1000; // выше этого страницу делим: 9:16 занимает экран телефона целиком
 
 const HEAD = /^\s*(([^·\n]{1,30}·\s*){0,2}(№|Задание|Задача)\s*\S*|Исправляю\b.*|Вариант\s+\S+.*)$/;
@@ -63,7 +64,7 @@ export function tex(src: string): string {
       try {
         return katex.renderToString(clean, { ...KATEX, displayMode: true }); // окружения вроде align живут только в выключной формуле
       } catch {
-        return `<span class="raw">${esc(texToPlain(src))}</span>`;
+        return `<span class="raw">${esc(prettyMath(stripTex(texToPlain(src))))}</span>`;
       }
     }
   }
@@ -71,7 +72,8 @@ export function tex(src: string): string {
 
 // Строка с формулами $…$ -> HTML
 export function inline(text: string): string {
-  return mathSpans(text).map((s) => (s.math ? tex(s.body) : esc(prettyMath(s.body)))).join("");
+  // вне формул разметки быть не должно: что осталось (знак $ без пары, команда без $), переводится в обычные знаки
+  return mathSpans(text).map((s) => (s.math ? tex(s.body) : esc(prettyMath(stripTex(s.body))))).join("");
 }
 
 // Пометка справа от преобразования: «выражение | что сделали». Черту ищем только вне формул.
@@ -211,6 +213,7 @@ export function assign(parts: string[], svgs: string[]): Fig[][] {
     return free >= 0 ? free : heads.findIndex(ok);
   };
   const figs: Fig[][] = parts.map(() => []);
+  if (!parts.length) return figs; // рисунок без единого задания ставить некуда
   for (const svg of svgs) {
     const label = key(figureLabel(svg));
     let at = label ? find((h) => h === label) : -1;
@@ -222,35 +225,43 @@ export function assign(parts: string[], svgs: string[]): Fig[][] {
   return figs;
 }
 
-// Чёрный фон, белый текст: так страницу хорошо видно и на очках, и на телефоне
+// «Фильтр» листа: полутона на краях букв и линий подтягиваются к белому. Тонкие штрихи формул и чертежей
+// перестают выглядеть серыми, чёрный фон остаётся чёрным.
+const INK = `<svg width="0" height="0" style="position:absolute" aria-hidden="true"><filter id="ink" color-interpolation-filters="sRGB"><feComponentTransfer>${
+  ["R", "G", "B"].map((c) => `<feFunc${c} type="gamma" exponent="0.6" amplitude="1.1"/>`).join("")
+}</feComponentTransfer></filter></svg>`;
+
+// Чёрный фон, белый текст: так страницу хорошо видно и на очках, и на телефоне.
+// Буквам добавлена тонкая обводка: у шрифта формул штрихи волосяные, без неё формулы тусклее текста.
 export function pageCss(): string {
   return `*{box-sizing:border-box}html,body{margin:0;padding:0;background:#000}
-body{width:${PAGE_W}px;color:#fff;font:21px/1.5 'DejaVu Sans',sans-serif;-webkit-font-smoothing:antialiased}
-.sheet{width:${PAGE_W}px;padding:22px 24px 16px;background:#000}
+body{width:${PAGE_W}px;color:#fff;font:21px/1.5 'DejaVu Sans',sans-serif;-webkit-font-smoothing:antialiased;-webkit-text-stroke:.2px #fff}
+.sheet{width:${PAGE_W}px;padding:22px 24px 16px;background:#000;filter:url(#ink)}
 .task{padding:0 0 14px}.task+.task{border-top:2px solid #555;padding-top:10px}
 h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
-.cont{font-size:17px;color:#ccc;margin:0 0 6px}
+.cont{font-size:17px;margin:0 0 6px}
 .b{margin:6px 0;overflow-wrap:anywhere}
 .lbl{font-weight:bold}
 .given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
 .given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}
 .row{display:flex;gap:12px;align-items:center}
 .row .main{flex:1 1 auto;min-width:0}
-.row .note{flex:0 1 auto;max-width:44%;border-left:2px solid #fff;padding-left:10px;color:#ddd;font-size:18px;line-height:1.35}
+.row .note{flex:0 1 auto;max-width:44%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
 .ans{margin:12px 0 4px;padding:8px 12px;border:2px solid #fff;border-radius:8px}
 pre{font:17px/1.4 'DejaVu Sans Mono','Liberation Mono',monospace;border:1px solid #666;padding:10px 12px;border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}
 .fig{margin:10px 0}.fig svg{display:block;width:100%;height:auto}
 .raw{font-family:'DejaVu Sans',sans-serif}
 .f{white-space:nowrap}.f wbr{display:none}.f.brk{white-space:normal}.f.brk wbr{display:inline}.fx{white-space:nowrap}.fx.wide{white-space:normal}
-.katex{font-size:1.08em}.katex-display{margin:0;text-align:left}.katex-display>.katex{text-align:left}
-.foot{font-size:14px;color:#ccc;text-align:right;margin-top:6px}`;
+.katex{font-size:1.08em;-webkit-text-stroke:.35px #fff}.katex svg{stroke:#fff;stroke-width:14px}
+.katex .frac-line,.katex .overline-line,.katex .underline-line{border-bottom-width:.06em}.katex-display{margin:0;text-align:left}.katex-display>.katex{text-align:left}
+.foot{font-size:14px;text-align:right;margin-top:6px}`;
 }
 
 // Целая страница. fonts: готовые правила @font-face (шрифт текста и шрифты формул), css: стили KaTeX.
 export function pageHtml(parts: string[], svgs: string[], fonts: string, css: string): string {
   const figs = assign(parts, svgs);
   const body = parts.map((p, i) => taskHtml(p, figs[i])).join("");
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:"><style>${fonts}${css}${pageCss()}</style></head><body><div id="flow" class="sheet">${body}</div></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:"><style>${fonts}${css}${pageCss()}</style></head><body>${INK}<div id="flow" class="sheet">${body}</div></body></html>`;
 }
 
 // Выполняется внутри страницы в браузере: делит поток на листы не выше PAGE_H и возвращает их число.
@@ -281,7 +292,80 @@ export const PAGINATE = `(() => {
     const w = Math.ceil(Math.max(...notes.map((n) => n.getBoundingClientRect().width)));
     for (const n of notes) n.style.flex = "0 0 " + w + "px";
   }
-  // 3. У рисунка убираем пустые полосы сверху и снизу: холст обрезается по тому, что на нём нарисовано
+  // 3. Подписи на рисунке. Буква, которая легла на линию или на соседнюю подпись, сдвигается на ближайшее свободное место.
+  for (const svg of flow.querySelectorAll(".fig svg")) {
+    const area = svg.getBoundingClientRect();
+    if (!area.width || !area.height) continue;
+    const aside = (el) => el.closest("defs, marker, clipPath, mask, pattern, symbol");
+    const backdrop = (r) => r.width >= area.width * 0.98 && r.height >= area.height * 0.98;
+    const pts = []; // точки всех линий рисунка на экране: x, y и половина толщины линии
+    const plates = []; // закрашенные прямоугольники: подпись на такой подложке стоит там нарочно
+    for (const el of svg.querySelectorAll("line, path, polyline, polygon, circle, ellipse, rect")) {
+      if (aside(el)) continue;
+      const r = el.getBoundingClientRect(), cs = getComputedStyle(el), m = el.getScreenCTM();
+      const rect = el.tagName.toLowerCase() === "rect";
+      if (!m || cs.display === "none" || cs.visibility === "hidden" || (rect && backdrop(r))) continue;
+      const stroke = cs.stroke !== "none" && parseFloat(cs.strokeWidth) > 0;
+      if (rect && cs.fill !== "none") plates.push(r);
+      if (!stroke && cs.fill === "none") continue;
+      let len = 0;
+      try { len = el.getTotalLength(); } catch (e) {}
+      if (!len) continue;
+      const k = Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) || 1;
+      const hw = stroke ? parseFloat(cs.strokeWidth) * k / 2 : 0;
+      const n = Math.min(3000, Math.max(1, Math.ceil(len * k / 3)));
+      for (let i = 0; i <= n; i++) {
+        const p = el.getPointAtLength(len * i / n);
+        pts.push([m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f, hw]);
+      }
+    }
+    if (!pts.length) continue;
+    // рамка самих букв: у строки текста сверху и снизу есть пустые поля
+    const glyphs = (t) => { const r = t.getBoundingClientRect(); return { l: r.left, r: r.right, t: r.top + r.height * 0.16, b: r.bottom - r.height * 0.14 }; };
+    const texts = [...svg.querySelectorAll("text")].filter((t) => !aside(t) && t.textContent.trim() && t.getBoundingClientRect().width > 0);
+    const boxes = texts.map(glyphs);
+    const hits = (b, pad) => {
+      let n = 0;
+      for (const p of pts) if (p[0] > b.l - pad - p[2] && p[0] < b.r + pad + p[2] && p[1] > b.t - pad - p[2] && p[1] < b.b + pad + p[2]) n++;
+      return n;
+    };
+    const over = (b, i, pad) => {
+      let sum = 0;
+      boxes.forEach((o, j) => {
+        const w = Math.min(b.r, o.r) - Math.max(b.l, o.l) + pad, h = Math.min(b.b, o.b) - Math.max(b.t, o.t) + pad;
+        if (j !== i && w > 0 && h > 0) sum += w * h;
+      });
+      return sum;
+    };
+    texts.forEach((t, i) => {
+      const b = boxes[i], cs = getComputedStyle(t);
+      const now = hits(b, -1) + over(b, i, 0) / 9;
+      // три точки это около сантиметра линии под буквой; касание краем (связь в формуле, выноска) не в счёт
+      if (hits(b, -1) < 3 && over(b, i, 0) < (b.r - b.l) * (b.b - b.t) * 0.15) return;
+      if (cs.paintOrder.indexOf("stroke") === 0 && cs.stroke !== "none") return; // у подписи своя обводка, линия под ней закрыта
+      if (plates.some((r) => r.left <= b.l + 1 && r.right >= b.r - 1 && r.top <= b.t + 1 && r.bottom >= b.b - 1)) return;
+      let best = null;
+      for (const d of [5, 8, 12, 16, 21, 27]) {
+        for (let a = 0; a < 16; a++) {
+          const dx = d * Math.cos(a * Math.PI / 8), dy = d * Math.sin(a * Math.PI / 8);
+          const c = { l: b.l + dx, r: b.r + dx, t: b.t + dy, b: b.b + dy };
+          if (c.l < area.left + 2 || c.r > area.right - 2 || c.t < area.top + 2 || c.b > area.bottom - 2) continue;
+          const cost = hits(c, 2) + over(c, i, 2) / 9, crowd = hits(c, 8);
+          if (!best || cost < best.cost || (cost === best.cost && d === best.d && crowd < best.crowd)) best = { cost, crowd, d, dx, dy };
+        }
+        if (best && best.cost === 0) break;
+      }
+      if (!best || (best.cost > 0 && best.cost > now / 2)) return;
+      const parent = t.parentNode.getScreenCTM && t.parentNode.getScreenCTM();
+      if (!parent) return;
+      const inv = parent.inverse();
+      const ux = inv.a * best.dx + inv.c * best.dy, uy = inv.b * best.dx + inv.d * best.dy;
+      t.setAttribute("transform", "translate(" + ux.toFixed(2) + " " + uy.toFixed(2) + ") " + (t.getAttribute("transform") || ""));
+      t.setAttribute("data-moved", "1");
+      boxes[i] = glyphs(t);
+    });
+  }
+  // 4. У рисунка убираем пустые полосы сверху и снизу: холст обрезается по тому, что на нём нарисовано
   for (const svg of flow.querySelectorAll(".fig svg")) {
     const vb = svg.viewBox && svg.viewBox.baseVal;
     const box = svg.getBoundingClientRect();
@@ -301,7 +385,7 @@ export const PAGINATE = `(() => {
     const y0 = Math.max(vb.y, top - 28), y1 = Math.min(vb.y + vb.height, bottom + 28);
     if (y1 - y0 > 40 && y1 - y0 < vb.height - 20) svg.setAttribute("viewBox", vb.x + " " + y0 + " " + vb.width + " " + (y1 - y0));
   }
-  // 4. Делим поток на листы
+  // 5. Делим поток на листы
   const top = flow.getBoundingClientRect().top;
   const tasks = [...flow.querySelectorAll(".task")];
   const pages = [[]];
