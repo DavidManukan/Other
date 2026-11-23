@@ -200,7 +200,7 @@ async function upload(req, res, bytes) {
   const b = Buffer.from(await file.arrayBuffer());
   calls.push({ method: "sendFileByUpload", at: Date.now(), chatId: form.get("chatId"), fileName: form.get("fileName"), caption: form.get("caption") ?? undefined, type: file.type, png: b.subarray(0, 4).toString("hex") === "89504e47", bytes: b.length, body: b });
   // шлюз принял файл, но связь оборвалась раньше ответа
-  if (flags.uploadHang && String(form.get("chatId")).startsWith(flags.uploadHang) && form.get("caption") === "2 / 2") return (flags.uploadHang = ""), res.destroy();
+  if (flags.uploadHang && String(form.get("chatId")).startsWith(flags.uploadHang) && String(form.get("caption") ?? "").replace(/[\u200B\u200C\u2060]/g, "") === "2 / 2") return (flags.uploadHang = ""), res.destroy();
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ idMessage: "OUT" + calls.length, urlFile: "https://example.invalid/file.png" }));
 }

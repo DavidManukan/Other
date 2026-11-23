@@ -21,9 +21,11 @@ const REL = /^(?:=|<|>|\\(?:le|leq|leqslant|ge|geq|geqslant|ne|neq|approx|equiv|
 // переносится на странице перед знаком, а не посреди скобки или модуля.
 export function chunks(src: string): string[] {
   const out: string[] = [];
-  let depth = 0, start = 0;
+  let depth = 0, paren = 0, start = 0;
   const cut = (i: number) => {
-    if (depth === 0 && src.slice(start, i).trim() && REL.test(src.slice(i))) {
+    const head = src.slice(start, i);
+    // внутри круглых скобок не режем («P(X = 2)»), перечёркнутый знак \\not= и «:=» не разрываем
+    if (depth === 0 && paren <= 0 && head.trim() && !/(\\not|:)\s*$/.test(head) && REL.test(src.slice(i))) {
       out.push(src.slice(start, i));
       start = i;
     }
@@ -39,6 +41,8 @@ export function chunks(src: string): string[] {
       i += m[0].length - 1;
     } else if (c === "{") depth++;
     else if (c === "}") depth--;
+    else if (c === "(") paren++;
+    else if (c === ")") paren--;
     else cut(i);
   }
   out.push(src.slice(start));
@@ -50,10 +54,11 @@ export function tex(src: string): string {
   const clean = src.replace(/\\tag\*?\{[^{}]*\}/g, ""); // номера формул на странице не нужны
   const one = (s: string) => katex.renderToString(`\\displaystyle ${s}`, KATEX);
   try {
-    return chunks(clean).map((part, i) => `<span class="fx">${one(i ? `{}${part}` : part)}</span>`).join("<wbr>");
+    // .f: формула целиком. Она не рвётся, пока помещается в строку; не помещается: переносится между кусками .fx
+    return `<span class="f">${chunks(clean).map((part, i) => `<span class="fx">${one(i ? `{}${part}` : part)}</span>`).join("<wbr>")}</span>`;
   } catch {
     try {
-      return `<span class="fx">${one(clean)}</span>`;
+      return `<span class="f"><span class="fx">${one(clean)}</span></span>`;
     } catch {
       try {
         return katex.renderToString(clean, { ...KATEX, displayMode: true }); // окружения вроде align живут только в выключной формуле
@@ -227,7 +232,7 @@ h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .cont{font-size:17px;color:#ccc;margin:0 0 6px}
 .b{margin:6px 0;overflow-wrap:anywhere}
 .lbl{font-weight:bold}
-.given{display:table;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
+.given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
 .given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}
 .row{display:flex;gap:12px;align-items:center}
 .row .main{flex:1 1 auto;min-width:0}
@@ -236,7 +241,7 @@ h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 pre{font:17px/1.4 'DejaVu Sans Mono','Liberation Mono',monospace;border:1px solid #666;padding:10px 12px;border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}
 .fig{margin:10px 0}.fig svg{display:block;width:100%;height:auto}
 .raw{font-family:'DejaVu Sans',sans-serif}
-.fx{white-space:nowrap}.fx.wide{white-space:normal}
+.f{white-space:nowrap}.f wbr{display:none}.f.brk{white-space:normal}.f.brk wbr{display:inline}.fx{white-space:nowrap}.fx.wide{white-space:normal}
 .katex{font-size:1.08em}.katex-display{margin:0;text-align:left}.katex-display>.katex{text-align:left}
 .foot{font-size:14px;color:#ccc;text-align:right;margin-top:6px}`;
 }
@@ -253,17 +258,18 @@ export function pageHtml(parts: string[], svgs: string[], fonts: string, css: st
 export const PAGINATE = `(() => {
   const H = ${PAGE_H};
   const flow = document.getElementById("flow");
-  // 1. Кусок формулы шире строки: ему разрешаем перенос внутри, иначе он уйдёт за край листа
-  for (const fx of flow.querySelectorAll(".fx")) {
-    const box = fx.closest(".main, .note, .b");
-    if (box && fx.getBoundingClientRect().width > box.clientWidth + 1) fx.classList.add("wide");
-  }
+  // 1. Формула шире строки: разрешаем перенос между её кусками (перед знаком отношения), а слишком широкому куску и внутри него
+  const room = (el) => {
+    const box = el.closest(".main, .note, .ans, .given, .b");
+    if (!box) return 0;
+    const cs = getComputedStyle(box);
+    return box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  };
+  for (const f of flow.querySelectorAll(".f")) if (f.getBoundingClientRect().width > room(f) + 1) f.classList.add("brk");
+  for (const fx of flow.querySelectorAll(".fx")) if (fx.getBoundingClientRect().width > room(fx) + 1) fx.classList.add("wide");
   // Дробь, корень или матрицу перенести нельзя: если такой кусок шире строки, уменьшаем формулу, чтобы её не обрезало краем листа
   for (const k of flow.querySelectorAll(".katex")) {
-    const box = k.closest(".main, .note, .ans, .given, .b");
-    if (!box) continue;
-    const cs = getComputedStyle(box);
-    const avail = box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    const avail = room(k);
     let w = 0;
     for (const b of k.querySelectorAll(".base")) w = Math.max(w, b.getBoundingClientRect().width);
     if (w > avail && avail > 0) k.style.fontSize = Math.max(0.45, Math.floor((1.08 * avail / w) * 100) / 100) + "em";

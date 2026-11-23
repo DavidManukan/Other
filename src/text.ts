@@ -60,7 +60,8 @@ export function plainText(text: string): string {
 
 export const RULE = "——————————"; // черта между заданиями: длинное тире есть в любом шрифте
 export const HEAD = /^\s*(([^·\n]{1,30}·\s*){0,2}(№|Задание|Задача)|Исправляю|Вариант\s)/; // «№3», «Вариант 1 · №3», «Физика · №1»
-const OTHER = /^(Ответ|Дано|Найти|Доказать|Решение|Доказательство|Обоснование|Проверка|ОДЗ|Если|Не видно|Прочитал|Прочитано)\b|^\d+\)|^```|^@@@/;
+// (граница слова \b кириллицу не понимает, поэтому конец слова проверяем сами)
+const OTHER = /^(Ответ|Дано|Найти|Доказать|Решение|Доказательство|Обоснование|Проверка|ОДЗ|Если|Не видно|Прочитал|Прочитано|Правило)(?![\p{L}\p{N}])|^\d+\)|^[а-я]\)|^```|^@@@/u;
 
 // Ответ, начатый в строке i («Ответ: …»). Модель иногда переносит его на следующую строку:
 // хвост присоединяем, иначе в рамке и в списке ответов осталась бы половина.
@@ -85,9 +86,9 @@ export function answerAt(rows: string[], i: number): { value: string; last: numb
 
 // Короткий список ответов: в начале сообщения или подписью к первой странице. На маленьком экране видно прежде всего его.
 export function card(parts: string[]): string {
-  const lines = parts.map((p) => {
+  const lines = parts.map((p, n) => {
     const rows = p.replace(/```[\s\S]*?```/g, "").split("\n").map((l) => l.trim());
-    const head = (rows.find((l) => HEAD.test(l)) ?? rows.find(Boolean) ?? "").slice(0, 40);
+    const head = (rows.find((l) => HEAD.test(l) && l.length <= 60) ?? `Задание ${n + 1}`).replace(/[:.]+$/, "").slice(0, 40);
     const answers: string[] = [];
     let branch = ""; // прочтение неразборчивого условия («Если в условии 28:»), к которому относится следующий ответ
     for (let i = 0; i < rows.length; i++) {
@@ -95,12 +96,14 @@ export function card(parts: string[]): string {
       if (b) branch = b[1];
       if (!/^Ответ:/.test(rows[i])) continue;
       const a = answerAt(rows, i);
-      if (a.value) answers.push(branch && !a.value.includes(branch) ? `при ${branch}: ${a.value}` : a.value);
+      if (a.value) answers.push(branch && !a.value.startsWith(`при ${branch}`) ? `при ${branch}: ${a.value}` : a.value);
       branch = "";
       i = a.last;
     }
     // задания без ответа: условие не видно целиком (нужно переснять) или это доказательство
-    let answer = answers.length ? answers.join("; ") : rows.some((l) => /^Не видно:/.test(l)) ? "не видно условия, пересними ближе" : "см. решение";
+    // несколько ответов идут через «;», точка в конце каждого перед ним не нужна
+    let answer = answers.length > 1 ? answers.map((a, k) => (k < answers.length - 1 ? a.replace(/[.;]+$/, "") : a)).join("; ") : answers[0]
+      ?? (rows.some((l) => /^Не видно:/.test(l)) ? "не видно условия, пересними ближе" : rows.some((l) => /решено выше/i.test(l)) ? "решено выше" : "см. решение");
     if (answer.length > 140) {
       const cut = answer.slice(0, 139);
       const at = Math.max(cut.lastIndexOf("; "), cut.lastIndexOf(" "));

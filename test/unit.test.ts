@@ -87,6 +87,14 @@ test("список ответов: все строки «Ответ:» зада�
   // два прочтения неразборчивого числа: у каждого ответа видно, к какому прочтению он относится
   assert.equal(card(["№1\nЕсли в условии 28:\nx = 5\nОтвет: 5\nЕсли в условии 23:\nОтвет: 4"]), "✅ Ответы\n№1: при 28: 5; при 23: 4");
   assert.equal(card(["№2\nРешение:\nНе видно: конец условия. Пересними ближе."]), "✅ Ответы\n№2: не видно условия, пересними ближе");
+  // после ответа идёт другая метка или второй ответ: чужая строка к ответу не приклеивается
+  assert.equal(card(["№2\nОтвет: 12 см\nПроверка: 3 + 4 + 5 = 12."]), "✅ Ответы\n№2: 12 см");
+  assert.equal(card(["№1\nа) x = 2\nОтвет: а) 2;\nб) y = 3\nОтвет: б) 3."]), "✅ Ответы\n№1: а) 2; б) 3.");
+  assert.equal(card(["№5\nОтвет: растёт\nПравило: всегда так."]), "✅ Ответы\n№5: растёт");
+  // ответ содержит цифры прочтения: пометка «при 28» всё равно ставится; точка перед «;» убирается
+  assert.equal(card(["№2\nЕсли в условии 28:\nОтвет: s = 280 м.\nЕсли в условии 23:\nОтвет: s = 230 м."]), "✅ Ответы\n№2: при 28: s = 280 м; при 23: s = 230 м.");
+  // у задания нет заголовка: в списке оно идёт по номеру, а не по первой попавшейся строке
+  assert.equal(card(["Дано:\n$a = 1$\nОтвет: 1", "№3\nРешено выше."]), "✅ Ответы\nЗадание 1: 1\n№3: решено выше");
   const long = card([`№1\nОтвет: ${"слово ".repeat(60)}`]);
   assert.ok(long.length < 160 && long.endsWith("…") && !long.endsWith(" …"));
 });
@@ -188,6 +196,10 @@ test("формулы LaTeX переводятся в обычный текст �
     "\\left.\\dfrac{x^2}{2}\\right|_0^1": "x²/2|₀¹",
     "\\ce{2H2 + O2 -> 2H2O}": "2H₂ + O₂ → 2H₂O",
     "\\ce{SO4^{2-}}": "SO₄²⁻",
+    "\\sqrt{3}\\geqslant 1": "√3≥ 1",
+    "\\sqrt{3}\\sin x": "√3·sin x",
+    "\\sin\\alpha\\cos\\beta + \\cos\\alpha\\sin\\beta": "sin α cos β + cos α sin β",
+    "\\omega t": "ωt",
   };
   for (const [a, b] of Object.entries(cases)) assert.equal(texToPlain(a), b, a);
   assert.equal(plainMath("Ответ: $x = \\dfrac{2\\sqrt{3}}{3}$ см, цена 5$ и $y$."), "Ответ: x = 2√3/3 см, цена 5$ и y.");
@@ -199,14 +211,17 @@ test("формулы LaTeX переводятся в обычный текст �
 test("страница решения: формулы набраны, «Дано» блоком, пометки справа, ответ в рамке", () => {
   const html = taskHtml("№2\nДано:\n$AB = 6$ см\nНайти: $SO$\nРешение:\n$x^2 = 4$ | $\\cdot 2$\n|x − 1| = 3\nОтвет: $\\dfrac{4}{3}$.", []);
   assert.match(html, /<section class="task" data-title="№2"><h2 class="b">№2<\/h2>/);
-  assert.match(html, /<div class="b given"><div class="lbl">Дано:<\/div><div><span class="fx"><span class="katex">/);
-  assert.match(html, /<div class="find"><span class="lbl">Найти:<\/span> <span class="fx"><span class="katex">/);
+  assert.match(html, /<div class="b given"><div class="lbl">Дано:<\/div><div><span class="f"><span class="fx"><span class="katex">/);
+  assert.match(html, /<div class="find"><span class="lbl">Найти:<\/span> <span class="f"><span class="fx"><span class="katex">/);
   assert.match(html, /<div class="b lbl">Решение:<\/div>/);
-  assert.match(html, /<div class="b row"><div class="main"><span class="fx"><span class="katex">.*<div class="note"><span class="fx"><span class="katex">/);
+  assert.match(html, /<div class="b row"><div class="main"><span class="f"><span class="fx"><span class="katex">.*<div class="note"><span class="f"><span class="fx"><span class="katex">/);
   assert.match(html, /<div class="b line">\|x − 1\| = 3<\/div>/); // модуль это не пометка
-  assert.match(html, /<div class="b ans"><span class="lbl">Ответ:<\/span> <span class="fx"><span class="katex">.*mfrac/);
+  assert.match(html, /<div class="b ans"><span class="lbl">Ответ:<\/span> <span class="f"><span class="fx"><span class="katex">.*mfrac/);
   // цепочка равенств делится на куски по знакам верхнего уровня: на странице она переносится перед знаком, а не посреди скобки
   assert.deepEqual(chunks("S = \\dfrac{a = b}{2} = \\left(x = 1\\right) \\le 54"), ["S ", "= \\dfrac{a = b}{2} ", "= \\left(x = 1\\right) ", "\\le 54"]);
+  assert.deepEqual(chunks("P(X = 2) = 0{,}3"), ["P(X = 2) ", "= 0{,}3"]); // внутри скобок не режем
+  assert.deepEqual(chunks("a \\not= b"), ["a \\not= b"]); // перечёркнутый знак не отрывается от черты
+  assert.deepEqual(chunks("x := 5"), ["x := 5"]);
   assert.equal(inline("$30(x-2) = 8(x^2-4)$").split('<span class="fx">').length - 1, 2);
   // ответ, перенесённый на вторую строку, целиком попадает в рамку; рисунок задания без «Дано» стоит перед ответом
   const two = taskHtml("№1\nрешение\nОтвет: 1380 год, войско возглавлял\nДмитрий Донской.", [{ svg: '<svg xmlns="x" viewBox="0 0 8 8"><text>№1</text></svg>', own: true }]);
@@ -216,7 +231,7 @@ test("страница решения: формулы набраны, «Дано
   assert.match(taskHtml("№1\nMn⁺⁷ + 5e⁻ → Mn⁺² | 2\nОтвет: 1", []), /<div class="main">Mn⁺⁷ \+ 5e⁻ → Mn⁺²<\/div><div class="note">2<\/div>/);
   // «Найти:» отдельной строкой: искомое не попадает в данные; решение без строки «Решение:» не попадает в блок «Дано»
   const bare = taskHtml("№3\nДано:\n$m = 1$ кг\nНайти:\n$F$ — ?\nОбоснование:\nтело точка\n$F = ma$ | закон\nОтвет: 1", []);
-  assert.match(bare, /Дано:<\/div><div><span class="fx">[^]*?<\/div><div class="find"><span class="lbl">Найти:<\/span> <span class="fx">[^]*? — \?<\/div><\/div><div class="b lbl">Обоснование:<\/div><div class="b line">тело точка<\/div><div class="b row">/);
+  assert.match(bare, /Дано:<\/div><div><span class="f"><span class="fx">[^]*?<\/div><div class="find"><span class="lbl">Найти:<\/span> <span class="f"><span class="fx">[^]*? — \?<\/div><\/div><div class="b lbl">Обоснование:<\/div><div class="b line">тело точка<\/div><div class="b row">/);
   const noLabel = taskHtml("№3\nДано: $v = 2$\nНайти: $t$\nРешение.\n$t = 1$ | делим\nОтвет: 1", []);
   assert.match(noLabel, /<\/div><\/div><div class="b line">Решение\.<\/div><div class="b row">/);
   // формула с опечаткой показывается текстом, страница не ломается; разметка из текста не исполняется
@@ -257,6 +272,10 @@ test("ответ модели: берётся решение, а не замет
   assert.equal(answerText([text("Сейчас пересчитаю."), tool, result]), ""); // решения нет вовсе: бот попросит модель его написать
   assert.equal(allText([text("заметка"), tool, result, text("итог")]), "заметка\n\nитог");
   assert.equal(answerText([{ type: "thinking" } as any, text("№1\n"), text("Ответ: 4")]), "№1\nОтвет: 4");
+  // ход оборван, пока модель переписывала решение после проверки: берётся новый текст, старое решение не подклеивается
+  const rewrite = [text("№1\nОтвет: 5"), tool, result, text("№1\nпересчёт: x = ")];
+  assert.equal(answerText(rewrite), "№1\nОтвет: 5");
+  assert.equal(answerText(rewrite, true), "№1\nпересчёт: x = ");
 });
 
 test("рисунок приводится к одному стилю: чёрный фон, белые линии и подписи, шрифт, индексы", () => {

@@ -39,6 +39,7 @@ const reqs = (tag) => claude.filter((b) => JSON.stringify(b.messages).includes(t
 const imgs = (m) => (Array.isArray(m.content) ? m.content.filter((x) => x.type === "image").length : 0);
 const lastText = (b) => { const c = b.messages.at(-1).content; return typeof c === "string" ? c : c.filter((x) => x.type === "text").map((x) => x.text).join("\n"); };
 const RULE = "——————————";
+const vis = (s) => String(s ?? "").replace(/[\u200B\u200C\u2060]/g, ""); // подпись без невидимой метки работы
 async function until(f, ms = 20_000) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
@@ -333,7 +334,7 @@ try {
   await sleep(1200);
   const pg = pics("950");
   ok(pg.length === 2 && answers("950").filter((t) => !t.startsWith("Решения")).length === 0, "картинкой: три задания это две страницы, текстом ответ не дублируется и рисунок отдельно не идёт", JSON.stringify(of("950").map((c) => c.method + ":" + (c.text ?? c.fileName))));
-  ok(pg[0].caption === "✅ Ответы\n№1: x = ±3/2.\n№2: √34 см\n№3: x ∈ (2; 4]" && pg[1].caption === "2 / 2", "картинкой: короткие ответы стоят подписью к первой странице, формулы в них обычным текстом, у второй страницы подпись с номером", JSON.stringify(pg.map((c) => c.caption)));
+  ok(vis(pg[0].caption) === "✅ Ответы\n№1: x = ±3/2.\n№2: √34 см\n№3: x ∈ (2; 4]" && vis(pg[1].caption) === "2 / 2" && pg[1].caption.length > 5, "картинкой: короткие ответы стоят подписью к первой странице, формулы в них обычным текстом, у второй страницы подпись с номером", JSON.stringify(pg.map((c) => c.caption)));
   ok(pg.every((c) => c.png && /^reshenie-\w+\.png$/.test(c.fileName)) && pg[0].fileName !== pg[1].fileName, "картинкой: у каждой страницы своё имя файла", JSON.stringify(pg.map((c) => c.fileName)));
   const bt = claude.length;
   await text("950", "объясни №1");
@@ -346,7 +347,7 @@ try {
   await photo("951", "S_LONGCARD");
   ok(await until(() => pics("951").length === 15, 60_000), "30 заданий картинкой: 15 страниц", String(pics("951").length));
   const many = of("951").filter((c) => !ACK.test(c.text ?? "") && c.text !== "Решения присылаю картинкой ✅");
-  ok(many[0].method === "sendMessage" && many[0].text.startsWith("✅ Ответы\n№1: значение номер 0") && many[0].text.includes("№30: значение номер 29") && many.slice(1).every((c, i) => c.method !== "sendMessage" && c.caption === `${i + 1} / 15`), "длинный список ответов: сначала он текстом, потом страницы с номерами в подписи", JSON.stringify(many.slice(0, 3).map((c) => c.method)));
+  ok(many[0].method === "sendMessage" && many[0].text.startsWith("✅ Ответы\n№1: значение номер 0") && many[0].text.includes("№30: значение номер 29") && many.slice(1).every((c, i) => c.method !== "sendMessage" && vis(c.caption) === `${i + 1} / 15`), "длинный список ответов: сначала он текстом, потом страницы с номерами в подписи", JSON.stringify(many.slice(0, 3).map((c) => c.method)));
   await photo("951", "S_MANY");
   ok(await until(() => pics("951").length === 15 + 23, 60_000) && pics("951")[15].caption.startsWith("✅ Ответы\n№1: 0\n") && pics("951")[15].caption.includes("№45: 44"), "45 коротких ответов помещаются в подпись к первой странице", String(pics("951").length));
 
@@ -421,7 +422,10 @@ try {
   await photo("965", "S_TEX обрыв загрузки");
   ok(await until(() => pics("965").length >= 2, 30_000), "обрыв загрузки: страницы дошли");
   await sleep(2500);
-  ok(pics("965").length === 2 && pics("965").every((c) => c.method === "sendFileByUpload"), "обрыв загрузки: вторая страница в чате одна, по ссылке не продублирована", JSON.stringify(pics("965").map((c) => c.method + ":" + c.caption)));
+  ok(pics("965").length === 2 && pics("965").every((c) => c.method === "sendFileByUpload") && flags.uploadHang === "", "обрыв загрузки: вторая страница в чате одна, по ссылке не продублирована", JSON.stringify(pics("965").map((c) => c.method + ":" + vis(c.caption))));
+  // у двух работ подряд подписи «2 / 2» выглядят одинаково, но невидимая метка у них разная: чужую страницу за свою бот не примет
+  await photo("965", "S_TEX вторая работа");
+  ok(await until(() => pics("965").length === 4, 30_000) && vis(pics("965")[3].caption) === "2 / 2" && pics("965")[3].caption !== pics("965")[1].caption, "подписи страниц разных работ различаются невидимой меткой", JSON.stringify(pics("965").map((c) => c.caption.length)));
 
   // --- шлюз принял сообщение, но не ответил: бот сверяется с журналом исходящих и второй раз не шлёт ---
   flags.sendHang = "960";

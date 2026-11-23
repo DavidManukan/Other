@@ -155,14 +155,15 @@ const MARK = /^[ \t]*(Ответ:|@@@)/m; // по этим строкам вид
 // («сейчас пересчитаю», «проверка подтвердила») читателю не нужны. У Fable 5.2 они уходят в размышления,
 // а запасные модели пишут их обычным текстом. Если решение стоит до проверки, а после неё только заметка, берём решение.
 // Блок fallback (ход подхватила запасная модель) текст не разрывает: она продолжает с того же места.
-export function answerText(content: Content): string {
+// cut: ход оборван. Тогда недописанный текст после проверки это и есть ответ (модель переписывала решение), старое решение до проверки не берём.
+export function answerText(content: Content, cut = false): string {
   const segments: string[] = [""];
   for (const b of content) {
     if (isTool(b.type as string)) segments.push("");
     else if (b.type === "text") segments[segments.length - 1] += b.text;
   }
   const last = segments[segments.length - 1];
-  if (MARK.test(last)) return last;
+  if (MARK.test(last) || (cut && last.trim())) return last;
   return [...segments].reverse().find((s) => MARK.test(s)) ?? last;
 }
 // Весь текст хода: если после проверок модель ничего не написала, ответ мог остаться перед ними
@@ -198,13 +199,13 @@ async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
     tokens.in += r.tokens.in;
     tokens.out += r.tokens.out;
     // поток оборвался на полуслове: берём написанное после последней проверки
-    if (!r.msg) return { text: r.fresh ? r.text : answerText(blocks) + r.text, cut: true, refused: false, tokens, model, checks };
+    if (!r.msg) return { text: r.fresh ? r.text : answerText([...blocks, { type: "text", text: r.text } as Content[number]], true), cut: true, refused: false, tokens, model, checks };
     const msg = r.msg;
     blocks.push(...msg.content);
     checks += msg.content.filter((b) => b.type === "server_tool_use").length;
-    const out = answerText(blocks);
     // pause_turn здесь значит «ход не закончен»: если продолжить его нельзя, ответ считается оборванным
     const cut = msg.stop_reason === "max_tokens" || msg.stop_reason === "model_context_window_exceeded" || msg.stop_reason === "pause_turn";
+    const out = answerText(blocks, cut);
     const done: Answer = {
       text: cut ? out : out || allText(blocks),
       cut,

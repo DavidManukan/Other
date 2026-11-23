@@ -25,8 +25,6 @@ const SUB: Record<string, string> = { "0": "₀", "1": "₁", "2": "₂", "3": "
 const WRAP = new Set(["text", "mathrm", "mathbf", "mathit", "mathsf", "textbf", "textit", "boldsymbol", "bm", "displaystyle", "textstyle", "mathstrut", "underline", "widehat", "hat", "tilde", "boxed", "mathcal", "limits", "nolimits"]);
 const NOT: Record<string, string> = { "=": "≠", "∈": "∉", "⊂": "⊄", "⊆": "⊈", "≡": "≢", "<": "≮", ">": "≯", "|": "∤", "∥": "∦" };
 const GLUE = /[\p{L}\p{N})′⁰¹²³⁴-⁹ⁿˣ₀-₉]$/u; // после такого знака имя функции нужно отделить пробелом: «2 sin x cos x»
-// Сразу за корнем идёт множитель: без точки «√2x» читалось бы как корень из 2x
-const AFTER_ROOT = /^(?:[A-Za-z\p{N}({]|\s*[A-Za-z(]|\\(?!(?:text|mathrm|operatorname|cdot|times|cdots|ldots|dots|right|end|quad|qquad|le|ge|leq|geq|ne|neq|pm|mp|approx|in|cup|cap|to|div)(?![A-Za-z]))[A-Za-z])/u;
 
 // Химическая запись из \ce{…}: индексы, заряды, стрелки
 function chem(s: string): string {
@@ -59,6 +57,8 @@ function factorNext(rest: string): boolean {
   if (n in SYM) return /[\p{L}∞∂∇√]/u.test(SYM[n]);
   return n !== "text" && n !== "mathrm"; // sqrt, frac, sin… это множители; единицы измерения в \text нет
 }
+// Сразу за корнем идёт множитель: без точки «√2x» читалось бы как корень из 2x
+const afterRoot = (rest: string): boolean => /^(?:[A-Za-z\p{N}({]|\s*[A-Za-z(])/u.test(rest) || (/^\\(?!operatorname(?![A-Za-z]))[A-Za-z]/.test(rest) && factorNext(rest));
 // Перед дробью стоит функция (sin², log₃): аргумент берём в скобки, «sin²(x/2)»
 const AFTER_FN = /(?:sin|cos|tg|ctg|tan|cot|ln|lg|log[₀-₉,]*)[⁰¹²³⁴-⁹⁻]*\s*$/;
 
@@ -126,7 +126,7 @@ function conv(s: string): string {
         // смешанное число: 2\dfrac{1}{3} это «2 1/3», а не «21/3»
         out += (/\d$/.test(out) && /^\d/.test(f) ? " " : "") + (fn || factorNext(s.slice(i)) ? `(${f})` : f);
       }
-      else if (name === "sqrt") { const n = optional(), x = group(); out += (n === null || n === "2" ? "√" : n === "3" ? "∛" : n === "4" ? "∜" : (map(n, SUP) ?? `(${n})`) + "√") + (/^[\p{L}\p{N},]+$/u.test(x) ? x + (AFTER_ROOT.test(s.slice(i)) ? "·" : "") : `(${x})`); }
+      else if (name === "sqrt") { const n = optional(), x = group(); out += (n === null || n === "2" ? "√" : n === "3" ? "∛" : n === "4" ? "∜" : (map(n, SUP) ?? `(${n})`) + "√") + (/^[\p{L}\p{N},]+$/u.test(x) ? x + (afterRoot(s.slice(i)) ? "·" : "") : `(${x})`); }
       else if (name === "mathbb") { const x = group(); out += BB[x] ?? x; }
       else if (name === "vec" || name === "overrightarrow") out += group() + "⃗";
       else if (name === "ce" || name === "pu") { const from = i; group(); out += chem(s.slice(from, i).trim().replace(/^\{|\}$/g, "")); }
@@ -178,7 +178,7 @@ export function texToPlain(tex: string): string {
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\(\s+/g, "(").replace(/\s+\)/g, ")")
     .replace(/([∠△¬√◡⌢]) (?=\S)/g, "$1")
-    .replace(/([α-ωΑ-Ω]) (?=[A-Za-zα-ωΑ-Ω])/g, "$1")
+    .replace(/([α-ωΑ-Ω]) (?!(?:arcsin|arccos|arctg|arcctg|sin|cos|tg|ctg|ln|lg|exp|log)(?![a-z]))(?=[A-Za-zα-ωΑ-Ω])/g, "$1")
     .replace(/(^|[=≠<>≤≥(,;] ?)± (?=[\d\p{L}])/gu, "$1±")
     .replace(/(?<![A-Za-z])(arcsin|arccos|arctg|arcctg|sin|cos|tg|ctg|ln|lg|exp|log[₀-₉,]*)(?=[A-Za-zα-ωΑ-Ω\d√])/g, "$1 ")
     .trim();

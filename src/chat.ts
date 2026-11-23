@@ -131,6 +131,9 @@ const photoKeys = (p: PhotoMeta) => Array.from({ length: p.n }, (_, i) => `photo
 // в начале id стоит время: старые картинки потом находятся по ключу, без чтения самих картинок
 const imageId = () => Date.now().toString(16).padStart(12, "0") + crypto.randomUUID().replace(/-/g, "").slice(0, 20);
 const forwarded = (d: any) => Boolean(d?.isForwarded) || Number(d?.forwardingScore) > 0;
+// Невидимая метка работы в конце подписи: у двух работ подряд подписи «2 / 2» выглядят одинаково,
+// а в журнале шлюза их нужно различать. Знаки нулевой ширины читатель не видит.
+const stamp = (id: string) => [...id.replace(/\W/g, "").slice(-8)].map((ch) => ["\u200B", "\u200C", "\u2060"][ch.charCodeAt(0) % 3]).join("");
 // Чужой текст (пересланная подпись, цитата) уходит модели в теге, который нельзя закрыть изнутри:
 // так он не сможет выдать себя за слова владельца
 const foreign = (s: string) => `<пересланное>${s.replace(/</g, "‹").replace(/>/g, "›")}</пересланное>`;
@@ -549,7 +552,7 @@ export class Chat extends DurableObject<Env> {
       job.parts = tasks(text);
       job.svgs = [...new Set(svgs)].slice(0, MAX_DRAWINGS);
       job.body = job.parts.join("\n\n");
-      job.turn = content;
+      job.turn = epoch === this.epoch ? content : undefined; // «сброс» пришёл, пока модель думала: в очищенную память эта пара не пойдёт
       job.outbox = [];
       job.packed = false;
       job.done = { cut: a.cut, refused: a.refused, empty: !job.parts.length };
@@ -618,7 +621,7 @@ export class Chat extends DurableObject<Env> {
         const id = imageId();
         await this.db.put(`img:${id}`, bytes);
         // подпись есть у каждой страницы: у первой список ответов, у остальных номер. По подписи страницу видно в журнале шлюза.
-        items.push({ img: id, name: `reshenie-${id.slice(-8)}.${imageType(bytes) === "image/jpeg" ? "jpg" : "png"}`, caption: i === 0 && summary.length <= CAPTION_MAX ? summary : `${i + 1} / ${shots.length}` });
+        items.push({ img: id, name: `reshenie-${id.slice(-8)}.${imageType(bytes) === "image/jpeg" ? "jpg" : "png"}`, caption: (i === 0 && summary.length <= CAPTION_MAX ? summary : `${i + 1} / ${shots.length}`) + stamp(job.id) });
       }
       job.outbox = items;
       job.pages = shots.length;
@@ -753,7 +756,7 @@ export class Chat extends DurableObject<Env> {
       job.drawing = { i, tries };
       await save();
       const name = `risunok-${job.id.replace(/\W/g, "").slice(-8)}-${i + 1}.png`;
-      const caption = `Рисунок ${i + 1} из ${total}`; // своя подпись у каждого рисунка: по ней видно в журнале шлюза, дошёл ли он
+      const caption = `Рисунок ${i + 1} из ${total}` + stamp(job.id); // своя подпись у каждого рисунка: по ней видно в журнале шлюза, дошёл ли он
       try {
         if (tries > 2) throw new Error("рисунок дважды уронил рендер");
         if (job.unsure && (await this.green.wasSent(chatId, job.unsure, { file: name, caption }))) {
