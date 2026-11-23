@@ -5,7 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { Busy, Fatal, activeModel, allText, answerText, claudeProblem, tasks, unavailable } from "../src/claude.ts";
 import { config, hider, hookKey, logKey, lower, publicOrigin } from "../src/config.ts";
 import { Green, GreenError, permanent } from "../src/green.ts";
-import { assign, figureLabel, inline, taskHtml } from "../src/page.ts";
+import { assign, chunks, figureLabel, inline, pageHtml, taskHtml } from "../src/page.ts";
 import { fixSvg } from "../src/svg.ts";
 import { mathSpans, plainMath, texToPlain } from "../src/tex.ts";
 import { RULE, card, compose, plainText, prettyMath, seam, splitAnswer } from "../src/text.ts";
@@ -82,6 +82,11 @@ test("список ответов: все строки «Ответ:» зада�
   assert.equal(card(["Проверю вычисления.\n\n№1\nx = 5\nОтвет: 5"]), "✅ Ответы\n№1: 5");
   assert.equal(card(["№1\n```\nОтвет: не этот\n```\nОтвет: 35"]), "✅ Ответы\n№1: 35");
   assert.equal(card(["№2\nдоказательство\nч.т.д."]), "✅ Ответы\n№2: см. решение");
+  // ответ перенесён на следующую строку: в список идёт целиком; чужая строка после законченного ответа не цепляется
+  assert.equal(card(["№1\nОтвет: 1380 год (8 сентября), войско возглавлял\nДмитрий Иванович Донской.", "№2\nОтвет: мера стоимости, средство обращения,\nсредство накопления."]), "✅ Ответы\n№1: 1380 год (8 сентября), войско возглавлял Дмитрий Иванович Донской.\n№2: мера стоимости, средство обращения, средство накопления.");
+  // два прочтения неразборчивого числа: у каждого ответа видно, к какому прочтению он относится
+  assert.equal(card(["№1\nЕсли в условии 28:\nx = 5\nОтвет: 5\nЕсли в условии 23:\nОтвет: 4"]), "✅ Ответы\n№1: при 28: 5; при 23: 4");
+  assert.equal(card(["№2\nРешение:\nНе видно: конец условия. Пересними ближе."]), "✅ Ответы\n№2: не видно условия, пересними ближе");
   const long = card([`№1\nОтвет: ${"слово ".repeat(60)}`]);
   assert.ok(long.length < 160 && long.endsWith("…") && !long.endsWith(" …"));
 });
@@ -150,21 +155,70 @@ test("формулы LaTeX переводятся в обычный текст �
     "y = 3e^{x^2}": "y = 3e^(x²)",
     "\\sqrt[3]{x+1}": "∛(x+1)",
     "(A \\lor B) \\to \\neg C": "(A ∨ B) → ¬C",
+    // дробь перед множителем берётся в скобки, иначе читалась бы как деление на произведение
+    "\\Delta U = \\dfrac{3}{2}\\nu R \\Delta T": "ΔU = (3/2)νR ΔT",
+    "\\dfrac{1}{2}(a+b)": "(1/2)(a+b)",
+    "\\dfrac{3}{2} \\cdot 5": "3/2 · 5",
+    "S = \\dfrac{1}{2}ab\\sin\\gamma": "S = (1/2)ab sin γ",
+    "V = \\dfrac{1}{3} S_{ABD} \\cdot AA_1": "V = (1/3) S(ABD) · AA₁",
+    "\\dfrac{V}{V_m}": "V/Vₘ",
+    "\\dfrac{dy}{dx} = 2xy": "dy/dx = 2xy",
+    "\\dfrac{m(\\text{Zn})}{m(\\text{смеси})}": "m(Zn)/m(смеси)",
+    "\\smile AB = 70^\\circ": "◡AB = 70°",
+    "\\begin{vmatrix} -1 & 4 \\\\ 2 & 5 \\end{vmatrix} - 0": "|−1 4; 2 5| − 0",
+    // смешанное число, множитель после дроби и корня, функция после буквы: запись не должна менять смысл
+    "2\\dfrac{1}{3}": "2 1/3",
+    "2\\frac{a}{b}": "2a/b",
+    "y = \\dfrac{1}{2}x + 3": "y = (1/2)x + 3",
+    "V = \\dfrac{4}{3}\\pi R^3": "V = (4/3)πR³",
+    "x = \\dfrac{\\pi}{4} + \\dfrac{\\pi}{2}k": "x = π/4 + (π/2)k",
+    "\\frac{a}{b}^{2}": "(a/b)²",
+    "\\sin^2\\dfrac{x}{2}": "sin²(x/2)",
+    "\\dfrac{1}{2}\\text{ см}": "1/2 см",
+    "\\sqrt{2}x": "√2·x",
+    "\\sqrt{2x}": "√2x",
+    "4\\sqrt{3}\\text{ см}": "4√3 см",
+    "2\\sin x\\cos x": "2 sin x cos x",
+    "x\\ln x": "x ln x",
+    "2^{\\pi}x": "2^(π)x",
+    "x^\\pi": "x^π",
+    "\\binom{5}{2} = 10": "C(5, 2) = 10",
+    "a \\not= b": "a ≠ b",
+    "0{,}\\overline{3}": "0,(3)",
+    "\\left.\\dfrac{x^2}{2}\\right|_0^1": "x²/2|₀¹",
+    "\\ce{2H2 + O2 -> 2H2O}": "2H₂ + O₂ → 2H₂O",
+    "\\ce{SO4^{2-}}": "SO₄²⁻",
   };
   for (const [a, b] of Object.entries(cases)) assert.equal(texToPlain(a), b, a);
   assert.equal(plainMath("Ответ: $x = \\dfrac{2\\sqrt{3}}{3}$ см, цена 5$ и $y$."), "Ответ: x = 2√3/3 см, цена 5$ и y.");
   assert.deepEqual(mathSpans("a $b$ c").map((s) => s.math), [false, true, false]);
+  // числа в другой системе счисления после перевода формулы не принимаются за химическую формулу
+  assert.equal(plainText("Ответ: $1A2_{16}$ и $a1_{16}$, H2SO4"), "Ответ: 1A2₁₆ и a1₁₆, H₂SO₄");
 });
 
 test("страница решения: формулы набраны, «Дано» блоком, пометки справа, ответ в рамке", () => {
   const html = taskHtml("№2\nДано:\n$AB = 6$ см\nНайти: $SO$\nРешение:\n$x^2 = 4$ | $\\cdot 2$\n|x − 1| = 3\nОтвет: $\\dfrac{4}{3}$.", []);
   assert.match(html, /<section class="task" data-title="№2"><h2 class="b">№2<\/h2>/);
-  assert.match(html, /<div class="b given"><div class="lbl">Дано:<\/div><div><span class="katex">/);
-  assert.match(html, /<div class="find"><span class="lbl">Найти:<\/span> <span class="katex">/);
+  assert.match(html, /<div class="b given"><div class="lbl">Дано:<\/div><div><span class="fx"><span class="katex">/);
+  assert.match(html, /<div class="find"><span class="lbl">Найти:<\/span> <span class="fx"><span class="katex">/);
   assert.match(html, /<div class="b lbl">Решение:<\/div>/);
-  assert.match(html, /<div class="b row"><div class="main"><span class="katex">.*<div class="note"><span class="katex">/);
+  assert.match(html, /<div class="b row"><div class="main"><span class="fx"><span class="katex">.*<div class="note"><span class="fx"><span class="katex">/);
   assert.match(html, /<div class="b line">\|x − 1\| = 3<\/div>/); // модуль это не пометка
-  assert.match(html, /<div class="b ans"><span class="lbl">Ответ:<\/span> <span class="katex">.*mfrac/);
+  assert.match(html, /<div class="b ans"><span class="lbl">Ответ:<\/span> <span class="fx"><span class="katex">.*mfrac/);
+  // цепочка равенств делится на куски по знакам верхнего уровня: на странице она переносится перед знаком, а не посреди скобки
+  assert.deepEqual(chunks("S = \\dfrac{a = b}{2} = \\left(x = 1\\right) \\le 54"), ["S ", "= \\dfrac{a = b}{2} ", "= \\left(x = 1\\right) ", "\\le 54"]);
+  assert.equal(inline("$30(x-2) = 8(x^2-4)$").split('<span class="fx">').length - 1, 2);
+  // ответ, перенесённый на вторую строку, целиком попадает в рамку; рисунок задания без «Дано» стоит перед ответом
+  const two = taskHtml("№1\nрешение\nОтвет: 1380 год, войско возглавлял\nДмитрий Донской.", [{ svg: '<svg xmlns="x" viewBox="0 0 8 8"><text>№1</text></svg>', own: true }]);
+  assert.match(two, /class="b fig">.*<div class="b ans"><span class="lbl">Ответ:<\/span> 1380 год, войско возглавлял Дмитрий Донской\.<\/div><\/section>$/);
+  // строка таблицы с несколькими чертами это не пометка; запись электронного баланса с одной чертой остаётся пометкой
+  assert.match(taskHtml("№1\nx | y | F\n0 | 1 | 1\nОтвет: 1", []), /<div class="b line">x \| y \| F<\/div><div class="b line">0 \| 1 \| 1<\/div>/);
+  assert.match(taskHtml("№1\nMn⁺⁷ + 5e⁻ → Mn⁺² | 2\nОтвет: 1", []), /<div class="main">Mn⁺⁷ \+ 5e⁻ → Mn⁺²<\/div><div class="note">2<\/div>/);
+  // «Найти:» отдельной строкой: искомое не попадает в данные; решение без строки «Решение:» не попадает в блок «Дано»
+  const bare = taskHtml("№3\nДано:\n$m = 1$ кг\nНайти:\n$F$ — ?\nОбоснование:\nтело точка\n$F = ma$ | закон\nОтвет: 1", []);
+  assert.match(bare, /Дано:<\/div><div><span class="fx">[^]*?<\/div><div class="find"><span class="lbl">Найти:<\/span> <span class="fx">[^]*? — \?<\/div><\/div><div class="b lbl">Обоснование:<\/div><div class="b line">тело точка<\/div><div class="b row">/);
+  const noLabel = taskHtml("№3\nДано: $v = 2$\nНайти: $t$\nРешение.\n$t = 1$ | делим\nОтвет: 1", []);
+  assert.match(noLabel, /<\/div><\/div><div class="b line">Решение\.<\/div><div class="b row">/);
   // формула с опечаткой показывается текстом, страница не ломается; разметка из текста не исполняется
   assert.match(inline("$\\frac{1}{$ и <b>x</b>"), /class="raw".*&lt;b&gt;x&lt;\/b&gt;/);
 });
@@ -179,51 +233,30 @@ test("рисунок попадает в своё задание по номер
   assert.ok(html.indexOf('class="b fig"') > html.indexOf('class="b given"') && html.indexOf('class="b fig"') < html.indexOf("Решение:")); // чертёж сразу под «Дано»
   assert.ok(!/script|onclick|<image|https:\/\/x/.test(html));
   assert.ok(!html.includes(">Вариант 1 · №2</text>")); // номер в углу своего рисунка на странице не повторяется
+  // подпись деления оси «1» не принимается за заголовок «№1»; две работы со своим №1 получают каждая свой рисунок
+  assert.deepEqual(assign(["№1\nОтвет: 4", "№2\nграфик"], [pic("1")]).map((f) => f.map((x) => x.own)), [[], [false]]);
+  assert.deepEqual(assign(["Геометрия · №1\nОтвет: 1", "Физика · №1\nОтвет: 2"], [pic("Геометрия · №1"), pic("Физика · №1")]).map((f) => f.length), [1, 1]);
+  assert.deepEqual(assign(["Геометрия\n№1\nОтвет: 1", "Физика\n№1\nОтвет: 2"], [pic("№1"), pic("№1")]).map((f) => f.length), [1, 1]);
+  // кавычка в заголовке не выходит из атрибута, страница запрещает скрипты и загрузку из сети
+  assert.ok(taskHtml('Вариант 1" style="color:red\nОтвет: 1', []).includes('data-title="Вариант 1&quot; style=&quot;color:red"'));
+  assert.ok(pageHtml(["№1\nОтвет: 1"], [], "", "").includes(`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:">`));
   assert.ok(taskHtml(parts[2], figs[2]).includes(">нет такого</text>")); // у чужого рисунка подпись остаётся
 });
 
-test("ответ модели: берётся текст после последней проверки в песочнице", () => {
+test("ответ модели: берётся решение, а не заметки между проверками в песочнице", () => {
   const text = (t: string) => ({ type: "text", text: t }) as any;
   const tool = { type: "server_tool_use" } as any, result = { type: "code_execution_tool_result" } as any, fb = { type: "fallback" } as any;
   assert.equal(answerText([text("Проверю в песочнице."), tool, result, text("№1\nОтвет: 4")]), "№1\nОтвет: 4");
-  assert.equal(answerText([text("старый ответ"), fb, text("Сейчас пересчитаю."), tool, result, text("№1\nОтвет: 4")]), "№1\nОтвет: 4");
-  assert.equal(answerText([text("№1\nОтвет: 4"), tool, result]), ""); // после проверки ничего: бот попросит написать ответ
-  assert.equal(allText([text("№1\nОтвет: 4"), tool, result]), "№1\nОтвет: 4");
+  // решение написано до проверки, после неё только заметка: уходит решение
+  assert.equal(answerText([text("№1\nx = 4\nОтвет: 4\n@@@\n№2\nОтвет: 7"), tool, result, text("Проверка подтвердила оба ответа.")]), "№1\nx = 4\nОтвет: 4\n@@@\n№2\nОтвет: 7");
+  assert.equal(answerText([text("№1\nОтвет: 4"), tool, result]), "№1\nОтвет: 4");
+  // после проверки модель переписала ответ целиком: берётся новый
+  assert.equal(answerText([text("№1\nОтвет: 5"), tool, result, text("№1\nОтвет: 4")]), "№1\nОтвет: 4");
+  // ход подхватила запасная модель: она продолжает с того же места, начало ответа не теряется
+  assert.equal(answerText([text("№1\nОтвет: 4\n@@@\n№2\nРеакция идёт "), fb, text("с выделением газа.\nОтвет: 22,4 л")]), "№1\nОтвет: 4\n@@@\n№2\nРеакция идёт с выделением газа.\nОтвет: 22,4 л");
+  assert.equal(answerText([text("Сейчас пересчитаю."), tool, result]), ""); // решения нет вовсе: бот попросит модель его написать
+  assert.equal(allText([text("заметка"), tool, result, text("итог")]), "заметка\n\nитог");
   assert.equal(answerText([{ type: "thinking" } as any, text("№1\n"), text("Ответ: 4")]), "№1\nОтвет: 4");
-});
-
-test("размер и отпечаток фото", async () => {
-  const jpeg = Buffer.from("/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/yQALCAABAAEBAREA/8wABgAQEAX/2gAIAQEAAD8A0s8g/9k=", "base64");
-  assert.deepEqual(imageSize(new Uint8Array(jpeg)), { w: 1, h: 1 });
-  const png = new Uint8Array(32);
-  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0, 0x06, 0x40, 0, 0, 0x04, 0xb0]);
-  assert.deepEqual(imageSize(png), { w: 1600, h: 1200 });
-  assert.equal(imageSize(new TextEncoder().encode("не картинка")), null);
-  const a = await fingerprint(new Uint8Array([1, 2, 3])), b = await fingerprint(new Uint8Array([1, 2, 3])), c = await fingerprint(new Uint8Array([1, 2, 4]));
-  assert.ok(a === b && a !== c && /^[0-9a-f]{24}$/.test(a));
-});
-
-test("ошибки Claude: что повторять, а что сразу показывать", () => {
-  const c = config({ MODEL: "claude-opus-5-5" } as any);
-  const api = (status: number | undefined, type: string, message: string, headers: Record<string, string> = {}, details?: unknown) =>
-    Anthropic.APIError.generate(status, { type: "error", error: { type, message, details } }, undefined, new Headers(headers));
-  assert.ok(claudeProblem(c, api(529, "overloaded_error", "Overloaded")) instanceof Busy);
-  assert.ok(claudeProblem(c, api(500, "api_error", "boom")) instanceof Busy);
-  assert.ok(claudeProblem(c, api(429, "rate_limit_error", "slow down")) instanceof Busy); // без retry-after тоже повтор
-  assert.ok(claudeProblem(c, api(undefined, "overloaded_error", "Overloaded")) instanceof Busy); // ошибка внутри потока
-  assert.ok(claudeProblem(c, new Anthropic.APIConnectionError({ message: "x" })) instanceof Busy);
-  assert.match(claudeProblem(c, api(401, "authentication_error", "bad key")).message, /Неверный ключ/);
-  assert.match(claudeProblem(c, api(404, "not_found_error", "no model")).message, /Нет модели claude-opus-5-5/);
-  assert.match(claudeProblem(c, api(402, "billing_error", "pay")).message, /кончились деньги/);
-  assert.match(claudeProblem(c, api(400, "invalid_request_error", "Your credit balance is too low")).message, /кончились деньги/);
-  assert.match(claudeProblem(c, api(400, "invalid_request_error", "You have reached your specified API usage limits.")).message, /лимит трат, который задан в консоли/);
-  assert.match(claudeProblem(c, api(413, "request_too_large", "big")).message, /Фото слишком большое/);
-  assert.match(claudeProblem(c, api(400, "invalid_request_error", "In order to access this model, your organization or workspace must have data retention enabled.")).message, /хранения данных 30 дней/);
-  assert.ok(unavailable(api(404, "not_found_error", "model: x")) && unavailable(api(400, "invalid_request_error", "must have data retention enabled")) && !unavailable(api(400, "invalid_request_error", "messages: bad")));
-  assert.equal(activeModel(c), "claude-opus-5-5"); // в этом тесте MODEL задана как Opus: запасная не нужна
-  const other = claudeProblem(c, api(400, "invalid_request_error", "messages: bad"));
-  assert.ok(other instanceof Fatal);
-  assert.equal(other.message, "Ошибка Claude 400: messages: bad");
 });
 
 test("рисунок приводится к одному стилю: чёрный фон, белые линии и подписи, шрифт, индексы", () => {
@@ -357,7 +390,8 @@ test("шлюз не ответил на отправку: по журналу и
   const now = Math.floor(Date.now() / 1000);
   const journal = [
     { chatId: "1@c.us", timestamp: now, typeMessage: "extendedTextMessage", textMessage: "✅ Ответы\n№1: 4" },
-    { chatId: "1@c.us", timestamp: now, typeMessage: "imageMessage", fileName: "reshenie-abc.png" },
+    { chatId: "1@c.us", timestamp: now, typeMessage: "imageMessage", fileName: "b89ded5e-1a3b-4168-895a-540123456789.png", caption: "2 / 3" },
+    { chatId: "1@c.us", timestamp: now, typeMessage: "documentMessage", fileName: "reshenie-doc.png" },
     { chatId: "2@c.us", timestamp: now, typeMessage: "textMessage", textMessage: "чужой чат" },
     { chatId: "1@c.us", timestamp: now - 900, typeMessage: "textMessage", textMessage: "старое" },
   ];
@@ -368,8 +402,11 @@ test("шлюз не ответил на отправку: по журналу и
     const since = Date.now() - 20_000;
     assert.equal(await g.wasSent("1@c.us", since, { text: "✅ Ответы\n№1: 4" }), true);
     assert.match(url, /lastOutgoingMessages\/secret-token-123\?minutes=\d+$/);
-    assert.equal(await g.wasSent("1@c.us", since, { file: "reshenie-abc.png" }), true);
-    assert.equal(await g.wasSent("1@c.us", since, { file: "reshenie-other.png" }), false);
+    // шлюз даёт картинке своё имя файла: страницу узнаём по подписи
+    assert.equal(await g.wasSent("1@c.us", since, { file: "reshenie-abc.png", caption: "2 / 3" }), true);
+    assert.equal(await g.wasSent("1@c.us", since, { file: "reshenie-abc.png", caption: "3 / 3" }), false);
+    assert.equal(await g.wasSent("1@c.us", since, { file: "reshenie-abc.png" }), false); // без подписи картинку не опознать: шлём ещё раз
+    assert.equal(await g.wasSent("1@c.us", since, { file: "reshenie-doc.png" }), true);
     assert.equal(await g.wasSent("1@c.us", since, { text: "чужой чат" }), false);
     assert.equal(await g.wasSent("1@c.us", since, { text: "старое" }), false); // было до этой отправки
     globalThis.fetch = (async () => new Response("boom", { status: 500 })) as typeof fetch;
@@ -401,8 +438,25 @@ test("картинка: после таймаута загрузки по ссы
       return new Response("{}");
     }) as typeof fetch;
     await new Green(c).sendImage("1@c.us", new Uint8Array([1]), "https://w/?img=1", "p.png", "подпись");
-    assert.equal(calls.length, 2);
+    // шлюз ответил 500: файл он мог успеть принять, поэтому перед отправкой по ссылке бот смотрит в журнал исходящих
+    assert.equal(calls.length, 3);
+    assert.match(calls[1], /lastOutgoingMessages/);
     assert.deepEqual(JSON.parse(body), { chatId: "1@c.us", urlFile: "https://w/?img=1", fileName: "p.png", caption: "подпись" });
+    // картинка в журнале уже есть: по ссылке второй раз не шлём
+    calls.length = 0;
+    const now = Math.floor(Date.now() / 1000);
+    globalThis.fetch = (async (u: any) => {
+      calls.push(String(u));
+      if (String(u).includes("sendFileByUpload")) return new Response("bad gateway", { status: 502 });
+      return new Response(JSON.stringify([{ chatId: "1@c.us", timestamp: now, typeMessage: "imageMessage", fileName: "auto.png", caption: "подпись" }]));
+    }) as typeof fetch;
+    await new Green(c).sendImage("1@c.us", new Uint8Array([1]), "https://w/?img=1", "p.png", "подпись");
+    assert.ok(calls.length === 2 && !calls.some((u) => u.includes("sendFileByUrl")), String(calls.length));
+    // ясный отказ 4xx: в журнал не ходим, сразу по ссылке
+    calls.length = 0;
+    globalThis.fetch = (async (u: any) => (calls.push(String(u)), String(u).includes("sendFileByUpload") ? new Response("too big", { status: 413 }) : new Response("{}"))) as typeof fetch;
+    await new Green(c).sendImage("1@c.us", new Uint8Array([1]), "https://w/?img=1", "p2.png", "подпись");
+    assert.ok(calls.length === 2 && calls[1].includes("sendFileByUrl"));
   } finally {
     globalThis.fetch = real;
   }

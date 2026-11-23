@@ -150,18 +150,23 @@ export async function ask(c: Cfg, o: AskOptions): Promise<Answer> {
 const has = (content: Content, type: string) => content.some((b) => (b.type as string) === type);
 const isTool = (type: string) => type === "server_tool_use" || type.endsWith("_tool_result");
 const texts = (content: Content) => content.flatMap((b) => (b.type === "text" && b.text.trim() ? [b.text] : []));
-// Часть хода после перехода на запасную модель (всё, что было до него, запасная модель переписывает заново)
-const tail = (content: Content) => content.slice(content.map((b) => b.type as string).lastIndexOf("fallback") + 1);
-// Готовый ответ: текст после последнего обращения к песочнице. Заметки, которые модель писала между
-// проверками («сейчас пересчитаю»), читателю не нужны. У Fable 5.2 они и так уходят в размышления,
-// а запасные модели пишут их обычным текстом.
+const MARK = /^[ \t]*(Ответ:|@@@)/m; // по этим строкам видно, что кусок текста это решение, а не заметка
+// Готовый ответ: то, что модель написала после последнего обращения к песочнице. Заметки между проверками
+// («сейчас пересчитаю», «проверка подтвердила») читателю не нужны. У Fable 5.2 они уходят в размышления,
+// а запасные модели пишут их обычным текстом. Если решение стоит до проверки, а после неё только заметка, берём решение.
+// Блок fallback (ход подхватила запасная модель) текст не разрывает: она продолжает с того же места.
 export function answerText(content: Content): string {
-  const t = tail(content);
-  const lastTool = t.reduce((k, b, i) => (isTool(b.type as string) ? i : k), -1);
-  return texts(t.slice(lastTool + 1)).join("");
+  const segments: string[] = [""];
+  for (const b of content) {
+    if (isTool(b.type as string)) segments.push("");
+    else if (b.type === "text") segments[segments.length - 1] += b.text;
+  }
+  const last = segments[segments.length - 1];
+  if (MARK.test(last)) return last;
+  return [...segments].reverse().find((s) => MARK.test(s)) ?? last;
 }
 // Весь текст хода: если после проверок модель ничего не написала, ответ мог остаться перед ними
-export const allText = (content: Content): string => texts(tail(content)).join("\n\n");
+export const allText = (content: Content): string => texts(content).join("\n\n");
 
 // Один ход модели. Пересчёт в песочнице идёт на стороне Anthropic; если он затянулся, ход приходит
 // с пометкой pause_turn, и его нужно продолжить, вернув модели её же сообщение без изменений.
@@ -177,6 +182,14 @@ async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
     try {
       r = await attempt(c, model, o, messages, container);
     } catch (e) {
+      // fast-режим упёрся в свой лимит посреди хода: этот же круг повторяем на обычной скорости, оплаченные круги не теряем
+      const spend = e instanceof Anthropic.RateLimitError && (e.errorCode === "enforced_spend_limit_reached" || e.errorCode === "contract_spend_limit_reached");
+      if (round > 0 && o.fast && !spend && e instanceof Anthropic.APIError && (e.status === 429 || e.status === 529)) {
+        console.log("fast: лимит или перегрузка посреди хода, продолжаю на обычной скорости");
+        o = { ...o, fast: false };
+        round--;
+        continue;
+      }
       // срок вышел или Claude отвалился уже после того, как часть ответа написана: её не теряем
       const sofar = answerText(blocks);
       if ((e instanceof Timeout || e instanceof Busy) && sofar.trim()) return { text: sofar, cut: true, refused: false, tokens, model, checks };
@@ -271,7 +284,7 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
     for await (const ev of stream) {
       opened = true;
       if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") out += ev.delta.text;
-      else if (ev.type === "content_block_start" && (isTool(ev.content_block.type as string) || (ev.content_block.type as string) === "fallback")) {
+      else if (ev.type === "content_block_start" && isTool(ev.content_block.type as string)) {
         out = ""; // всё, что было написано до проверки, это заметки, а не ответ
         fresh = true;
       }

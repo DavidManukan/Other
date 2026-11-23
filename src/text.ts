@@ -7,9 +7,9 @@ const SUB: Record<string, string> = { "0": "₀", "1": "₁", "2": "₂", "3": "
 const conv = (t: string, map: Record<string, string>) => [...t].every((c) => c in map) ? [...t].map((c) => map[c]).join("") : null;
 // Химические формулы и индексы: CH3 -> CH₃, H2SO4 -> H₂SO₄, A1B1 -> A₁B₁, x1 -> x₁ (коэффициент 2H2O не трогаем).
 // Формулу, за которой стоит знак заряда (SO42-), не трогаем: где индекс, а где заряд, по записи не понять.
-const CHEM = /(?<![A-Za-z0-9_.,])(\d*)((?:[A-Z][a-z]?\d*|\((?:[A-Z][a-z]?\d*)+\)\d*)+)(?![A-Za-z0-9]|[+−-](?![A-Za-z0-9(]))/g;
+const CHEM = /(?<![A-Za-z0-9_.,])(\d*)((?:[A-Z][a-z]?\d*|\((?:[A-Z][a-z]?\d*)+\)\d*)+)(?![A-Za-z0-9₀-₉]|[+−-](?![A-Za-z0-9(]))/g;
 const ION = /(?<![A-Za-z0-9])([A-Z][a-z]?)(\d)([+−-])(?![A-Za-z0-9(])/g; // Fe3+ -> Fe³⁺: заряд простого иона
-const IDX = /(?<![A-Za-zА-Яа-я0-9])([a-z])(\d{1,2})(?![\d.,]?\d)/g;
+const IDX = /(?<![A-Za-zА-Яа-я0-9])([a-z])(\d{1,2})(?![\d.,]?\d|[₀-₉])/g; // 1A2₁₆ и a1₁₆ это числа в другой системе счисления
 export function subscripts(text: string, sub: (d: string) => string): string {
   return text
     .replace(CHEM, (_m: string, k: string, tok: string) => k + (/\d/.test(tok) ? tok.replace(/(?<=[A-Za-z)])\d+/g, sub) : tok))
@@ -59,21 +59,48 @@ export function plainText(text: string): string {
 }
 
 export const RULE = "——————————"; // черта между заданиями: длинное тире есть в любом шрифте
-const HEAD = /^\s*((Вариант\s+\S+\s*·\s*)?(№|Задание|Задача)|Исправляю|Вариант\s)/;
+export const HEAD = /^\s*(([^·\n]{1,30}·\s*){0,2}(№|Задание|Задача)|Исправляю|Вариант\s)/; // «№3», «Вариант 1 · №3», «Физика · №1»
+const OTHER = /^(Ответ|Дано|Найти|Доказать|Решение|Доказательство|Обоснование|Проверка|ОДЗ|Если|Не видно|Прочитал|Прочитано)\b|^\d+\)|^```|^@@@/;
 
-// Короткий список ответов: в начале сообщения или подписью к картинке. На маленьком экране видно прежде всего его.
+// Ответ, начатый в строке i («Ответ: …»). Модель иногда переносит его на следующую строку:
+// хвост присоединяем, иначе в рамке и в списке ответов осталась бы половина.
+// Возвращает сам ответ и номер последней строки, которая в него вошла.
+export function answerAt(rows: string[], i: number): { value: string; last: number } {
+  let value = rows[i].trim().replace(/^Ответ:\s*/, "");
+  let last = i;
+  const tail = rows.reduce((k, r, n) => (r.trim() ? n : k), -1); // последняя непустая строка задания
+  for (let k = i + 1; k < rows.length && k <= i + 3; k++) {
+    const next = rows[k].trim();
+    if (!next || OTHER.test(next) || HEAD.test(next)) break;
+    // хвост берём, только когда ответ явно не закончен: строка пустая, оборвана на запятой или тире,
+    // либо следом идёт последняя строка задания, которая и заканчивает фразу
+    const open = !value || /[,;:—–(]$/.test(value);
+    const closes = !/[.!?…]$/.test(value) && k === tail && /[.!?…]$/.test(next);
+    if (!open && !closes) break;
+    value = value ? `${value} ${next}` : next;
+    last = k;
+  }
+  return { value, last };
+}
+
+// Короткий список ответов: в начале сообщения или подписью к первой странице. На маленьком экране видно прежде всего его.
 export function card(parts: string[]): string {
   const lines = parts.map((p) => {
     const rows = p.replace(/```[\s\S]*?```/g, "").split("\n").map((l) => l.trim());
     const head = (rows.find((l) => HEAD.test(l)) ?? rows.find(Boolean) ?? "").slice(0, 40);
     const answers: string[] = [];
-    rows.forEach((l, i) => {
-      if (!/^Ответ:/.test(l)) return;
-      const next = rows.slice(i + 1).find(Boolean) ?? "";
-      const value = l.slice(6).trim() || (HEAD.test(next) || /^Ответ:/.test(next) ? "" : next); // ответ мог уйти на следующую строку
-      if (value) answers.push(value);
-    });
-    let answer = answers.length ? answers.join("; ") : "см. решение";
+    let branch = ""; // прочтение неразборчивого условия («Если в условии 28:»), к которому относится следующий ответ
+    for (let i = 0; i < rows.length; i++) {
+      const b = /^Если в условии\s+(.+?):/.exec(rows[i]);
+      if (b) branch = b[1];
+      if (!/^Ответ:/.test(rows[i])) continue;
+      const a = answerAt(rows, i);
+      if (a.value) answers.push(branch && !a.value.includes(branch) ? `при ${branch}: ${a.value}` : a.value);
+      branch = "";
+      i = a.last;
+    }
+    // задания без ответа: условие не видно целиком (нужно переснять) или это доказательство
+    let answer = answers.length ? answers.join("; ") : rows.some((l) => /^Не видно:/.test(l)) ? "не видно условия, пересними ближе" : "см. решение";
     if (answer.length > 140) {
       const cut = answer.slice(0, 139);
       const at = Math.max(cut.lastIndexOf("; "), cut.lastIndexOf(" "));

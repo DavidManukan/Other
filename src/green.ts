@@ -65,7 +65,8 @@ export class Green {
 
   // Принял ли шлюз сообщение, на отправку которого мы не дождались ответа. Смотрим его журнал исходящих:
   // если сообщение там есть, второй раз его не шлём. Не удалось узнать: считаем, что не принял (лучше дубль, чем потеря).
-  async wasSent(chatId: string, since: number, what: { text: string } | { file: string }): Promise<boolean> {
+  // Картинку ищем по подписи (у каждой страницы она своя): имя файла шлюз в журнале для картинок заменяет своим.
+  async wasSent(chatId: string, since: number, what: { text: string } | { file: string; caption?: string }): Promise<boolean> {
     try {
       const minutes = Math.min(1440, Math.ceil((Date.now() - since) / 60_000) + 2);
       const list = await this.call("lastOutgoingMessages", undefined, 10_000, `?minutes=${minutes}`);
@@ -74,7 +75,10 @@ export class Green {
       const head = (s: unknown) => String(s ?? "").trim().slice(0, 200);
       return list.some((m: any) => {
         if (m?.chatId !== chatId || Number(m.timestamp) < from) return false;
-        if ("file" in what) return String(m.fileName ?? "") === what.file;
+        if ("file" in what) {
+          if (m.typeMessage === "documentMessage") return String(m.fileName ?? "") === what.file;
+          return /image/i.test(String(m.typeMessage)) && !!what.caption && head(m.caption) === head(what.caption);
+        }
         return head(m.textMessage ?? m.extendedTextMessage?.text) === head(clip(what.text));
       });
     } catch (e) {
@@ -102,6 +106,8 @@ export class Green {
     const media = this.mediaUrl();
     const type = /\.jpe?g$/i.test(name) ? "image/jpeg" : "image/png";
     if (media && Date.now() > Green.uploadOffUntil) {
+      const at = Date.now();
+      let status = 0;
       try {
         const form = new FormData();
         form.append("chatId", chatId);
@@ -109,6 +115,7 @@ export class Green {
         if (caption) form.append("caption", caption);
         form.append("file", new Blob([image], { type }), name);
         const r = await fetch(`${media}/waInstance${this.c.greenId}/sendFileByUpload/${this.c.greenToken}`, { method: "POST", body: form, signal: AbortSignal.timeout(45_000) });
+        status = r.status;
         const t = await r.text();
         if (!r.ok) throw new Error(`${r.status} ${this.hide(t).slice(0, 150)}`);
         Green.uploadFails = 0;
@@ -116,6 +123,8 @@ export class Green {
       } catch (e: any) {
         // Ответа не дождались: файл мог уйти. По ссылке следом не шлём, иначе картинка придёт дважды.
         if (e?.name === "TimeoutError") throw new GreenError("GREEN-API sendFileByUpload: не ответил за 45 с", undefined, true);
+        // Связь оборвалась или шлюз ответил 5xx: файл он мог успеть принять. Смотрим в журнал, прежде чем слать по ссылке.
+        if (!(status >= 400 && status < 500) && (await this.wasSent(chatId, at, { file: name, caption }))) return;
         console.log("загрузка картинки не удалась, отправляю по ссылке:", this.hide(e?.message ?? e));
         if (++Green.uploadFails >= 2) Green.uploadOffUntil = Date.now() + 600_000; // не тратим время на заведомо неудачные попытки
       }

@@ -27,7 +27,7 @@ export function sameSecret(a: string, b: string): boolean {
   return d === 0;
 }
 
-export const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+export const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
 // Время по Москве для журнала на странице проверки
 export const clock = (t: number) =>

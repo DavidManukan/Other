@@ -14,19 +14,53 @@ const SYM: Record<string, string> = {
   land: "∧", wedge: "∧", lor: "∨", vee: "∨", neg: "¬", lnot: "¬", oplus: "⊕", sum: "Σ", prod: "∏", int: "∫", oint: "∮",
   ell: "ℓ", hbar: "ħ", prime: "′", quad: " ", qquad: "  ", lbrace: "{", rbrace: "}", langle: "⟨", rangle: "⟩", mid: "|", vert: "|",
   backslash: "\\", colon: ":", lt: "<", gt: ">", ast: "∗", star: "⋆", propto: "∝", cong: "≅", ll: "≪", gg: "≫", simeq: "≃",
+  smile: "◡", frown: "⌢", nparallel: "∦", nmid: "∤", therefore: "∴", because: "∵",
+  lvert: "|", rvert: "|", lVert: "‖", rVert: "‖", Vert: "‖", lfloor: "⌊", rfloor: "⌋", lceil: "⌈", rceil: "⌉",
+  varkappa: "ϰ", varrho: "ρ", varsigma: "ς", Pi: "Π", Xi: "Ξ", Upsilon: "Υ", supset: "⊃", supseteq: "⊇", nsubseteq: "⊈",
+  otimes: "⊗", leqq: "≤", geqq: "≥", rightleftharpoons: "⇄", leftrightarrows: "⇄", triangleq: "≜", bot: "⊥", top: "⊤",
 };
 const BB: Record<string, string> = { N: "ℕ", Z: "ℤ", Q: "ℚ", R: "ℝ", C: "ℂ" };
 const SUP: Record<string, string> = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻", "−": "⁻", "=": "⁼", "(": "⁽", ")": "⁾", n: "ⁿ", i: "ⁱ", x: "ˣ", y: "ʸ", a: "ᵃ", b: "ᵇ", c: "ᶜ", d: "ᵈ", e: "ᵉ", k: "ᵏ", m: "ᵐ", p: "ᵖ", t: "ᵗ" };
 const SUB: Record<string, string> = { "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉", "+": "₊", "-": "₋", "−": "₋", "=": "₌", "(": "₍", ")": "₎", a: "ₐ", e: "ₑ", o: "ₒ", x: "ₓ", n: "ₙ", m: "ₘ", k: "ₖ", t: "ₜ", i: "ᵢ", j: "ⱼ", ",": ",", ".": "," };
-const WRAP = new Set(["text", "mathrm", "mathbf", "mathit", "mathsf", "textbf", "textit", "operatorname", "boldsymbol", "bm", "displaystyle", "textstyle", "mathstrut", "overline", "underline", "widehat", "hat", "bar", "tilde", "boxed", "mathcal", "limits", "nolimits"]);
+const WRAP = new Set(["text", "mathrm", "mathbf", "mathit", "mathsf", "textbf", "textit", "boldsymbol", "bm", "displaystyle", "textstyle", "mathstrut", "underline", "widehat", "hat", "tilde", "boxed", "mathcal", "limits", "nolimits"]);
+const NOT: Record<string, string> = { "=": "≠", "∈": "∉", "⊂": "⊄", "⊆": "⊈", "≡": "≢", "<": "≮", ">": "≯", "|": "∤", "∥": "∦" };
+const GLUE = /[\p{L}\p{N})′⁰¹²³⁴-⁹ⁿˣ₀-₉]$/u; // после такого знака имя функции нужно отделить пробелом: «2 sin x cos x»
+// Сразу за корнем идёт множитель: без точки «√2x» читалось бы как корень из 2x
+const AFTER_ROOT = /^(?:[A-Za-z\p{N}({]|\s*[A-Za-z(]|\\(?!(?:text|mathrm|operatorname|cdot|times|cdots|ldots|dots|right|end|quad|qquad|le|ge|leq|geq|ne|neq|pm|mp|approx|in|cup|cap|to|div)(?![A-Za-z]))[A-Za-z])/u;
+
+// Химическая запись из \ce{…}: индексы, заряды, стрелки
+function chem(s: string): string {
+  const up: Record<string, string> = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻" };
+  const down = "₀₁₂₃₄₅₆₇₈₉";
+  return s
+    .replace(/<=>|<-->|<->/g, "⇄").replace(/->/g, "→").replace(/\s+v(?=\s|$)/g, "↓").replace(/\s+\^(?=\s|$)/g, "↑")
+    .replace(/\^\{?(\d*[+-])\}?/g, (_m, c: string) => [...c].map((x) => up[x]).join(""))
+    .replace(/(?<=[A-Za-z)\]])(\d+)(?![+-](?![A-Za-z(\d]))/g, (d) => [...d].map((x) => down[Number(x)]).join(""))
+    .replace(/[{}]/g, "");
+}
 const DROP = new Set(["left", "right", "big", "Big", "bigg", "Bigg", "bigl", "bigr", "Bigl", "Bigr", "displaystyle", "textstyle", "limits", "nolimits", "nonumber", "hline", "mathstrut"]);
 const BIG = new Set(["lim", "sum", "prod", "int", "max", "min", "sup", "inf"]);
 
 const map = (s: string, m: Record<string, string>) => [...s].every((c) => c in m) ? [...s].map((c) => m[c]).join("") : null;
-const simple = (s: string) => /^[\p{L}\p{N}.,°′√∞π⁰¹²³⁴-⁹₀-₉ⁿ]*$/u.test(s) || /^\([^()]*\)$/.test(s) || /^√\([^()]*\)$/.test(s);
+const simple = (s: string) => /^[\p{L}\p{N}.,°′√∞π⁰¹²³⁴-⁹₀-₉ₐₑₒₓₙₘₖₜᵢⱼⁿ]*$/u.test(s) || /^\([^()]*\)$/.test(s) || /^√\([^()]*\)$/.test(s) || /^\p{L}+\([^()]*\)$/u.test(s);
 const paren = (s: string) => (simple(s) ? s : `(${s})`);
 // Знаменатель без скобок только если это одно число, одна буква или имя отрезка: a/2a читалось бы неверно
-const below = (s: string) => (/^(\d+(,\d+)?|\p{Lu}+[₀-₉]*|\p{L}[⁰¹²³⁴-⁹₀-₉ⁿ]*|√\d+|π)$/u.test(s) || /^\([^()]*\)$/.test(s) ? s : `(${s})`);
+const below = (s: string) => (/^(\d+(,\d+)?|\p{Lu}+[₀-₉]*|\p{L}[⁰¹²³⁴-⁹₀-₉ₐₑₒₓₙₘₖₜᵢⱼⁿ]*|d\p{Ll}|\p{L}+\([^()]*\)|√\d+|π)$/u.test(s) || /^\([^()]*\)$/.test(s) ? s : `(${s})`);
+// После дроби сразу идёт множитель (буква, число, скобка, корень, степень): без скобок «1/2x» читалось бы как деление на 2x
+const NOT_FACTOR = new Set(["in", "notin", "ni", "subset", "subseteq", "cup", "cap", "setminus", "to", "mid", "vert", "land", "wedge", "lor", "vee", "neg", "lnot", "right", "end", "quad", "qquad"]);
+function factorNext(rest: string): boolean {
+  const t = rest.trimStart();
+  if (/^[\p{L}\p{N}(^]/u.test(t)) return true;
+  const m = /^\\([A-Za-z]+)/.exec(t);
+  if (!m) return false;
+  const n = m[1];
+  if (n === "left") return true;
+  if (NOT_FACTOR.has(n) || DROP.has(n)) return false;
+  if (n in SYM) return /[\p{L}∞∂∇√]/u.test(SYM[n]);
+  return n !== "text" && n !== "mathrm"; // sqrt, frac, sin… это множители; единицы измерения в \text нет
+}
+// Перед дробью стоит функция (sin², log₃): аргумент берём в скобки, «sin²(x/2)»
+const AFTER_FN = /(?:sin|cos|tg|ctg|tan|cot|ln|lg|log[₀-₉,]*)[⁰¹²³⁴-⁹⁻]*\s*$/;
 
 // Разбор по символам: группы {…} раскрываются рекурсивно
 function conv(s: string): string {
@@ -71,8 +105,10 @@ function conv(s: string): string {
     if (mark === "^" && raw === "′") return "′";
     const u = map(raw.replace(/\s/g, ""), m);
     if (u !== null) return u;
+    if (mark === "_" && /^[A-Z][A-Z₀-₉]+$/.test(raw)) return `(${raw})`; // S_{ABD}: «SABD» читалось бы как произведение
     if (mark === "_") return BIG.has(after) ? `(${raw})` : /^[\p{L}\p{N}\s,]+$/u.test(raw) ? raw.replace(/\s/g, "") : `_(${raw})`;
-    return `^${[...raw].length === 1 ? raw : `(${raw})`}`;
+    // одиночный знак без надстрочного вида (π, ∞, λ): в скобки, если следом идёт множитель, иначе «2^πx» читалось бы как 2 в степени πx
+    return `^${[...raw].length === 1 && !/^\s*[\p{L}\p{N}\\({]/u.test(s.slice(i)) ? raw : `(${raw})`}`;
   };
   let last = ""; // имя последней команды: от него зависит вид индекса (lim, sum, int)
   while (i < s.length) {
@@ -83,14 +119,32 @@ function conv(s: string): string {
       i += m[0].length;
       const name = m[1];
       last = name;
-      if (name === "frac" || name === "dfrac" || name === "tfrac" || name === "cfrac") { const a = group(), b = group(); out += `${paren(a)}/${below(b)}`; }
-      else if (name === "sqrt") { const n = optional(), x = group(); out += (n === null || n === "2" ? "√" : n === "3" ? "∛" : n === "4" ? "∜" : (map(n, SUP) ?? `(${n})`) + "√") + (/^[\p{L}\p{N},]+$/u.test(x) ? x : `(${x})`); }
+      if (name === "frac" || name === "dfrac" || name === "tfrac" || name === "cfrac") {
+        const fn = AFTER_FN.test(out);
+        const a = group(), b = group();
+        const f = `${paren(a)}/${below(b)}`;
+        // смешанное число: 2\dfrac{1}{3} это «2 1/3», а не «21/3»
+        out += (/\d$/.test(out) && /^\d/.test(f) ? " " : "") + (fn || factorNext(s.slice(i)) ? `(${f})` : f);
+      }
+      else if (name === "sqrt") { const n = optional(), x = group(); out += (n === null || n === "2" ? "√" : n === "3" ? "∛" : n === "4" ? "∜" : (map(n, SUP) ?? `(${n})`) + "√") + (/^[\p{L}\p{N},]+$/u.test(x) ? x + (AFTER_ROOT.test(s.slice(i)) ? "·" : "") : `(${x})`); }
       else if (name === "mathbb") { const x = group(); out += BB[x] ?? x; }
       else if (name === "vec" || name === "overrightarrow") out += group() + "⃗";
+      else if (name === "ce" || name === "pu") { const from = i; group(); out += chem(s.slice(from, i).trim().replace(/^\{|\}$/g, "")); }
+      else if (name === "overline" || name === "bar") { const x = group(); out += /^\d+$/.test(x) ? `(${x})` : [...x].map((ch) => ch + "\u0305").join(""); } // 0,(3): период дроби
+      else if (name === "binom" || name === "dbinom" || name === "tbinom") { const n = group(), k = group(); out += `C(${n}, ${k})`; }
+      else if (name === "pmod") out += ` (mod ${group()})`;
+      else if (name === "bmod" || name === "mod") out += " mod ";
+      else if (name === "not") { const x = group(); out += NOT[x] ?? x + "\u0338"; }
+      else if (name === "operatorname") { const w = group(); out += (/^[A-Za-z]/.test(w) && GLUE.test(out) ? " " : "") + w; }
+      else if ((name === "left" || name === "right") && s[i] === ".") i++; // невидимая скобка
       else if (name === "begin" || name === "end") {
         const env = takeRaw().replace(/[{}]/g, "");
-        if (name === "begin") { if (/array|aligned|tabular/.test(env) && s[i] === "{") takeRaw(); out += /cases/.test(env) ? "система: " : /[pb]matrix/.test(env) ? "(" : /vmatrix/.test(env) ? "|" : ""; }
-        else out += /[pb]matrix/.test(env) ? ")" : /vmatrix/.test(env) ? "|" : "";
+        const edge = /[pb]matrix/.test(env) ? "()" : /vmatrix/.test(env) ? "||" : "";
+        if (name === "begin") {
+          if (/array|aligned|tabular/.test(env) && s[i] === "{") takeRaw();
+          out += /cases/.test(env) ? "система: " : edge.slice(0, 1);
+          while (edge && s[i] === " ") i++;
+        } else out = edge ? out.replace(/[\s;]+$/, "") + edge.slice(1) : out;
       }
       else if (name === "\\") out += "; ";
       else if (name === "," || name === ";" || name === ":" || name === " " || name === ">") out += " ";
@@ -98,7 +152,7 @@ function conv(s: string): string {
       else if (DROP.has(name)) out += "";
       else if (WRAP.has(name)) out += group();
       else if (name in SYM) out += SYM[name];
-      else out += /^[A-Za-z]+$/.test(name) ? name : name; // sin, cos, tg, log, \%, \{ …
+      else out += (/^[A-Za-z]{2,}$/.test(name) && GLUE.test(out) ? " " : "") + name; // sin, cos, tg, log, \%, \{ …
       continue;
     }
     last = c === " " ? last : c === "^" || c === "_" ? last : "";
@@ -122,8 +176,8 @@ export function texToPlain(tex: string): string {
     .replace(/\s*;\s*(?=\)|\||$)/g, "") // лишний разделитель строк перед концом матрицы
     .replace(/[ \t]+;/g, ";")
     .replace(/[ \t]{2,}/g, " ")
-    .replace(/\(\s+/g, "(").replace(/\s+\)/g, ")").replace(/\|\s+(?=[^|]*\|)/, "|").replace(/\s+\|$/, "|")
-    .replace(/([∠△¬√]) (?=\S)/g, "$1")
+    .replace(/\(\s+/g, "(").replace(/\s+\)/g, ")")
+    .replace(/([∠△¬√◡⌢]) (?=\S)/g, "$1")
     .replace(/([α-ωΑ-Ω]) (?=[A-Za-zα-ωΑ-Ω])/g, "$1")
     .replace(/(^|[=≠<>≤≥(,;] ?)± (?=[\d\p{L}])/gu, "$1±")
     .replace(/(?<![A-Za-z])(arcsin|arccos|arctg|arcctg|sin|cos|tg|ctg|ln|lg|exp|log[₀-₉,]*)(?=[A-Za-zα-ωΑ-Ω\d√])/g, "$1 ")
