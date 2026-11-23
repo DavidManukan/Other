@@ -15,6 +15,8 @@ export interface SelfTest {
 // Рисунок для самопроверки: обычный чертёж в стиле бота (две плоскости и отрезки между ними)
 export const SAMPLE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 640" font-family="DejaVu Sans"><rect width="800" height="640" fill="#171717"/><text x="40" y="50" fill="#fff" font-size="34">№1</text><polygon points="200,90 700,90 600,190 100,190" fill="none" stroke="#D9D9D0" stroke-width="2"/><text x="650" y="125" fill="#D9D9D0" font-size="30">α</text><polygon points="200,430 700,430 600,530 100,530" fill="none" stroke="#D9D9D0" stroke-width="2"/><text x="650" y="465" fill="#D9D9D0" font-size="30">β</text><line x1="270" y1="140" x2="520" y2="140" stroke="#fff" stroke-width="2" stroke-dasharray="8 6"/><line x1="330" y1="480" x2="580" y2="480" stroke="#fff" stroke-width="2" stroke-dasharray="8 6"/><line x1="270" y1="140" x2="330" y2="480" stroke="#D5643C" stroke-width="4"/><line x1="520" y1="140" x2="580" y2="480" stroke="#D5643C" stroke-width="4"/><g fill="#fff"><circle cx="270" cy="140" r="7"/><circle cx="520" cy="140" r="7"/><circle cx="330" cy="480" r="7"/><circle cx="580" cy="480" r="7"/></g><g fill="#fff" font-size="32"><text x="235" y="125">A1</text><text x="535" y="125">C</text><text x="300" y="525">B1</text><text x="590" y="525">D</text></g></svg>`;
 
+const VAL_TOWN_END = Date.UTC(2027, 0, 11); // после этого Val Town выключен и подсказка про него не нужна
+
 const STATE_HINT: Record<string, string> = {
   starting: "Запускается. Подожди 5 минут и обнови страницу.",
   sleepMode: "Телефон офлайн. Открой WhatsApp Business и подожди 5 минут.",
@@ -24,7 +26,8 @@ const STATE_HINT: Record<string, string> = {
   yellowCard: "WhatsApp временно ограничил отправку с номера бота. Подожди сутки.",
 };
 
-export async function status(c: Cfg, green: Green, origin: string, log: string[], test: SelfTest): Promise<string> {
+// log === null: страницу открыли по общей ссылке, журнал событий не показываем
+export async function status(c: Cfg, green: Green, origin: string, log: string[] | null, test: SelfTest): Promise<string> {
   const hide = hider(c);
   const rows: string[] = [];
   const cpu = test.state === "ok"
@@ -42,8 +45,11 @@ export async function status(c: Cfg, green: Green, origin: string, log: string[]
 ${test.state === "running" ? '<meta http-equiv="refresh" content="4">' : ""}<title>Solver</title><body style="font:18px/1.5 -apple-system,sans-serif;margin:16px">
 <h2>Solver: проверка</h2>${rows.map((r) => `<p>${esc(hide(r))}</p>`).join("")}
 <p>Бот думает столько, сколько нужно: потолка в 60 секунд больше нет.</p>
-<p><a href="?">Проверить ещё раз</a></p>
-${log.length ? `<h3>Последние события</h3>${[...log].reverse().map((l) => `<p style="font-size:15px;margin:4px 0">${esc(hide(l))}</p>`).join("")}` : ""}</body>`;
+<p><a href="">Проверить ещё раз</a></p>
+${Date.now() < VAL_TOWN_END ? '<p style="font-size:15px;color:#666">Старую страницу бота на Val Town больше не открывай: она вернёт сообщения на старого бота. Лучше удали там val.</p>' : ""}
+${log === null
+    ? '<p style="font-size:15px;color:#666">Журнал событий: напиши боту ping, в ответе придёт личная ссылка.</p>'
+    : `<h3>Последние события</h3>${log.length ? [...log].reverse().map((l) => `<p style="font-size:15px;margin:4px 0">${esc(hide(l))}</p>`).join("") : "<p>Пока пусто.</p>"}`}</body>`;
 }
 
 async function greenState(green: Green): Promise<string> {

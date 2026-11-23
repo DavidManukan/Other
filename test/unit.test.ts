@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import Anthropic from "@anthropic-ai/sdk";
 import { Busy, Fatal, Splitter, claudeProblem } from "../src/claude.ts";
-import { config, hider, hookKey, lower } from "../src/config.ts";
+import { config, hider, hookKey, lower, publicOrigin } from "../src/config.ts";
+import { Green, GreenError, permanent } from "../src/green.ts";
 import { fixSvg } from "../src/svg.ts";
 import { prettyMath, splitAnswer } from "../src/text.ts";
 import { base64, imageType, sameSecret } from "../src/util.ts";
@@ -159,4 +160,55 @@ test("формат фото определяется по содержимому
   assert.equal(imageType(new TextEncoder().encode("это не картинка")), null);
   const big = new Uint8Array(100_000).map((_, i) => i % 251);
   assert.deepEqual(new Uint8Array(Buffer.from(base64(big), "base64")), big);
+});
+
+test("адрес для вебхука и рисунков всегда https, кроме локального запуска", () => {
+  assert.equal(publicOrigin(new URL("http://solver.example.workers.dev/?k=1")), "https://solver.example.workers.dev");
+  assert.equal(publicOrigin(new URL("https://solver.example.workers.dev/")), "https://solver.example.workers.dev");
+  assert.equal(publicOrigin(new URL("http://127.0.0.1:8787/")), "http://127.0.0.1:8787");
+});
+
+test("хозяева из OWNER: номера и id чатов через запятую", () => {
+  assert.deepEqual(config({ OWNER: " 79990001122, 12345@lid " } as any).owners, ["79990001122", "12345@lid"]);
+  assert.deepEqual(config({} as any).owners, []);
+});
+
+test("шлюз: повтор только когда запрос точно не принят; после таймаута и отказа по существу повтора нет", async () => {
+  const c = config({ ANTHROPIC_API_KEY: "k", GREEN_URL: "https://7103.api.greenapi.com", GREEN_ID: "7103", GREEN_TOKEN: "secret-token-123" } as any);
+  const real = globalThis.fetch;
+  const run = async (answers: Array<() => Response | Promise<Response>>) => {
+    let n = 0;
+    globalThis.fetch = (async () => answers[Math.min(n++, answers.length - 1)]()) as typeof fetch;
+    try {
+      const r = await new Green(c).send("1@c.us", "привет").then((v) => ({ ok: v }), (e) => ({ err: e }));
+      return { ...r, calls: n } as { ok?: any; err?: any; calls: number };
+    } finally {
+      globalThis.fetch = real;
+    }
+  };
+  const timeout = () => Promise.reject(Object.assign(new Error("timed out"), { name: "TimeoutError" }));
+  const offline = () => Promise.reject(new TypeError("fetch failed: https://7103.api.greenapi.com/waInstance7103/sendMessage/secret-token-123"));
+  const ok200 = () => new Response(JSON.stringify({ idMessage: "X" }));
+
+  let r = await run([timeout, ok200]);
+  assert.equal(r.calls, 1); // сообщение могло дойти: повтор задвоил бы его
+  assert.ok(r.err instanceof GreenError && r.err.timeout && !permanent(r.err));
+
+  r = await run([() => new Response("quota", { status: 466 }), ok200]);
+  assert.equal(r.calls, 1);
+  assert.ok(permanent(r.err));
+
+  r = await run([() => new Response("boom", { status: 503 }), ok200]);
+  assert.equal(r.calls, 2);
+  assert.deepEqual(r.ok, { idMessage: "X" });
+
+  r = await run([offline, ok200]);
+  assert.equal(r.calls, 2);
+
+  r = await run([offline, offline]);
+  assert.ok(!String(r.err.message).includes("secret-token-123")); // токен не утекает в текст ошибки
+  assert.ok(!permanent(r.err));
+
+  r = await run([() => new Response("slow down", { status: 429 }), ok200]);
+  assert.equal(r.calls, 2);
 });

@@ -101,14 +101,17 @@ export function claudeProblem(c: Cfg, e: unknown): Error {
 
 const CREDIT = /credit balance/i;
 const SPEND = /specified (workspace )?API usage limits/i;
-// Ошибка 400, которая точно не про необязательные параметры: перебирать их незачем
-const notAboutParams = (e: InstanceType<typeof Anthropic.BadRequestError>) => {
-  const msg = String(e.apiMessage ?? e.message ?? "");
-  return CREDIT.test(msg) || SPEND.test(msg);
-};
-
 export function client(c: Cfg): Anthropic {
   return new Anthropic({ apiKey: c.claudeKey, baseURL: c.claudeBase, maxRetries: 2 });
+}
+
+// Какой необязательный параметр не понравился модели. Если ошибка 400 не называет ни одного из них,
+// дело не в параметрах: ничего не отключаем и показываем ошибку как есть.
+function blamed(e: unknown, fast: boolean, off: Set<Feature>): Feature | undefined {
+  if (!(e instanceof Anthropic.BadRequestError)) return undefined;
+  const msg = String(e.apiMessage ?? e.message ?? "");
+  const f: Feature | undefined = /speed|fast/i.test(msg) ? "speed" : /fallback|anthropic-beta/i.test(msg) ? "fallbacks" : /output_config|effort/i.test(msg) ? "effort" : undefined;
+  return f && !off.has(f) && (f !== "speed" || fast) ? f : undefined;
 }
 
 export async function ask(c: Cfg, o: AskOptions): Promise<Answer> {
@@ -123,8 +126,7 @@ export async function ask(c: Cfg, o: AskOptions): Promise<Answer> {
       return await attempt(c, o);
     } catch (e) {
       const off = disabled.get(c.model) ?? new Set<Feature>();
-      // Возможно, модель не знает один из необязательных параметров: убираем по одному и пробуем снова
-      const next = e instanceof Anthropic.BadRequestError && !notAboutParams(e) ? ORDER.find((f) => !off.has(f) && (f !== "speed" || o.fast)) : undefined;
+      const next = blamed(e, o.fast, off);
       if (!next) {
         restore();
         throw claudeProblem(c, e);
@@ -164,7 +166,7 @@ async function attempt(c: Cfg, o: AskOptions): Promise<Answer> {
 
   const split = new Splitter();
   let wrote = false; // модель написала хоть что-то, кроме пробелов
-  let opened = false; // поток открылся: запрос принят, дальше возможны только сбои связи и перегрузка
+  let opened = false; // поток открылся: модель приняла запрос и начала работать
   try {
     const stream = client(c).beta.messages.stream(params, { signal: ctrl.signal });
     for await (const ev of stream) {
@@ -196,9 +198,11 @@ async function attempt(c: Cfg, o: AskOptions): Promise<Answer> {
       console.log("ответ оборван:", e instanceof Error ? e.message : String(e));
       return { rest: split.rest(), cut: true, refused: false, empty: false, tokens: { in: 0, out: 0 }, model: c.model };
     }
-    if (ctrl.signal.aborted) throw new Timeout("время вышло");
-    // Модель ещё думала, а связь оборвалась или пришла ошибка в потоке: это не приговор, повторяем позже
-    if (opened && !(e instanceof Anthropic.APIError && typeof e.status === "number")) throw new Busy("связь с Claude оборвалась");
+    // Срок вышел. Если модель всё это время думала, следующую попытку делаем на ступень проще.
+    // Если поток так и не открылся (очередь у Claude, зависшее соединение), модель ни при чём: просто повтор.
+    if (ctrl.signal.aborted) throw opened ? new Timeout("время вышло") : new Busy("Claude не ответил");
+    // Связь оборвалась или ошибка пришла прямо в потоке, пока модель думала: это не приговор, повторяем позже
+    if (!(e instanceof Anthropic.APIError && typeof e.status === "number")) throw new Busy("связь с Claude оборвалась");
     throw e;
   } finally {
     clearTimeout(timer);

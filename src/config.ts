@@ -13,6 +13,7 @@ export interface Env {
   FAST?: string;
   AUTO_MAX?: string;
   REGION?: string;
+  OWNER?: string; // необязательно: чаты хозяина через запятую (номер или id чата), только они меняют режим
   ANTHROPIC_BASE_URL?: string; // только для локальных тестов
   TIME_SCALE?: string; // только для локальных тестов: во сколько раз ускорить таймеры
 }
@@ -35,6 +36,7 @@ export interface Cfg {
   fast: boolean;
   autoMax: number;
   region: string;
+  owners: string[];
   missing: string[];
 }
 
@@ -54,9 +56,13 @@ export function config(env: Env): Cfg {
     fast: v("FAST") === "1",
     autoMax: Number.isFinite(autoMax) && autoMax >= 0 ? Math.min(autoMax, 20) : 5,
     region: v("REGION", "eu").toLowerCase(),
+    owners: v("OWNER").split(/[,;\s]+/).filter(Boolean),
     missing: (["ANTHROPIC_API_KEY", "GREEN_URL", "GREEN_ID", "GREEN_TOKEN"] as const).filter((k) => !v(k)),
   };
 }
+
+// Адрес воркера для вебхука и ссылок на рисунки: всегда https (кроме локального запуска)
+export const publicOrigin = (url: URL): string => (/^(localhost|127\.0\.0\.1)$/.test(url.hostname) ? url.origin : `https://${url.host}`);
 
 // Ключи не должны попасть ни на страницу проверки, ни в чат, ни в логи
 export const hider = (c: Cfg) => (x: unknown): string =>

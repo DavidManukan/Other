@@ -4,7 +4,9 @@ import http from "node:http";
 export const calls = []; // всё, что бот отправил «в WhatsApp»
 export const claude = []; // тела запросов к «Claude»
 export const settings = { webhookUrl: "", incomingWebhook: "no" };
-export const flags = { uploadBroken: false }; // тест может «сломать» загрузку файлов
+export const flags = { uploadBroken: false, sendDown: "", send466: "" }; // тест может «сломать» шлюз: загрузку файлов или отправку в чат
+// Большое фото (2,5 МБ): проверяем, что оно без потерь переживает хранение по частям
+export const BIG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from(Uint8Array.from({ length: 2_500_000 }, (_, i) => (i * 31 + (i >> 8)) & 255))]);
 const counters = new Map();
 const hit = (k) => (counters.set(k, (counters.get(k) ?? 0) + 1), counters.get(k));
 
@@ -94,6 +96,7 @@ function anthropic(req, res, body) {
     const m = message("№1\nОтвет: 1\n@@@\n" + "долгое второе задание ".repeat(600), { gap: 40 });
     return sse(res, m.ev, { gap: 40 });
   }
+  if (scenario === "S_RESETCUT") return sse(res, message("№1\nОтвет: 1\n@@@\n№2\nначало длинного решения", { stop: "max_tokens", gap: 60 }).ev, { gap: 60 });
   if (scenario === "S_MANY") return sse(res, message(Array.from({ length: 45 }, (_, i) => `№${i + 1}\nОтвет: ${i}`).join("\n@@@\n"), { gap: 1 }).ev, { gap: 1 });
   if (scenario === "S_DROP" && n === 1) {
     // связь рвётся посреди ответа
@@ -118,7 +121,8 @@ function green(req, res, method, body) {
   if (method === "setSettings") return (Object.assign(settings, body), json({ saveSettings: true }));
   if (method === "downloadFile") return json({ downloadUrl: `http://127.0.0.1:${PORT}/photo.jpg` });
   if (method === "sendMessage") {
-    if (String(body.message).includes("S_GREENDOWN_NEVER")) return (res.writeHead(500), res.end("boom"));
+    if (flags.sendDown && body.chatId.startsWith(flags.sendDown)) return (res.writeHead(503), res.end("gateway is down"));
+    if (flags.send466 && body.chatId.startsWith(flags.send466)) return (res.writeHead(466), res.end(JSON.stringify({ invokeStatus: { method: "sendMessage", used: 3, total: 3, status: "QUOTE_ALLOWED_EXCEEDED" } })));
     calls.push({ method, at: Date.now(), chatId: body.chatId, text: body.message });
     return json({ idMessage: "OUT" + calls.length });
   }
@@ -168,6 +172,14 @@ export function start(port) {
       if (url.pathname === "/photo.jpg") {
         res.writeHead(200, { "content-type": "image/jpeg" });
         return res.end(JPEG);
+      }
+      if (url.pathname === "/big.jpg") {
+        res.writeHead(200, { "content-type": "image/jpeg", "content-length": BIG.length });
+        return res.end(BIG);
+      }
+      if (url.pathname === "/huge.jpg") {
+        res.writeHead(200, { "content-type": "image/jpeg", "content-length": 60_000_000 });
+        return res.end(Buffer.alloc(1024)); // размер объявлен огромным: бот не должен это качать
       }
       if (url.pathname === "/notphoto") {
         res.writeHead(200, { "content-type": "text/plain" });

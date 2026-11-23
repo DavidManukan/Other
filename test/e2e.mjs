@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { calls, claude, flags, settings, start } from "./mock.mjs";
+import { BIG, calls, claude, flags, settings, start } from "./mock.mjs";
 
 const MOCK = 8788, PORT = 8787, TOKEN = "testtoken-1234567890abcdef", KEY_CLAUDE = "sk-ant-test-1234567890";
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -91,6 +91,7 @@ try {
   await sleep(400);
   page = await (await fetch(BASE)).text();
   ok(page.includes("✅ Вебхук настроен") && !page.includes('http-equiv="refresh"'), "страница проверки: всё зелёное", page);
+  ok(page.includes("напиши боту ping") && !page.includes("Последние события"), "общая страница не показывает журнал");
   ok(!page.includes(TOKEN) && !page.includes(KEY_CLAUDE), "на странице нет ключей");
 
   // --- защита входа ---
@@ -125,6 +126,12 @@ try {
   // --- команды ---
   await text("111", "Пинг");
   ok(await until(() => texts("111").some((t) => t.startsWith("pong ✅ модель claude-opus-5-5, думает: high"))), "ping", JSON.stringify(texts("111").slice(-1)));
+  ok(texts("111").at(-1).includes(`Журнал: ${BASE}/?k=${KEY}`), "ping хозяину: личная ссылка на журнал", texts("111").at(-1));
+  await text("912", "макс");
+  ok(await until(() => texts("912").some((t) => t.startsWith("Режим меняет только хозяин бота"))), "чужой чат не может поднять режим", JSON.stringify(texts("912")));
+  await text("912", "fast вкл");
+  await text("912", "ping");
+  ok(await until(() => texts("912").some((t) => t.startsWith("pong"))) && texts("912").at(-1).includes("думает: high, fast выкл") && !texts("912").at(-1).includes("Журнал"), "чужой чат: режим прежний, ссылки на журнал нет", texts("912").at(-1));
   await text("111", "быстро");
   ok(await until(() => texts("111").some((t) => t.startsWith("Режим: low"))), "команда «быстро»");
   const b2 = claude.length;
@@ -222,7 +229,47 @@ try {
   // --- очень много заданий: укладываемся в лимит запросов Cloudflare ---
   await photo("904", "S_MANY");
   ok(await until(() => texts("904").some((t) => t.includes("№45")), 30_000), "45 заданий: дошли все");
-  ok(texts("904").length === 36 && texts("904")[35].includes("№36") && texts("904")[35].includes("№45"), "45 заданий: 35 сообщений и хвост одним", String(texts("904").length));
+  ok(texts("904").length === 45 && texts("904").every((t, i) => t.startsWith(`№${i + 1}\n`)), "45 заданий: 45 сообщений по порядку, в два захода", String(texts("904").length));
+  ok(claude.filter((b) => JSON.stringify(b.messages).includes("S_MANY")).length === 1, "45 заданий: Claude спрошен один раз");
+
+  // --- шлюз лежит: готовый ответ ждёт и доходит без повторного запроса к Claude ---
+  flags.sendDown = "910";
+  await photo("910", "S_GW");
+  ok(await until(() => claude.some((b) => JSON.stringify(b.messages).includes("S_GW"))), "шлюз лежит: Claude решил");
+  await sleep(5000);
+  ok(texts("910").length === 0, "шлюз лежит: пока ничего не доставлено");
+  flags.sendDown = "";
+  ok(await until(() => of("910").some((c) => c.method === "sendFileByUpload"), 30_000), "шлюз ожил: ответ и рисунок доставлены", JSON.stringify(texts("910")));
+  ok(texts("910").length === 2 && texts("910")[0].includes("Ответ: 4") && texts("910")[1].includes("Ответ: 5"), "шлюз ожил: каждое задание по одному разу", JSON.stringify(texts("910")));
+  ok(claude.filter((b) => JSON.stringify(b.messages).includes("S_GW")).length === 1, "шлюз лежал: Claude спрошен один раз, а не заново");
+
+  // --- шлюз отказал по существу (квота тарифа): не повторяем и не платим Claude за новые попытки ---
+  flags.send466 = "911";
+  await photo("911", "S_QUOTA");
+  ok(await until(async () => (await (await fetch(`${BASE}/?k=${KEY}`)).text()).includes("GREEN-API sendMessage: 466"), 20_000), "отказ шлюза виден в журнале");
+  await sleep(2500);
+  ok(claude.filter((b) => JSON.stringify(b.messages).includes("S_QUOTA")).length === 1, "отказ шлюза: Claude спрошен один раз");
+  flags.send466 = "";
+
+  // --- «сброс» посреди длинного ответа: бот не шлёт модели «дальше» без контекста ---
+  await photo("914", "S_RESETCUT");
+  ok(await until(() => texts("914").some((t) => t.includes("Ответ: 1"))), "сброс посреди ответа: первое задание пришло");
+  await text("914", "сброс");
+  ok(await until(() => texts("914").includes("Память чата очищена ✅")), "сброс посреди ответа: подтверждение");
+  await sleep(3000);
+  ok(claude.filter((b) => JSON.stringify(b.messages).includes("S_RESETCUT")).length === 1 && !claude.some((b) => b.messages.length === 1 && b.messages[0].content?.[0]?.text === "дальше"), "сброс посреди ответа: продолжения без контекста нет");
+
+  // --- большое фото (2,5 МБ) хранится по частям и уходит в Claude без потерь ---
+  const sha = (b) => createHash("sha256").update(b).digest("hex");
+  const sentPhoto = (chat) => {
+    const b = claude.filter((x) => JSON.stringify(x.messages).includes("S_BIG")).at(-1);
+    const img = b?.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).find((x) => x.type === "image");
+    return img ? sha(Buffer.from(img.source.data, "base64")) : null;
+  };
+  await photo("913", "S_BIG", undefined, `http://127.0.0.1:${MOCK}/big.jpg`);
+  ok(await until(() => texts("913").some((t) => t.includes("Ответ: 5")), 30_000) && sentPhoto("913") === sha(BIG), "большое фото дошло до Claude без потерь");
+  await photo("915", "", undefined, `http://127.0.0.1:${MOCK}/huge.jpg`);
+  ok(await until(() => texts("915").includes("⚠️ Фото слишком большое. Пришли обычное фото.")), "огромный файл: отказ без скачивания", JSON.stringify(texts("915")));
 
   // --- не картинка ---
   await photo("905", "", undefined, `http://127.0.0.1:${MOCK}/notphoto`);
@@ -254,11 +301,17 @@ try {
   ok(texts("908").filter((t) => t.includes("Ответ: 1")).length === 1, "перезапуск: уже отправленное не повторилось");
   const after = claude.filter((b) => JSON.stringify(b.messages).includes("S_CRASH")).at(-1);
   ok(after?.messages.at(-1).content[0].text === "дальше" && String(after.messages.at(-2).content).includes("Ответ: 1"), "перезапуск: модель получила уже отправленный текст и «дальше»");
+  const b13 = claude.length;
+  await text("913", "объясни первое S_BIG");
+  ok(await until(() => claude.length > b13) && sentPhoto("913") === sha(BIG), "после перезапуска большое фото читается из хранилища без потерь");
 
-  // --- журнал на странице проверки ---
+  // --- журнал: только по личной ссылке, без номеров телефонов ---
   await sleep(400);
   page = await (await fetch(BASE)).text();
-  ok(page.includes("Последние события") && page.includes("решено за") && !page.includes("@c.us") && !/\b(111|222|906)\b/.test(page.split("Последние события")[1] ?? ""), "журнал событий без номеров телефонов");
+  ok(!page.includes("решено за") && !page.includes("Последние события"), "общая страница по-прежнему без журнала");
+  page = await (await fetch(`${BASE}/?k=${KEY}`)).text();
+  ok(page.includes("Последние события") && page.includes("решено за") && !page.includes("@c.us") && !/\b(111|222|906)\b/.test(page.split("Последние события")[1] ?? ""), "журнал по личной ссылке, без номеров телефонов");
+  ok((await (await fetch(`${BASE}/?k=wrong`)).text()).includes("напиши боту ping"), "чужой ключ журнал не открывает");
 } catch (e) {
   console.log("❌ проверка упала:", e);
   failed++;
