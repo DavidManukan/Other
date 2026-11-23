@@ -1,7 +1,7 @@
 // Страница проверки: открой ссылку воркера в браузере. Заодно сама настраивает вебхук GREEN-API.
 import Anthropic from "@anthropic-ai/sdk";
 import { type Cfg, hider, hookKey } from "./config.ts";
-import { claudeProblem, client } from "./claude.ts";
+import { claudeProblem, client, unavailable } from "./claude.ts";
 import type { Green } from "./green.ts";
 import { esc } from "./util.ts";
 
@@ -83,6 +83,7 @@ async function webhook(c: Cfg, green: Green, origin: string, test: SelfTest): Pr
       editedMessageWebhook: "no",
       deletedMessageWebhook: "no",
       pollMessageWebhook: "no",
+      delaySendMessagesMilliseconds: 1000, // рисунки идут следом за текстом без долгих пауз
     });
     return "⏳ Вебхук только что переключён на этот адрес. Подожди 5 минут и обнови страницу.";
   } catch (e: any) {
@@ -91,11 +92,19 @@ async function webhook(c: Cfg, green: Green, origin: string, test: SelfTest): Pr
 }
 
 async function claudeCheck(c: Cfg): Promise<string> {
+  const look = (model: string) => client(c).models.retrieve(model, {}, { timeout: 10_000, maxRetries: 0 });
   try {
-    await client(c).models.retrieve(c.model, {}, { timeout: 10_000, maxRetries: 0 });
+    await look(c.model);
     return `✅ Ключ Claude принят, модель ${c.model}. Баланс смотри на platform.claude.com`;
   } catch (e) {
     if (e instanceof Anthropic.APIConnectionError) return "❌ Claude не отвечает";
+    // основной модели на этом ключе нет: бот сам работает на запасной
+    if (unavailable(e) && c.fallbackModel && c.fallbackModel !== c.model) {
+      try {
+        await look(c.fallbackModel);
+        return `⚠️ Модель ${c.model} на этом ключе недоступна. Бот работает на запасной: ${c.fallbackModel}`;
+      } catch { /* покажем ошибку основной модели */ }
+    }
     return `❌ ${claudeProblem(c, e).message}`;
   }
 }

@@ -24,14 +24,62 @@ export function prettyMath(text: string): string {
     .replace(/(?<=[A-Za-zА-Яа-я)\]])_([0-9]+|[aeoxnmkt](?![a-zA-Z]))/g, fix(/./, SUB));
 }
 
-// Текст ответа модели -> чистый текст для WhatsApp + рисунки отдельно
+// Текст ответа модели -> чистый текст для WhatsApp + рисунки отдельно.
+// Код программ (между строками ```) не трогаем: в нём ^, _ и цифры после букв значат своё.
 export function splitAnswer(raw: string): { text: string; svgs: string[] } {
   const svgs = raw.match(/<svg[\s\S]*?<\/svg>/gi) ?? [];
-  const text = prettyMath(raw)
+  const noDrawings = raw
     .replace(/```[a-z]*\s*(<svg[\s\S]*?<\/svg>)\s*```/gi, "$1")
     .replace(/<svg[\s\S]*?<\/svg>/gi, "")
-    .replace(/(```[a-z]*\s*)?<svg[\s\S]*$/i, "") // недописанный рисунок
+    .replace(/(```[a-z]*\s*)?<svg[\s\S]*$/i, ""); // недописанный рисунок
+  const text = noDrawings
+    .split(/(```[\s\S]*?```)/)
+    .map((piece, i) => (i % 2 ? piece : prettyMath(piece).replace(/\*\*([^*\n]+)\*\*/g, "$1").replace(/^#{1,6}\s+/gm, "")))
+    .join("")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return { text, svgs };
+}
+
+export const RULE = "——————————"; // черта между заданиями: длинное тире есть в любом шрифте
+
+// Короткий список ответов для начала сообщения: на маленьком экране видно прежде всего начало
+function card(parts: string[]): string {
+  const lines = parts.map((p) => {
+    const head = (p.split("\n", 1)[0] ?? "").trim().slice(0, 40);
+    const answers = [...p.matchAll(/^Ответ:[ \t]*(.+)$/gm)];
+    const answer = answers.length ? answers[answers.length - 1][1].trim() : "см. решение";
+    return `${head}: ${answer.length > 140 ? answer.slice(0, 139) + "…" : answer}`;
+  });
+  return `✅ Ответы\n${lines.join("\n")}`;
+}
+
+// Собирает ответ в одно сообщение: сверху список ответов, ниже решения по порядку.
+// Если всё не помещается в max знаков, делит на несколько сообщений по границам заданий.
+export function compose(parts: string[], max: number): string[] {
+  if (!parts.length) return [];
+  const blocks = parts.length > 1 ? [card(parts), ...parts] : [...parts];
+  const whole = blocks.join(`\n${RULE}\n`);
+  if (whole.length <= max) return [whole];
+  const out: string[] = [];
+  let cur = "";
+  const push = (block: string) => {
+    const next = cur ? `${cur}\n${RULE}\n${block}` : block;
+    if (next.length <= max) return void (cur = next);
+    if (cur) out.push(cur);
+    cur = "";
+    // одно задание длиннее сообщения: режем по строкам
+    let piece = "";
+    for (const line of block.split("\n")) {
+      if (piece && piece.length + line.length + 1 > max) {
+        out.push(piece);
+        piece = "";
+      }
+      piece = piece ? `${piece}\n${line}` : line.slice(0, max);
+    }
+    cur = piece;
+  };
+  for (const b of blocks) push(b);
+  if (cur) out.push(cur);
+  return out.length > 1 ? out.map((m, i) => `(${i + 1}/${out.length})\n${m}`) : out;
 }

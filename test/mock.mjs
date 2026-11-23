@@ -4,7 +4,7 @@ import http from "node:http";
 export const calls = []; // всё, что бот отправил «в WhatsApp»
 export const claude = []; // тела запросов к «Claude»
 export const settings = { webhookUrl: "", incomingWebhook: "no" };
-export const flags = { uploadBroken: false, sendDown: "", send466: "" }; // тест может «сломать» шлюз: загрузку файлов или отправку в чат
+export const flags = { uploadBroken: false, sendDown: "", send466: "", noFable: false }; // тест может «сломать» шлюз: загрузку файлов или отправку в чат
 // Большое фото (2,5 МБ): проверяем, что оно без потерь переживает хранение по частям
 export const BIG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from(Uint8Array.from({ length: 2_500_000 }, (_, i) => (i * 31 + (i >> 8)) & 255))]);
 const counters = new Map();
@@ -32,29 +32,42 @@ function sse(res, events, { gap = 5 } = {}) {
   next();
 }
 
-function message(text, { stop = "end_turn", think = 50, model = "claude-opus-5-5", gap = 5 } = {}) {
+function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks = [], container } = {}) {
   const ev = [
-    { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1200, output_tokens: 1 } } },
+    { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", model: model ?? "claude-fable-5-2", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1200, output_tokens: 1 } } },
     { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
     think,
     { type: "content_block_stop", index: 0 },
   ];
-  if (text) {
-    ev.push({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } });
-    for (let i = 0; i < text.length; i += 17) ev.push({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: text.slice(i, i + 17) } });
-    ev.push({ type: "content_block_stop", index: 1 });
+  let index = 1;
+  for (const block of blocks) {
+    ev.push({ type: "content_block_start", index, content_block: block }, { type: "content_block_stop", index });
+    index++;
   }
-  ev.push({ type: "message_delta", delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 345 } });
+  if (text) {
+    ev.push({ type: "content_block_start", index, content_block: { type: "text", text: "" } });
+    for (let i = 0; i < text.length; i += 17) ev.push({ type: "content_block_delta", index, delta: { type: "text_delta", text: text.slice(i, i + 17) } });
+    ev.push({ type: "content_block_stop", index });
+  }
+  ev.push({ type: "message_delta", delta: { stop_reason: stop, stop_sequence: null, ...(container ? { container: { id: container, expires_at: "2027-01-01T00:00:00Z" } } : {}) }, usage: { output_tokens: 345 } });
   ev.push({ type: "message_stop" });
   return { ev, gap };
 }
 
+export const CONT = "Продолжай с того места, где остановился. Уже написанное не повторяй.";
+export const NUDGE = "Теперь напиши готовый ответ целиком, по формату.";
+// пересчёт кодом в песочнице: так его видит клиент
+const CHECK = [
+  { type: "server_tool_use", id: "srvtoolu_1", name: "bash_code_execution", input: { command: "python check.py" } },
+  { type: "bash_code_execution_tool_result", tool_use_id: "srvtoolu_1", content: { type: "bash_code_execution_result", stdout: "ok", stderr: "", return_code: 0, content: [] } },
+];
+const ANSWER = `№1\nДано: v_0 = 5 м/с, H2SO4\nx^2 + 2x = 8\nОтвет: 4 см2\n@@@\n№2\nРешение второго.\nОтвет: 5\n@@@\n${SVG}`;
+
 function lastUserText(body) {
   const users = body.messages.filter((m) => m.role === "user");
   const last = users[users.length - 1];
-  const all = body.messages.flatMap((m) => (typeof m.content === "string" ? [m.content] : m.content.filter((b) => b.type === "text").map((b) => b.text))).join("\n");
-  const text = typeof last.content === "string" ? last.content : last.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  return { text, all };
+  const texts = (m) => (typeof m.content === "string" ? [m.content] : m.content.filter((b) => b.type === "text").map((b) => b.text));
+  return { text: texts(last).join("\n"), all: body.messages.flatMap(texts).join("\n") };
 }
 
 function anthropic(req, res, body) {
@@ -62,18 +75,19 @@ function anthropic(req, res, body) {
   const { text, all } = lastUserText(body);
   const scenario = (all.match(/S_[A-Z0-9]+/g) ?? []).pop() ?? "";
   const n = hit(scenario || "default");
+  const send = (t, o) => {
+    const m = message(t, { model: body.model, ...o });
+    return sse(res, m.ev, { gap: m.gap });
+  };
   const err = (status, type, message, headers = {}) => {
     res.writeHead(status, { "content-type": "application/json", ...headers });
     res.end(JSON.stringify({ type: "error", error: { type, message } }));
   };
+  if (flags.noFable && body.model === "claude-fable-5-2") return err(404, "not_found_error", "model: claude-fable-5-2");
   if (scenario === "S_BUSY" && n <= 3) return err(529, "overloaded_error", "Overloaded", { "x-should-retry": "false" });
   if (scenario === "S_400" && body.fallbacks) return err(400, "invalid_request_error", "fallbacks: Extra inputs are not permitted");
   if (scenario === "S_BADIMG") return err(400, "invalid_request_error", "messages.0.content.0.image: Could not process image");
   if (scenario === "S_NOKEY") return err(401, "authentication_error", "invalid x-api-key");
-  if (scenario === "S_SLOW" && body.output_config?.effort === "high") {
-    const m = message("", { think: 600_000 });
-    return sse(res, m.ev);
-  }
   if (scenario === "S_SPEND") return err(400, "invalid_request_error", "You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.");
   if ((scenario === "S_SSEERR" || scenario === "S_EARLYDROP") && n === 1) {
     // модель ещё думает, а поток обрывается: ошибкой перегрузки или просто разрывом связи
@@ -83,21 +97,25 @@ function anthropic(req, res, body) {
     res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}\n\n`);
     return res.end();
   }
-  if (scenario === "S_REFMID") return sse(res, message("№1\nОтвет: 5\n@@@\n№2\nначало", { stop: "refusal" }).ev);
-  if (scenario === "S_REFUSE") return sse(res, message("", { stop: "refusal" }).ev);
-  if (scenario === "S_CUT" && text !== "дальше") return sse(res, message("№1\nx^2 = 16\nОтвет: 4\n@@@\n№2\nначало решения, которое не помести", { stop: "max_tokens" }).ev);
-  if (scenario === "S_CUT") return sse(res, message("лось в первый кусок.\nОтвет: 7 см2").ev);
-  if (scenario === "S_HELLO") return sse(res, message("№1\nОтвет: 42", { think: 2500 }).ev);
-  if (scenario === "S_STOP") {
-    const m = message("№1\nОтвет: 1\n@@@\n" + "очень длинное решение ".repeat(400), { gap: 40 });
-    return sse(res, m.ev, { gap: 40 });
+  if (scenario === "S_SLOW" && body.output_config?.effort === "high") return send("", { think: 600_000 });
+  if (scenario === "S_REFUSE") return send("", { stop: "refusal" });
+  if (scenario === "S_REFMID") return send("№1\nОтвет: 5\n@@@\n№2\nначало", { stop: "refusal" });
+  if (scenario === "S_CUT" && text !== CONT) return send("№1\nx^2 = 16\nОтвет: 4\n@@@\n№2\nначало решения, которое не помести", { stop: "max_tokens" });
+  if (scenario === "S_CUT") return send("лось в первый кусок.\nОтвет: 7 см2");
+  if (scenario === "S_WAIT") return send("№1\nОтвет: 42", { think: 2500 });
+  if (scenario === "S_HELLO") return send("№1\nОтвет: 42", { think: 4500 });
+  if (scenario === "S_LONG" || (scenario === "S_CRASH" && n === 1)) return send("№1\nОтвет: 1\n@@@\n" + "очень длинное решение ".repeat(400), { gap: 40 });
+  if (scenario === "S_CRASH") return send("№1\nОтвет: 9");
+  if (scenario === "S_MANY") return send(Array.from({ length: 45 }, (_, i) => `№${i + 1}\nОтвет: ${i}`).join("\n@@@\n"), { gap: 1 });
+  if (scenario === "S_HUGE") return send(Array.from({ length: 30 }, (_, i) => `№${i + 1}\n${"строка решения с выкладками\n".repeat(22)}Ответ: ${i}`).join("\n@@@\n"), { gap: 1 });
+  if (scenario === "S_PAUSE") {
+    // пересчёт затянулся: ход приходит с pause_turn, его нужно продолжить тем же сообщением и в том же контейнере
+    const resumed = body.messages.at(-1).role === "assistant";
+    if (!resumed) return send("", { stop: "pause_turn", blocks: CHECK, container: "cont_1" });
+    return send("№1\nОтвет: 77");
   }
-  if (scenario === "S_CRASH" && text !== "дальше") {
-    const m = message("№1\nОтвет: 1\n@@@\n" + "долгое второе задание ".repeat(600), { gap: 40 });
-    return sse(res, m.ev, { gap: 40 });
-  }
-  if (scenario === "S_RESETCUT") return sse(res, message("№1\nОтвет: 1\n@@@\n№2\nначало длинного решения", { stop: "max_tokens", gap: 60 }).ev, { gap: 60 });
-  if (scenario === "S_MANY") return sse(res, message(Array.from({ length: 45 }, (_, i) => `№${i + 1}\nОтвет: ${i}`).join("\n@@@\n"), { gap: 1 }).ev, { gap: 1 });
+  if (scenario === "S_NUDGE") return text === NUDGE ? send("№1\nОтвет: 55") : send("", { blocks: CHECK, container: "cont_2" });
+  if (scenario === "S_CODE") return send("№1\nвывести a * b и my_var\n```\nfor i in range(3):\n    x_1 = a ** 2\n```\nОтвет: 9", { blocks: CHECK });
   if (scenario === "S_DROP" && n === 1) {
     // связь рвётся посреди ответа
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -105,10 +123,9 @@ function anthropic(req, res, body) {
     for (const ev of m) if (typeof ev !== "number") res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
     return setTimeout(() => res.destroy(), 200);
   }
-  if (scenario === "S_DROP") return sse(res, message("№2\nОтвет: 20").ev);
-  if (text === "дальше") return sse(res, message("Продолжение.\nОтвет: 9").ev);
+  if (scenario === "S_DROP") return send(" решена\nОтвет: 20");
   // обычный ответ: два задания и рисунок в конце
-  return sse(res, message(`№1\nДано: v_0 = 5 м/с, H2SO4\nx^2 + 2x = 8\nОтвет: 4 см2\n@@@\n№2\nРешение второго.\nОтвет: 5\n@@@\n${SVG}`).ev);
+  return send(ANSWER);
 }
 
 function green(req, res, method, body) {
@@ -173,6 +190,10 @@ export function start(port) {
         res.writeHead(200, { "content-type": "image/jpeg" });
         return res.end(JPEG);
       }
+      if (url.pathname === "/photo2.jpg") {
+        res.writeHead(200, { "content-type": "image/jpeg" });
+        return res.end(Buffer.concat([JPEG, Buffer.from([1, 2, 3])]));
+      }
       if (url.pathname === "/big.jpg") {
         res.writeHead(200, { "content-type": "image/jpeg", "content-length": BIG.length });
         return res.end(BIG);
@@ -189,6 +210,10 @@ export function start(port) {
       const g = url.pathname.match(/^\/green\/waInstance(\d+)\/(\w+)\/(.+)$/);
       if (g) return green(req, res, g[2], body);
       if (url.pathname === "/anthropic/v1/messages" && req.method === "POST") return anthropic(req, res, body);
+      if (url.pathname.startsWith("/anthropic/v1/models/") && flags.noFable && url.pathname.endsWith("claude-fable-5-2")) {
+        res.writeHead(404, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ type: "error", error: { type: "not_found_error", message: "model: claude-fable-5-2" } }));
+      }
       if (url.pathname.startsWith("/anthropic/v1/models/")) {
         res.writeHead(200, { "content-type": "application/json" });
         return res.end(JSON.stringify({ id: url.pathname.split("/").pop(), type: "model", display_name: "Test" }));

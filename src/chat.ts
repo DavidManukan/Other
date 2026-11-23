@@ -1,36 +1,44 @@
 // Один объект на чат: очередь заданий, память разговора и рисунки.
 // Вебхук только кладёт задание в очередь и сразу отвечает шлюзу. Решает будильник объекта:
 // у него до 15 минут на кусок работы, а длинный ответ продолжается следующим будильником.
+//
+// Одно задание = одна работа: одно или несколько фото. Решение начинается сразу после первого фото.
+// Фото, пришедшее, пока ответ ещё не отправлен, добавляется к тому же заданию: решение начинается
+// заново со всеми фото, и ответ приходит одним сообщением по порядку.
 import { DurableObject } from "cloudflare:workers";
 import type Anthropic from "@anthropic-ai/sdk";
 import { type Cfg, type Effort, type Env, chatStub, config, hider, hookKey, isEffort, lower } from "./config.ts";
-import { ask, Busy, Fatal, Stopped, Timeout } from "./claude.ts";
+import { type Answer, ask, Busy, Fatal, Stopped, tasks, Timeout } from "./claude.ts";
 import { Green, permanent, TooBig } from "./green.ts";
 import { renderPng } from "./render.ts";
 import { type SelfTest, SAMPLE_SVG, status } from "./status.ts";
-import { splitAnswer } from "./text.ts";
-import { base64, clock, imageType } from "./util.ts";
+import { compose, splitAnswer } from "./text.ts";
+import { base64, clock, fingerprint, imageSize, imageType } from "./util.ts";
 
 const SEGMENT = 13 * 60_000; // столько работает один кусок (потолок будильника 15 минут)
 const SEGMENT_TAIL = 45_000; // запас в конце куска на отправку и сохранение
 const BEAT = 60_000; // пульс: пока кусок работает, раз в минуту отодвигаем сторожевой будильник
 const WATCHDOG = 150_000; // пульс пропал (площадка перезапустила объект): через столько будильник поднимет задание снова
-const HELLO = 120_000; // столько молчим, прежде чем написать «решаю»
+const HELLO = 180_000; // столько молчим после «принял», прежде чем написать, что работа идёт
 const BACKOFF = [15_000, 45_000, 120_000]; // паузы перед повтором, когда Claude занят
 const GATEWAY_WAIT = [20_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000]; // ждём шлюз около часа, Claude при этом не трогаем
+const ADD_MIN = 8_000; // после добавленного фото ждём следующее: не меньше этого...
+const ADD_MAX = 40_000; // ...и не больше этого (пауза подстраивается под темп, с которым идут фото)
+const NOTE_WAIT = 3_000; // после текстового уточнения к фото
 const HISTORY_TTL = 2 * 3600_000; // через 2 часа без сообщений чат начинается заново
 const HISTORY_MAX = 12; // последние 6 вопросов и ответов
 const TURN_MAX = 50_000; // длиннее в памяти не храним
 const MAX_TRIES = 4; // попыток на один кусок
-const MAX_DRAWINGS = 8;
-const MAX_SENDS = 35; // сообщений за один запуск (у бесплатного тарифа Cloudflare 50 внешних запросов на запуск)
+const MAX_DRAWINGS = 12;
 const MAX_QUEUE = 10; // заданий в очереди одного чата
+const MAX_SHOTS = 10; // фото в одном задании
+const MAX_PHOTOS = 10; // столько последних фото бот помнит для уточняющих вопросов
+const MSG_MAX = 12_000; // ответ идёт одним сообщением; длиннее этого делим по границам заданий
 const PHOTO_CHUNK = 1_000_000; // значение в хранилище ограничено по размеру, фото режем на части
 const PHOTO_MAX = 5_000_000; // больше не берём: такое фото не нужно и бьёт по памяти
-const MAX_PHOTOS = 3; // столько последних фото бот помнит и столько решает одним запросом, если они пришли подряд
 const IMG_TTL = 86_400_000; // рисунки храним сутки
 const LOG_MAX = 12;
-const CUT_NOTE = "(ответ слишком длинный: пришли фото по частям)";
+const CUT_NOTE = "(ответ получился слишком длинным и оборван: пришли оставшиеся задания отдельным фото)";
 export const STATUS = "__status"; // имя служебного объекта: журнал, страница проверки, хозяин бота
 
 const NUDGE = new Set(["videoMessage", "audioMessage", "documentMessage", "stickerMessage", "locationMessage", "contactMessage"]);
@@ -54,43 +62,53 @@ interface PhotoMeta {
   type: "image/jpeg" | "image/png" | "image/gif" | "image/webp";
   n: number;
 }
-// Чем закончился запрос к Claude в этом куске (нужно, если ответ готов, а доставить его сразу не вышло)
+interface Shot {
+  id: string;
+  url?: string;
+  caption?: string;
+  at: number;
+  size?: string; // «1600×1200», для журнала: по нему видно, в каком качестве приходят фото
+  hash?: string; // отпечаток содержимого: одно и то же фото, отправленное дважды, считаем один раз
+}
+// Чем закончился запрос к Claude (нужно, если ответ готов, а доставить его сразу не вышло)
 interface Outcome {
   cut: boolean;
   refused: boolean;
   empty: boolean;
-  drew: boolean; // в этом куске появились новые рисунки
 }
 interface Job {
   id: string;
   at: number;
   kind: "image" | "text";
-  url?: string;
-  caption?: string;
   text?: string;
+  shots: Shot[]; // фото этой работы по порядку
+  notes: string[]; // сообщения, которые пришли к этим фото, пока шло решение
   phase: "solve" | "draw";
   step: number; // сколько раз ответ уже продолжали
   tries: number; // попытки текущего куска
   effort: Effort;
-  more?: { id: string; url?: string; caption?: string }[]; // фото, которые пришли следом и решаются вместе с этим
-  cont: boolean; // следующий кусок продолжает ответ («дальше»)
-  sent: string[]; // что уже ушло в чат в текущем куске
-  outbox: string[]; // готовые ответы, которые ещё не ушли: шлюз не принял или кончился запас запросов на запуск
-  done?: Outcome; // Claude на этот кусок уже ответил, осталось доставить outbox
+  acc: string; // начало ответа из прошлых кусков (если ответ обрезало и он продолжается)
+  body?: string; // готовый ответ целиком: уйдёт в память чата после доставки
+  sent: string[]; // сообщения с ответом, которые уже ушли в чат
+  outbox: string[]; // сообщения с ответом, которые ещё не ушли
+  done?: Outcome; // Claude уже ответил, осталось доставить outbox
   down: number; // сколько раз подряд шлюз не принял сообщение
-  svgs: string[]; // рисунки ждут своей очереди: сначала все ответы, потом картинки
+  svgs: string[]; // рисунки: уходят после текста
   drawn: number; // сколько рисунков уже отправлено
   drawing?: { i: number; tries: number }; // какой рисунок сейчас в работе и какая это попытка
-  after?: number; // не раньше этого времени (пауза перед повтором)
-  hello?: boolean; // «⏳ решаю» уже отправляли
+  after?: number; // не раньше этого времени (пауза перед повтором или ожидание следующего фото)
+  hello?: boolean; // «ещё решаю» уже отправляли
   started?: number;
   msgs: number;
   tokens: number;
+  checks: number; // сколько раз модель пересчитывала вычисления кодом
+  model?: string;
 }
 
 const photoKeys = (p: PhotoMeta) => Array.from({ length: p.n }, (_, i) => `photo:${p.id}:${i}`);
 
 class Delivery extends Error {} // ответ готов, но шлюз его сейчас не принимает: Claude не переспрашиваем, ждём шлюз
+class Added extends Error {} // к заданию добавили фото или уточнение: решение начинается заново со всем сразу
 
 export class Chat extends DurableObject<Env> {
   private c: Cfg;
@@ -98,6 +116,7 @@ export class Chat extends DurableObject<Env> {
   private hide: (x: unknown) => string;
   private running = false;
   private stop: AbortController | null = null;
+  private cur: { key: string; job: Job } | null = null; // задание, над которым сейчас работает будильник
   private photos = new Map<string, { type: PhotoMeta["type"]; data: string }>(); // фото, уже прочитанные из хранилища
   private page = new Map<boolean, { at: number; html: string }>();
   private epoch = 0; // растёт на «сброс»: решение, начатое до сброса, память уже не трогает
@@ -123,18 +142,18 @@ export class Chat extends DurableObject<Env> {
     if (!chatId) return;
     const seen = (await this.db.get<string[]>("seen")) ?? [];
     if (id && seen.includes(id)) return; // шлюз иногда присылает одно сообщение дважды
-    // Отметка «уже видели» пишется одной записью вместе с заданием: если объект упадёт на полпути,
-    // шлюз пришлёт сообщение снова и оно не потеряется.
     const meta: Meta = { chatId, origin };
     await this.isOwner(chatId).catch(() => false); // первый чат, который написал боту, становится хозяином
+    // Отметка «уже видели» пишется одной записью вместе с заданием: если объект упадёт на полпути,
+    // шлюз пришлёт сообщение снова и оно не потеряется.
     const mark: Record<string, unknown> = { seen: id ? [...seen, id].slice(-200) : seen, meta };
     const md = h.messageData ?? {};
     const type = String(md.typeMessage ?? "");
     const fd = md.fileMessageData ?? {};
     try {
       if (type === "imageMessage" || (type === "documentMessage" && /^image\//.test(String(fd.mimeType ?? "")))) {
-        const caption = String(fd.caption ?? "").trim();
-        return await this.enqueue({ kind: "image", id, url: fd.downloadUrl ? String(fd.downloadUrl) : undefined, caption }, mark);
+        const shot: Shot = { id, url: fd.downloadUrl ? String(fd.downloadUrl) : undefined, caption: String(fd.caption ?? "").trim() || undefined, at: Date.now() };
+        return await this.photoIn(chatId, shot, mark);
       }
       if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
         const text = String(md.textMessageData?.textMessage ?? md.extendedTextMessageData?.text ?? "").trim();
@@ -143,7 +162,7 @@ export class Chat extends DurableObject<Env> {
           const q = md.quotedMessage ?? {};
           const quoted = String(q.textMessage ?? q.caption ?? "").trim();
           const about = quoted ? `\n\n(это ответ на сообщение: «${quoted.slice(0, 1500)}»)` : /image/i.test(String(q.typeMessage ?? "")) ? "\n\n(это ответ на фото задания)" : "";
-          return await this.enqueue({ kind: "text", id, text: text + about }, mark);
+          return await this.textIn(chatId, id, text + about, mark);
         }
       } else if (NUDGE.has(type)) {
         await this.green.send(chatId, "Пришли фото задания.");
@@ -154,6 +173,65 @@ export class Chat extends DurableObject<Env> {
       await this.markSeen(id, meta);
       await this.say(chatId, `⚠️ ${this.hide(e?.message ?? e)}`);
     }
+  }
+
+  // Последнее задание в очереди, если это работа с фото, ответ на которую ещё не готов: к ней можно добавлять
+  private async openJob(): Promise<{ key: string; job: Job; live: boolean } | null> {
+    const all = await this.db.list<Job>({ prefix: "job:" });
+    const last = [...all].at(-1);
+    if (!last) return null;
+    const live = this.cur?.key === last[0];
+    const job = live ? this.cur!.job : last[1];
+    const open = job.kind === "image" && job.phase === "solve" && !job.done && !job.outbox?.length && !job.sent?.length;
+    return open ? { key: last[0], job, live } : null;
+  }
+
+  // Решение этой работы начинается заново: всё, что успели написать, выбрасываем
+  private rewind(job: Job, wait: number) {
+    job.acc = "";
+    job.body = undefined;
+    job.done = undefined;
+    job.outbox = [];
+    job.sent = [];
+    job.svgs = [];
+    job.step = 0;
+    job.tries = 0;
+    job.down = 0;
+    job.phase = "solve";
+    job.after = Date.now() + wait / this.k;
+  }
+
+  private async photoIn(chatId: string, shot: Shot, mark: Record<string, unknown>) {
+    const open = await this.openJob();
+    if (open && open.job.shots.length < MAX_SHOTS) {
+      // Работа ещё решается: добавляем фото к ней. Ждём чуть дольше, чем был промежуток между прошлыми фото:
+      // если идёт серия, следующее фото придёт в том же темпе, и решать лучше один раз всё сразу.
+      const { key, job, live } = open;
+      const gap = (shot.at - (job.shots.at(-1)?.at ?? shot.at)) * this.k;
+      job.shots.push(shot);
+      this.rewind(job, Math.min(ADD_MAX, Math.max(ADD_MIN, gap * 1.5)));
+      await this.db.put({ ...mark, [key]: job });
+      if (live) this.stop?.abort(new Added("добавлено фото"));
+      await this.db.setAlarm(job.after!);
+      return await this.say(chatId, `➕ Добавил к прошлому: теперь ${job.shots.length} фото. Решение пришлю одним сообщением.`);
+    }
+    const busy = await this.enqueue({ kind: "image", id: shot.id, shots: [shot] }, mark);
+    await this.say(chatId, busy ? "📥 Принял фото, решу сразу после текущего." : "📥 Принял фото, решаю.");
+  }
+
+  private async textIn(chatId: string, id: string, text: string, mark: Record<string, unknown>) {
+    const open = await this.openJob();
+    if (open) {
+      // сообщение пришло, пока решается работа с фото: считаем его уточнением к ней
+      const { key, job, live } = open;
+      job.notes.push(text.slice(0, 2000));
+      this.rewind(job, NOTE_WAIT);
+      await this.db.put({ ...mark, [key]: job });
+      if (live) this.stop?.abort(new Added("добавлено уточнение"));
+      await this.db.setAlarm(job.after!);
+      return await this.say(chatId, "➕ Учту это в решении.");
+    }
+    await this.enqueue({ kind: "text", id, text, shots: [] }, mark);
   }
 
   // Команда отвечает в чат, и за это время могло прийти другое сообщение: список читаем заново, чтобы не затереть его отметку
@@ -188,10 +266,10 @@ export class Chat extends DurableObject<Env> {
       const mine = await this.isOwner(chatId);
       await this.green.send(
         chatId,
-        `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}${queue ? `, в работе: ${queue}` : ""}\n` +
+        `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}, пересчёт кодом ${this.c.code ? "вкл" : "выкл"}${queue ? `, в работе: ${queue}` : ""}\n` +
           (mine
-            ? `Команды: быстро / средне / умно / макс, fast вкл / fast выкл, стоп, сброс\nЖурнал: ${origin}/?k=${await hookKey(this.c)}`
-            : "Команды: стоп, сброс"),
+            ? `Команды: решай, стоп, сброс, быстро / средне / умно / макс, fast вкл / fast выкл\nЖурнал: ${origin}/?k=${await hookKey(this.c)}`
+            : "Команды: решай, стоп, сброс"),
       );
       return true;
     }
@@ -203,8 +281,24 @@ export class Chat extends DurableObject<Env> {
     if (/^(стоп|stop|отмена)$/.test(t)) {
       const jobs = await this.db.list({ prefix: "job:" });
       await this.db.delete([...jobs.keys()]);
-      this.stop?.abort();
+      this.stop?.abort(new Stopped("стоп"));
       await this.green.send(chatId, jobs.size ? "Остановил ✅" : "Сейчас ничего не решаю.");
+      return true;
+    }
+    if (/^(решай|реши|готово|solve|solve it|go|done|ready)$/.test(t)) {
+      // бот ждёт, не придёт ли ещё фото к этой работе: команда снимает ожидание
+      const first = [...(await this.db.list<Job>({ prefix: "job:", limit: 1 }))][0];
+      if (!first) {
+        await this.green.send(chatId, "Сейчас нечего решать. Пришли фото.");
+        return true;
+      }
+      const job = this.cur?.key === first[0] ? this.cur.job : first[1];
+      if (job.after && job.after > Date.now() && !this.running) {
+        delete job.after;
+        await this.db.put(first[0], job);
+        await this.db.setAlarm(Date.now());
+      }
+      await this.green.send(chatId, "Решаю ✅");
       return true;
     }
     const m = t.match(/^(?:effort|режим)\s+(\S+)$/);
@@ -237,13 +331,16 @@ export class Chat extends DurableObject<Env> {
     this.epoch++;
   }
 
-  private async enqueue(j: Pick<Job, "kind" | "id" | "url" | "caption" | "text">, mark: Record<string, unknown>) {
-    if ((await this.db.list({ prefix: "job:", limit: MAX_QUEUE })).size >= MAX_QUEUE) throw new Error("Слишком много заданий в очереди. Подожди ответов или напиши «стоп».");
+  // Ставит задание в очередь. Возвращает true, если перед ним уже есть другие
+  private async enqueue(j: Pick<Job, "kind" | "id" | "text" | "shots">, mark: Record<string, unknown>): Promise<boolean> {
+    const queue = (await this.db.list({ prefix: "job:", limit: MAX_QUEUE })).size;
+    if (queue >= MAX_QUEUE) throw new Error("Слишком много заданий в очереди. Подожди ответов или напиши «стоп».");
     const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
     const { effort } = await this.options();
-    const job: Job = { ...j, at: Date.now(), phase: "solve", step: 0, tries: 0, effort, cont: false, sent: [], outbox: [], down: 0, svgs: [], drawn: 0, msgs: 0, tokens: 0 };
+    const job: Job = { ...j, at: Date.now(), notes: [], phase: "solve", step: 0, tries: 0, effort, acc: "", sent: [], outbox: [], down: 0, svgs: [], drawn: 0, msgs: 0, tokens: 0, checks: 0 };
     await this.db.put({ ...mark, seq, [`job:${String(seq).padStart(9, "0")}`]: job });
-    await this.db.setAlarm(Date.now());
+    if (!queue) await this.db.setAlarm(Date.now());
+    return queue > 0;
   }
 
   // ---------- будильник: один кусок работы ----------
@@ -259,7 +356,7 @@ export class Chat extends DurableObject<Env> {
       const first = await this.db.list<Job>({ prefix: "job:", limit: 1 });
       const [key, job] = [...first][0] ?? [];
       if (!key || !job) return await this.selfTest();
-      if (job.after && job.after > Date.now()) return; // пауза перед повтором ещё не прошла
+      if (job.after && job.after > Date.now()) return; // пауза перед повтором или ожидание следующего фото ещё не прошли
       const watch = () => this.db.setAlarm(Date.now() + WATCHDOG / this.k).catch((e) => console.log("watchdog:", String(e)));
       await watch();
       beat = setInterval(watch, BEAT / this.k);
@@ -269,6 +366,7 @@ export class Chat extends DurableObject<Env> {
     } finally {
       clearInterval(beat);
       this.running = false;
+      this.cur = null;
       const next = await this.db.list<Job>({ prefix: "job:", limit: 1 });
       const job = [...next.values()][0];
       if (job) await this.db.setAlarm(Math.max(Date.now(), job.after ?? 0));
@@ -284,8 +382,7 @@ export class Chat extends DurableObject<Env> {
     if (!(await this.db.get(key))) return; // «стоп» успел удалить задание
     const stop = new AbortController();
     this.stop = stop;
-    job.outbox ??= [];
-    job.down ??= 0;
+    this.cur = { key, job };
     job.started ??= Date.now();
     delete job.after;
     if (job.tries >= MAX_TRIES) {
@@ -295,15 +392,22 @@ export class Chat extends DurableObject<Env> {
       return void (await this.say(chatId, job.phase === "draw" ? "(рисунки не получились)" : "⚠️ Не получилось решить. Пришли фото ещё раз."));
     }
     await this.db.put(key, job);
-    // «стоп» удаляет задание из очереди: после него ничего не дописываем
+    // «стоп» удаляет задание, новое фото начинает решение заново: после них из этого запуска ничего не дописываем
     const save = async () => {
-      if (stop.signal.aborted) throw new Stopped("стоп");
+      if (stop.signal.aborted) throw stop.signal.reason;
       await this.db.put(key, job);
     };
     try {
       if (job.phase === "draw") await this.draw(key, job, chatId, origin, save);
       else await this.solve(key, job, chatId, end, stop.signal, save);
     } catch (e: any) {
+      if (stop.signal.reason instanceof Added) {
+        // фото или уточнение уже записаны в задание: сбрасываем то, что этот запуск успел наработать
+        const after = job.after;
+        this.rewind(job, 0);
+        job.after = after ?? Date.now();
+        return void (await this.db.put(key, job));
+      }
       if (e instanceof Stopped || stop.signal.aborted) return;
       console.log(this.hide(e?.stack ?? e));
       if (e instanceof Delivery) {
@@ -325,7 +429,7 @@ export class Chat extends DurableObject<Env> {
         // модель думала весь кусок и ничего не написала: следующая попытка на ступень проще
         job.effort = lower(job.effort);
         await this.db.put(key, job);
-        await this.say(chatId, "⏳ долго думаю, решаю быстрее…");
+        await this.say(chatId, "⏳ Долго думаю, решаю быстрее…");
       } else if (e instanceof Busy && retry) {
         job.after = Date.now() + (BACKOFF[job.tries - 1] ?? BACKOFF[0]) / this.k;
         await this.db.put(key, job);
@@ -347,59 +451,11 @@ export class Chat extends DurableObject<Env> {
     }
   }
 
-  // ---------- решение: вопрос + память чата -> Claude -> ответы по одному заданию ----------
+  // ---------- решение: фото или вопрос + память чата -> Claude -> один готовый ответ ----------
   private async solve(key: string, job: Job, chatId: string, end: number, stop: AbortSignal, save: () => Promise<void>) {
-    let content: Block[];
-    if (job.cont) content = [{ type: "text", text: "дальше" }];
-    else if (job.kind === "image") {
-      if (!job.more) {
-        // Фото, которые успели прийти следом (страницы одной работы), решаем одним запросом: модель видит их вместе
-        const queue = await this.db.list<Job>({ prefix: "job:", limit: MAX_PHOTOS + 1 });
-        const next: [string, Job][] = [];
-        for (const [k, j] of queue) {
-          if (k === key) continue;
-          if (j.kind !== "image" || next.length >= MAX_PHOTOS - 1) break;
-          next.push([k, j]);
-        }
-        job.more = next.map(([, j]) => ({ id: j.id, url: j.url, caption: j.caption }));
-        const gone = this.db.delete(next.map(([k]) => k)); // вместе с записью задания это одна операция
-        await save();
-        await gone;
-      }
-      const shots = [{ id: job.id, url: job.url, caption: job.caption }, ...job.more];
-      const have = new Set(((await this.db.get<PhotoMeta[]>("photos")) ?? []).map((p) => p.id));
-      const ready: typeof shots = [];
-      for (const shot of shots) {
-        if (!have.has(shot.id)) {
-          let type: PhotoMeta["type"] | null = null;
-          try {
-            const bytes = await this.green.photo(chatId, shot.id, shot.url, Date.now() + 40_000, PHOTO_MAX);
-            if ((type = imageType(bytes))) await this.savePhoto(shot.id, bytes, type);
-          } catch (e) {
-            if (shots.length === 1) throw e;
-            console.log("фото не скачалось:", this.hide(e));
-          }
-          if (!type) continue;
-        }
-        ready.push(shot);
-      }
-      if (!ready.length) {
-        await this.db.delete(key);
-        return void (await this.say(chatId, "Не понял формат фото. Пришли обычное фото."));
-      }
-      if (ready.length < shots.length) await this.say(chatId, `(фото не открылось: ${shots.length - ready.length}. Пришли его ещё раз.)`);
-      const captions = ready.map((x) => x.caption).filter(Boolean).join("; ");
-      const lead = ready.length > 1 ? `Реши задания на фото. Фото ${ready.length}: они пришли подряд, это страницы одной работы по порядку.` : "Реши задания на фото.";
-      content = [...ready.map((x): Block => ({ type: "photo", id: x.id })), { type: "text", text: captions ? `${lead} Подпись: ${captions}` : lead }];
-    } else content = [{ type: "text", text: job.text ?? "" }];
-
     const epoch = this.epoch;
-    const remember = async (t: Turn[]) => {
-      if (epoch === this.epoch) await this.saveHistory(t);
-    };
 
     // Одно сообщение в чат. Шлюз отказал по существу (квота, доступ): повторять и переспрашивать Claude бесполезно.
-    let sends = 0;
     const post = async (text: string) => {
       try {
         await this.green.send(chatId, text);
@@ -407,115 +463,130 @@ export class Chat extends DurableObject<Env> {
         const why = String(e?.message ?? e);
         throw permanent(e) ? new Fatal(why) : new Delivery(why);
       }
-      sends++;
       job.sent.push(text);
       job.msgs++;
       job.down = 0;
     };
-
-    // 1. Сначала досылаем то, что было готово, но не ушло
-    while (job.outbox.length) {
-      if (sends >= MAX_SENDS) return await save(); // запас запросов на этот запуск вышел: остальное в следующем
-      await post(job.outbox[0]);
-      job.outbox.shift();
-      await save();
-    }
-
-    let turns = await this.history();
-    let a = job.done;
-    if (a) {
-      turns = [...turns, { role: "user", content }]; // Claude на этот кусок уже ответил, осталось подвести итог
-    } else {
-      // память сбросили посреди длинного ответа: продолжать нечего
-      if (job.cont && !turns.length) return await this.finish(key, job, chatId);
-      if (job.sent.length) {
-        // прошлый запуск оборвался посреди ответа: отправленное уже в чате, продолжаем с этого места
-        turns = [...turns, { role: "user", content }, { role: "assistant", content: job.sent.join("\n\n") }];
-        await remember(turns);
-        job.sent = [];
-        job.cont = true;
-        content = [{ type: "text", text: "дальше" }];
-        await save();
+    const flush = async () => {
+      while (job.outbox.length) {
+        await post(job.outbox[0]);
+        job.outbox.shift();
+        await this.db.put(key, job); // ответ уже уходит: «стоп» и новые фото его больше не касаются
       }
-      turns = [...turns, { role: "user", content }];
+    };
 
-      // 2. Спрашиваем Claude. Каждое готовое задание сразу уходит в чат. Если шлюз не принял сообщение,
-      // ответ не выбрасываем: дописываем его в задание и доставим, когда шлюз оживёт.
-      const svgsBefore = job.svgs.length;
-      let gatewayDown = "";
-      const deliver = async (raw: string) => {
-        const { text, svgs } = splitAnswer(raw);
-        for (const svg of svgs) if (!job.svgs.includes(svg)) job.svgs.push(svg);
-        if (!text) return;
-        if (!gatewayDown && !job.outbox.length && sends < MAX_SENDS) {
-          try {
-            await post(text);
-            return await save();
-          } catch (e: any) {
-            if (!(e instanceof Delivery)) throw e;
-            gatewayDown = e.message;
-            console.log("шлюз не принял сообщение, коплю ответ:", this.hide(e.message));
-          }
-        }
-        job.outbox.push(text);
-        await save();
-      };
+    // 1. Ответ уже готов (прошлый запуск не смог его доставить): только досылаем
+    if (!job.done) {
+      const content = await this.question(key, job, chatId);
+      if (!content) return;
+      const history = await this.history();
+      const turns: Turn[] = [...history, { role: "user", content }];
+      // если ответ обрезало, продолжаем его: уже написанное модель видит как свой текст
+      if (job.acc) turns.push({ role: "assistant", content: job.acc }, { role: "user", content: [{ type: "text", text: "Продолжай с того места, где остановился. Уже написанное не повторяй." }] });
 
       // долгое молчание похоже на поломку: один раз даём знать, что бот жив
-      const hello = job.hello || job.cont ? undefined : setTimeout(() => {
-        if (job.msgs || job.outbox.length || stop.aborted) return;
+      const hello = job.hello ? undefined : setTimeout(() => {
+        if (stop.aborted) return;
         job.hello = true;
-        this.ctx.waitUntil(this.say(chatId, "⏳ решаю, задача непростая…"));
+        this.ctx.waitUntil(this.say(chatId, "⏳ Ещё решаю, скоро пришлю."));
       }, HELLO / this.k);
 
       const { fast } = await this.options();
       job.tries++; // попытка засчитывается до запроса: если объект упадёт посреди него, счётчик это запомнит
       await save();
-      let answer;
+      let a: Answer;
       try {
-        answer = await ask(this.c, { messages: await this.toApi(turns), effort: job.effort, fast, until: end - SEGMENT_TAIL / this.k, stop, onChunk: deliver });
+        a = await ask(this.c, { messages: await this.toApi(turns), effort: job.effort, fast, until: end - SEGMENT_TAIL / this.k, stop });
       } finally {
         clearTimeout(hello);
       }
-      // если модель остановил защитный фильтр, недописанный хвост не отправляем: он оборван на полуслове
-      if (answer.rest && !answer.refused) await deliver(answer.rest);
-      job.tokens += answer.tokens.in + answer.tokens.out;
-      a = { cut: answer.cut, refused: answer.refused, empty: answer.empty, drew: job.svgs.length > svgsBefore };
-      if (job.outbox.length) {
-        job.done = a;
-        await save();
-        if (gatewayDown) throw new Delivery(gatewayDown);
-        return; // сообщений больше, чем можно отправить за один запуск: следующий будильник дошлёт
+      job.tokens += a.tokens.in + a.tokens.out;
+      job.checks += a.checks;
+      job.model = a.model;
+      const full = job.acc + a.text; // продолжение идёт встык: модель дописывает с того знака, на котором её оборвало
+      if (a.cut && !a.text.trim() && job.effort !== "low") throw new Timeout("лимит токенов ушёл на размышления"); // повтор на ступень проще
+      if (a.cut && a.text.trim() && job.step < this.c.autoMax) {
+        job.acc = full;
+        job.step++;
+        job.tries = 0;
+        return await save(); // следующий будильник продолжит со свежим запасом времени
+      }
+
+      // 2. Ответ готов: текст одним сообщением (задания по порядку), рисунки следом
+      const { text, svgs } = splitAnswer(full);
+      const parts = tasks(text);
+      job.svgs = [...new Set(svgs)].slice(0, MAX_DRAWINGS);
+      job.body = parts.join("\n\n");
+      job.outbox = compose(parts, MSG_MAX);
+      job.done = { cut: a.cut, refused: a.refused, empty: !parts.length };
+      job.acc = "";
+      await save(); // с этой записи работа считается решённой: новое фото пойдёт уже отдельным заданием
+      if (epoch === this.epoch && (job.body || job.svgs.length)) {
+        await this.saveHistory([...history, { role: "user", content }, { role: "assistant", content: job.body || "[рисунок]" }]);
       }
     }
+    await flush();
 
-    // 3. Итог куска
+    // 3. Итог
+    const a = job.done!;
     delete job.done;
-    if (!job.msgs && !job.svgs.length) {
-      // за всё задание ни текста, ни рисунка
-      if (a.refused) return await this.finish(key, job, chatId, "Модель не стала это решать. Пересними задание.");
-      if (a.cut && a.empty && job.effort !== "low") throw new Timeout("лимит токенов ушёл на размышления"); // повтор на ступень проще
-      return await this.finish(key, job, chatId, a.cut ? "Задание слишком длинное. Сфоткай одно задание." : "Пустой ответ. Пришли фото ещё раз.");
-    }
-    if (job.sent.length || a.drew) {
-      // рисунки в память не кладём, только пометку: иначе после «дальше» модель нарисует их заново
-      const drawn = a.cut && job.svgs.length ? `\n\n[рисунков уже готово: ${job.svgs.length}, повторять их не нужно]` : "";
-      await remember([...turns, { role: "assistant", content: (job.sent.join("\n\n") || "[рисунок]") + drawn }]);
+    job.tries = 0;
+    if (a.empty && !job.svgs.length) {
+      return await this.finish(key, job, chatId, a.refused ? "Модель не стала это решать. Пересними задание." : a.cut ? "Задание слишком длинное. Сфоткай одно задание." : "Пустой ответ. Пришли фото ещё раз.");
     }
     if (a.refused) await this.say(chatId, "(модель остановилась и не дорешала. Пересними оставшиеся задания.)");
-    job.sent = [];
-    job.tries = 0;
-    if (a.cut && job.step < this.c.autoMax) {
-      job.step++;
-      job.cont = true;
-      return await save(); // следующий будильник продолжит со свежим запасом времени
-    }
     if (a.cut) await this.say(chatId, CUT_NOTE);
+    job.sent = [];
     if (job.svgs.length) {
       job.phase = "draw";
-      return await save();
+      return await this.db.put(key, job);
     }
     await this.finish(key, job, chatId);
+  }
+
+  // Что отправить модели: фото этой работы с подписями или текстовый вопрос. null: задание снято
+  private async question(key: string, job: Job, chatId: string): Promise<Block[] | null> {
+    if (job.kind !== "image") return [{ type: "text", text: job.text ?? "" }];
+    const have = new Set(((await this.db.get<PhotoMeta[]>("photos")) ?? []).map((p) => p.id));
+    const ready: Shot[] = [];
+    for (const shot of job.shots) {
+      if (!have.has(shot.id)) {
+        let type: PhotoMeta["type"] | null = null;
+        try {
+          const bytes = await this.green.photo(chatId, shot.id, shot.url, Date.now() + 40_000, PHOTO_MAX);
+          if ((type = imageType(bytes))) {
+            shot.hash = await fingerprint(bytes);
+            const px = imageSize(bytes);
+            shot.size = `${px ? `${px.w}×${px.h}, ` : ""}${Math.round(bytes.length / 1024)} КБ`;
+            await this.savePhoto(shot.id, bytes, type);
+          }
+        } catch (e) {
+          if (job.shots.length === 1) throw e;
+          console.log("фото не скачалось:", this.hide(e));
+        }
+        if (!type) continue;
+      }
+      if (shot.hash && ready.some((x) => x.hash === shot.hash)) continue; // то же фото ушло дважды
+      ready.push(shot);
+    }
+    if (!ready.length) {
+      await this.db.delete(key);
+      await this.say(chatId, "Не понял формат фото. Пришли обычное фото.");
+      return null;
+    }
+    const lost = job.shots.filter((x) => !ready.includes(x) && !x.hash).length;
+    job.shots = ready; // повторы и неоткрывшиеся фото убираем, чтобы не разбираться с ними при каждом запуске
+    if (lost) await this.say(chatId, `(фото не открылось: ${lost}. Пришли его ещё раз.)`);
+    const n = ready.length;
+    const content: Block[] = [];
+    for (const [i, shot] of ready.entries()) {
+      if (n > 1) content.push({ type: "text", text: `Фото ${i + 1} из ${n}:` });
+      content.push({ type: "photo", id: shot.id });
+    }
+    const captions = ready.map((x) => x.caption).filter(Boolean).join("; ");
+    const lead = n > 1 ? `Реши задания с этих ${n} фото. Это одна работа, фото идут в том порядке, в котором их сняли.` : "Реши задания с фото.";
+    content.push({ type: "text", text: lead + (captions ? `\nПодпись владельца к фото: ${captions}` : "") + (job.notes.length ? `\nСообщения владельца к этим фото: ${job.notes.join(" | ")}` : "") });
+    return content;
   }
 
   // ---------- рисунки: SVG от Claude -> PNG -> в чат ----------
@@ -579,7 +650,10 @@ export class Chat extends DurableObject<Env> {
     await this.db.delete(key);
     if (message) await this.say(chatId, message);
     const sec = Math.round((Date.now() - (job.started ?? job.at)) / 1000);
-    await this.note(`${message ? "без ответа" : "решено"} за ${sec} с: сообщений ${job.msgs}, рисунков ${job.drawn}, режим ${job.effort}, токенов ${job.tokens}`);
+    const photos = job.shots.length ? `, фото ${job.shots.length}${job.shots[0].size ? ` (${job.shots[0].size})` : ""}` : "";
+    await this.note(
+      `${message ? "без ответа" : "решено"} за ${sec} с${photos}: сообщений ${job.msgs}, рисунков ${job.drawn}, пересчётов кодом ${job.checks}, режим ${job.effort}, модель ${job.model ?? this.c.model}, токенов ${job.tokens}`,
+    );
   }
 
   // Сообщение, которое не должно ронять работу, если шлюз не ответил
@@ -600,7 +674,7 @@ export class Chat extends DurableObject<Env> {
     await this.db.put("hist", { at: Date.now(), turns: t });
   }
 
-  // Помним несколько последних фото: условие бывает на одном, рисунок на другом, и по ним задают вопросы
+  // Помним последние фото: по ним задают уточняющие вопросы («объясни №3», «перереши»)
   private async savePhoto(id: string, bytes: Uint8Array, type: PhotoMeta["type"]) {
     const list = (await this.db.get<PhotoMeta[]>("photos")) ?? [];
     const meta: PhotoMeta = { id, type, n: Math.ceil(bytes.length / PHOTO_CHUNK) };

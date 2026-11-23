@@ -32,3 +32,30 @@ export const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;")
 // Время по Москве для журнала на странице проверки
 export const clock = (t: number) =>
   new Date(t).toLocaleString("ru-RU", { timeZone: "Europe/Moscow", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+
+// Размер картинки в пикселях (JPEG и PNG): по нему в журнале видно, в каком качестве приходят фото
+export function imageSize(b: Uint8Array): { w: number; h: number } | null {
+  if (b[0] === 0x89 && b[1] === 0x50 && b.length > 24) {
+    const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    return { w: v.getUint32(16), h: v.getUint32(20) };
+  }
+  if (b[0] !== 0xff || b[1] !== 0xd8) return null;
+  let i = 2;
+  while (i + 9 < b.length) {
+    if (b[i] !== 0xff) return null;
+    const marker = b[i + 1];
+    const len = (b[i + 2] << 8) | b[i + 3];
+    // кадр SOF: в нём высота и ширина (кроме служебных C4, C8, CC)
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return { h: (b[i + 5] << 8) | b[i + 6], w: (b[i + 7] << 8) | b[i + 8] };
+    }
+    if (len < 2) return null;
+    i += 2 + len;
+  }
+  return null;
+}
+
+export async function fingerprint(b: Uint8Array): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", b);
+  return [...new Uint8Array(d)].slice(0, 12).map((x) => x.toString(16).padStart(2, "0")).join("");
+}

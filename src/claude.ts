@@ -1,4 +1,5 @@
-// Запрос к Claude через официальный SDK: ответ идёт потоком и режется на задания по строке @@@.
+// Запрос к Claude через официальный SDK. Ответ собирается целиком: модель сначала проверяет себя
+// (в том числе пересчётом в песочнице Anthropic), потом пишет решение, и только готовый текст уходит в чат.
 import Anthropic from "@anthropic-ai/sdk";
 import type { Cfg, Effort } from "./config.ts";
 import { PROMPT } from "./prompt.ts";
@@ -8,47 +9,14 @@ export class Timeout extends Error {} // время куска вышло, а м
 export class Stopped extends Error {} // пользователь написал «стоп»
 export class Busy extends Error {} // Claude перегружен или лимит запросов: стоит повторить позже
 export class Fatal extends Error {} // ошибка настройки: повтор не поможет
-class Undelivered {
-  cause: unknown;
-  constructor(cause: unknown) {
-    this.cause = cause;
-  }
-}
-
-// Режет поток текста на готовые задания. Разделитель: отдельная строка @@@
-export class Splitter {
-  private pending = "";
-  private static SPLIT = /(?:^|\n)[ \t]*@@@[^\n]*\n/;
-  private marked = false; // в накопленном тексте есть @@@ (значит, разделитель может завершиться переводом строки)
-  push(delta: string): string[] {
-    // Регулярное выражение по всему накопленному тексту дорогое, поэтому запускаем его, только когда
-    // разделитель действительно мог появиться: @@@ уже встречалось и пришёл перевод строки.
-    const from = Math.max(0, this.pending.length - 2);
-    this.pending += delta;
-    this.marked ||= this.pending.indexOf("@@@", from) >= 0;
-    if (!this.marked || !delta.includes("\n")) return [];
-    const out: string[] = [];
-    let m: RegExpMatchArray | null;
-    while ((m = this.pending.match(Splitter.SPLIT))) {
-      const chunk = this.pending.slice(0, m.index);
-      this.pending = this.pending.slice(m.index! + m[0].length);
-      if (chunk.trim()) out.push(chunk);
-    }
-    this.marked = this.pending.includes("@@@");
-    return out;
-  }
-  rest(): string {
-    return this.pending.replace(/(?:^|\n)[ \t]*@@@[^\n]*$/, "").trim(); // хвостовой разделитель без перевода строки
-  }
-}
 
 export interface Answer {
-  rest: string; // хвост после последнего @@@ (ещё не отправлен)
+  text: string; // весь текст ответа (задания разделены строкой @@@, рисунки идут блоками <svg>)
   cut: boolean; // ответ оборван (время или лимит токенов): продолжить в следующем куске
   refused: boolean;
-  empty: boolean; // модель не написала ни одного символа
   tokens: { in: number; out: number };
-  model: string; // модель, которая реально ответила (при отказе основной может ответить запасная)
+  model: string; // модель, которая реально ответила
+  checks: number; // сколько раз модель запускала пересчёт кодом
 }
 
 export interface AskOptions {
@@ -56,23 +24,40 @@ export interface AskOptions {
   effort: Effort;
   fast: boolean;
   until: number; // срок куска, мс
-  stop?: AbortSignal; // команда «стоп»
-  onChunk: (text: string) => Promise<void>; // готовое задание
+  stop?: AbortSignal; // «стоп» или новое фото к этому же заданию: причина лежит в signal.reason
 }
 
 type StreamParams = Parameters<Anthropic["beta"]["messages"]["stream"]>[0];
+type Content = Anthropic.Beta.BetaMessage["content"];
 
 // Необязательные параметры запроса. Если модель из MODEL какой-то из них не знает (ошибка 400),
-// бот по очереди отключает их и запоминает, чтобы не ошибаться на каждом фото.
-type Feature = "speed" | "fallbacks" | "effort";
-const ORDER: Feature[] = ["speed", "fallbacks", "effort"];
+// бот отключает именно его и запоминает, чтобы не ошибаться на каждом фото.
+type Feature = "speed" | "fallbacks" | "effort" | "tools" | "thinking";
 const disabled = new Map<string, Set<Feature>>();
 export const featureOff = (model: string, f: Feature) => disabled.get(model)?.has(f) ?? false;
 
-export function claudeProblem(c: Cfg, e: unknown): Error {
+// Основная модель недоступна на этом ключе (нет доступа, не включено хранение данных): до этого времени работаем на запасной
+const down = new Map<string, number>();
+const MODEL_RETRY = 30 * 60_000;
+export function activeModel(c: Cfg): string {
+  return c.fallbackModel && c.fallbackModel !== c.model && (down.get(c.model) ?? 0) > Date.now() ? c.fallbackModel : c.model;
+}
+
+const CREDIT = /credit balance/i;
+const SPEND = /specified (workspace )?API usage limits/i;
+const RETENTION = /data retention/i;
+
+export function unavailable(e: unknown): boolean {
+  if (e instanceof Anthropic.NotFoundError) return true;
+  const msg = e instanceof Anthropic.APIError ? String(e.apiMessage ?? e.message ?? "") : "";
+  if (e instanceof Anthropic.BadRequestError && RETENTION.test(msg)) return true;
+  return e instanceof Anthropic.PermissionDeniedError && /model/i.test(msg);
+}
+
+export function claudeProblem(c: Cfg, e: unknown, model = c.model): Error {
   if (e instanceof Timeout || e instanceof Stopped || e instanceof Busy || e instanceof Fatal) return e;
   if (e instanceof Anthropic.AuthenticationError) return new Fatal("Неверный ключ Claude. Проверь ANTHROPIC_API_KEY.");
-  if (e instanceof Anthropic.NotFoundError) return new Fatal(`Нет модели ${c.model}. Исправь MODEL.`);
+  if (e instanceof Anthropic.NotFoundError) return new Fatal(`Нет модели ${model} на этом ключе. Исправь MODEL.`);
   if (e instanceof Anthropic.PaymentRequiredError || (e instanceof Anthropic.APIError && e.type === "billing_error")) {
     return new Fatal("На балансе Claude кончились деньги (platform.claude.com → Billing).");
   }
@@ -94,61 +79,144 @@ export function claudeProblem(c: Cfg, e: unknown): Error {
     // Нехватка денег и лимит трат, заданный в консоли, приходят обычной ошибкой 400, своего типа у них нет
     if (CREDIT.test(msg)) return new Fatal("На балансе Claude кончились деньги (platform.claude.com → Billing).");
     if (SPEND.test(msg)) return new Fatal("Claude: достигнут лимит трат, который задан в консоли (platform.claude.com → Limits).");
+    if (RETENTION.test(msg)) return new Fatal(`Модель ${model} требует хранения данных 30 дней: включи его в консоли Claude или поставь другую модель в MODEL.`);
     return new Fatal(`Ошибка Claude ${e.status}: ${msg.slice(0, 120)}`);
   }
   return e instanceof Error ? e : new Error(String(e));
 }
 
-const CREDIT = /credit balance/i;
-const SPEND = /specified (workspace )?API usage limits/i;
 export function client(c: Cfg): Anthropic {
   return new Anthropic({ apiKey: c.claudeKey, baseURL: c.claudeBase, maxRetries: 2 });
 }
 
 // Какой необязательный параметр не понравился модели. Если ошибка 400 не называет ни одного из них,
 // дело не в параметрах: ничего не отключаем и показываем ошибку как есть.
-function blamed(e: unknown, fast: boolean, off: Set<Feature>): Feature | undefined {
+function blamed(e: unknown, o: AskOptions, c: Cfg, off: Set<Feature>): Feature | undefined {
   if (!(e instanceof Anthropic.BadRequestError)) return undefined;
   const msg = String(e.apiMessage ?? e.message ?? "");
-  const f: Feature | undefined = /speed|fast/i.test(msg) ? "speed" : /fallback|anthropic-beta/i.test(msg) ? "fallbacks" : /output_config|effort/i.test(msg) ? "effort" : undefined;
-  return f && !off.has(f) && (f !== "speed" || fast) ? f : undefined;
+  const f: Feature | undefined = /speed|fast/i.test(msg)
+    ? "speed"
+    : /fallback|anthropic-beta/i.test(msg)
+    ? "fallbacks"
+    : /code_execution|tools|container/i.test(msg)
+    ? "tools"
+    : /output_config|effort/i.test(msg)
+    ? "effort"
+    : /thinking/i.test(msg)
+    ? "thinking"
+    : undefined;
+  if (!f || off.has(f)) return undefined;
+  if ((f === "speed" && !o.fast) || (f === "tools" && !c.code)) return undefined;
+  return f;
 }
 
 export async function ask(c: Cfg, o: AskOptions): Promise<Answer> {
-  const removed: Feature[] = [];
+  const removed: [string, Feature][] = [];
   // Параметр считаем лишним, только если без него запрос прошёл. При любой другой концовке возвращаем как было.
   const restore = () => {
-    const off = disabled.get(c.model);
-    for (const f of removed) off?.delete(f);
+    for (const [m, f] of removed) disabled.get(m)?.delete(f);
   };
   for (;;) {
+    const model = activeModel(c);
     try {
-      return await attempt(c, o);
+      return await converse(c, model, o);
     } catch (e) {
-      const off = disabled.get(c.model) ?? new Set<Feature>();
-      const next = blamed(e, o.fast, off);
+      if (model === c.model && c.fallbackModel && c.fallbackModel !== c.model && unavailable(e)) {
+        console.log(`модель ${model} недоступна, работаю на ${c.fallbackModel}:`, String((e as Error).message).slice(0, 200));
+        down.set(c.model, Date.now() + MODEL_RETRY);
+        continue;
+      }
+      const off = disabled.get(model) ?? new Set<Feature>();
+      const next = blamed(e, o, c, off);
       if (!next) {
         restore();
-        throw claudeProblem(c, e);
+        throw claudeProblem(c, e, model);
       }
       console.log(`Claude 400, пробую без ${next}:`, String((e as Error).message).slice(0, 200));
       off.add(next);
-      disabled.set(c.model, off);
-      removed.push(next);
+      disabled.set(model, off);
+      removed.push([model, next]);
     }
   }
 }
 
-async function attempt(c: Cfg, o: AskOptions): Promise<Answer> {
-  const off = disabled.get(c.model) ?? new Set<Feature>();
+const textOf = (content: Content) => content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
+const has = (content: Content, type: string) => content.some((b) => (b.type as string) === type);
+
+// Один ход модели. Пересчёт в песочнице идёт на стороне Anthropic; если он затянулся, ход приходит
+// с пометкой pause_turn, и его нужно продолжить, вернув модели её же сообщение без изменений.
+async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
+  let messages = o.messages;
+  let container: string | undefined;
+  let out = "";
+  let checks = 0;
+  let nudged = false;
+  const tokens = { in: 0, out: 0 };
+  for (let round = 0; ; round++) {
+    let r: Attempt;
+    try {
+      r = await attempt(c, model, o, messages, container);
+    } catch (e) {
+      // срок вышел или Claude отвалился уже после того, как часть ответа написана: её не теряем
+      if ((e instanceof Timeout || e instanceof Busy) && out.trim()) return { text: out, cut: true, refused: false, tokens, model, checks };
+      throw e;
+    }
+    out += r.text;
+    tokens.in += r.tokens.in;
+    tokens.out += r.tokens.out;
+    if (!r.msg) return { text: out, cut: true, refused: false, tokens, model, checks };
+    const msg = r.msg;
+    checks += msg.content.filter((b) => b.type === "server_tool_use").length;
+    const done: Answer = {
+      text: out,
+      cut: msg.stop_reason === "max_tokens" || msg.stop_reason === "model_context_window_exceeded",
+      refused: msg.stop_reason === "refusal",
+      tokens,
+      model: msg.model,
+      checks,
+    };
+    // после перехода на запасную модель сообщение нельзя вернуть как есть: отдаём то, что получилось
+    if (has(msg.content, "fallback") || round >= 8) return done;
+    if (msg.stop_reason === "pause_turn") {
+      messages = [...messages, { role: "assistant", content: msg.content as Anthropic.Beta.BetaContentBlockParam[] }];
+      container = msg.container?.id ?? container;
+      continue;
+    }
+    // Модель всё проверила, но итоговый текст не написала (он остался в её заметках между проверками): просим написать
+    if (msg.stop_reason === "end_turn" && !out.trim() && checks > 0 && !nudged) {
+      nudged = true;
+      messages = [
+        ...messages,
+        { role: "assistant", content: msg.content as Anthropic.Beta.BetaContentBlockParam[] },
+        { role: "user", content: "Теперь напиши готовый ответ целиком, по формату." },
+      ];
+      container = msg.container?.id ?? container;
+      continue;
+    }
+    return done;
+  }
+}
+
+interface Attempt {
+  text: string;
+  tokens: { in: number; out: number };
+  msg?: Anthropic.Beta.BetaMessage; // нет, если ответ оборвался на полуслове
+}
+
+async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic.Beta.BetaMessageParam[], container?: string): Promise<Attempt> {
+  const off = disabled.get(model) ?? new Set<Feature>();
   const params: StreamParams = {
-    model: c.model,
+    model,
     // размышления тоже идут в счёт max_tokens, на высоких ступенях им нужно больше места
     max_tokens: o.effort === "xhigh" || o.effort === "max" ? 128_000 : 64_000,
     // инструкция одна и та же для всех фото: кэшируем, следующие запросы дешевле и быстрее
     system: [{ type: "text", text: PROMPT, cache_control: { type: "ephemeral" } }],
-    messages: o.messages,
+    // и разговор тоже: при добавлении фото, продолжении и уточнениях старые фото читаются из кэша
+    cache_control: { type: "ephemeral" },
+    messages,
   };
+  // размышления включаем явно: тогда и запасная модель (если основная откажется) будет думать
+  if (!off.has("thinking")) params.thinking = { type: "adaptive" };
   if (!off.has("effort")) params.output_config = { effort: o.effort };
   if (o.fast && !off.has("speed")) params.speed = "fast";
   if (!off.has("fallbacks")) {
@@ -157,46 +225,35 @@ async function attempt(c: Cfg, o: AskOptions): Promise<Answer> {
     params.betas = ["server-side-fallback-2026-07-01"];
     params.fallbacks = "default";
   }
+  if (c.code && !off.has("tools")) {
+    // песочница с Python (sympy, numpy): модель пересчитывает в ней вычисления перед тем, как писать ответ
+    params.tools = [{ type: "code_execution_20260521", name: "code_execution" }];
+    if (container) params.container = container;
+  }
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new Timeout("время вышло")), left(o.until, 3_000));
-  const onStop = () => ctrl.abort(new Stopped("стоп"));
-  if (o.stop?.aborted) onStop();
-  o.stop?.addEventListener("abort", onStop);
+  const interrupt = () => ctrl.abort(o.stop?.reason instanceof Error ? o.stop.reason : new Stopped("стоп"));
+  if (o.stop?.aborted) interrupt();
+  o.stop?.addEventListener("abort", interrupt);
 
-  const split = new Splitter();
-  let wrote = false; // модель написала хоть что-то, кроме пробелов
+  let out = "";
   let opened = false; // поток открылся: модель приняла запрос и начала работать
   try {
     const stream = client(c).beta.messages.stream(params, { signal: ctrl.signal });
     for await (const ev of stream) {
       opened = true;
-      if (ev.type !== "content_block_delta" || ev.delta.type !== "text_delta") continue;
-      wrote ||= /\S/.test(ev.delta.text);
-      for (const chunk of split.push(ev.delta.text)) {
-        try {
-          await o.onChunk(chunk);
-        } catch (cause) {
-          throw new Undelivered(cause); // сбой отправки в чат: это не обрыв ответа, решает вызывающий
-        }
-      }
+      if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") out += ev.delta.text;
     }
     const msg = await stream.finalMessage();
-    return {
-      rest: split.rest(),
-      cut: msg.stop_reason === "max_tokens",
-      refused: msg.stop_reason === "refusal",
-      empty: !wrote,
-      tokens: { in: msg.usage.input_tokens, out: msg.usage.output_tokens },
-      model: msg.model,
-    };
+    return { text: textOf(msg.content) || out, tokens: { in: msg.usage.input_tokens, out: msg.usage.output_tokens }, msg };
   } catch (e) {
-    if (ctrl.signal.reason instanceof Stopped) throw ctrl.signal.reason;
+    // «стоп» или новое фото: причину решает вызывающий
+    if (o.stop?.aborted) throw o.stop.reason instanceof Error ? o.stop.reason : new Stopped("стоп");
     // Срок вышел или связь оборвалась посреди ответа: написанное не теряем, остальное в следующем куске
-    if (e instanceof Undelivered) throw e.cause;
-    if (wrote) {
+    if (out.trim()) {
       console.log("ответ оборван:", e instanceof Error ? e.message : String(e));
-      return { rest: split.rest(), cut: true, refused: false, empty: false, tokens: { in: 0, out: 0 }, model: c.model };
+      return { text: out, tokens: { in: 0, out: 0 } };
     }
     // Срок вышел. Если модель всё это время думала, следующую попытку делаем на ступень проще.
     // Если поток так и не открылся (очередь у Claude, зависшее соединение), модель ни при чём: просто повтор.
@@ -206,6 +263,11 @@ async function attempt(c: Cfg, o: AskOptions): Promise<Answer> {
     throw e;
   } finally {
     clearTimeout(timer);
-    o.stop?.removeEventListener("abort", onStop);
+    o.stop?.removeEventListener("abort", interrupt);
   }
+}
+
+// Делит готовый ответ на задания по отдельной строке @@@
+export function tasks(answer: string): string[] {
+  return answer.split(/(?:^|\n)[ \t]*@@@[^\n]*(?:\n|$)/).map((t) => t.trim()).filter(Boolean);
 }

@@ -2,12 +2,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import Anthropic from "@anthropic-ai/sdk";
-import { Busy, Fatal, Splitter, claudeProblem } from "../src/claude.ts";
+import { Busy, Fatal, activeModel, claudeProblem, tasks, unavailable } from "../src/claude.ts";
 import { config, hider, hookKey, lower, publicOrigin } from "../src/config.ts";
 import { Green, GreenError, permanent } from "../src/green.ts";
 import { fixSvg } from "../src/svg.ts";
-import { prettyMath, splitAnswer } from "../src/text.ts";
-import { base64, imageType, sameSecret } from "../src/util.ts";
+import { RULE, compose, prettyMath, splitAnswer } from "../src/text.ts";
+import { base64, fingerprint, imageSize, imageType, sameSecret } from "../src/util.ts";
 
 test("степени и индексы: то, что модель написала через ^ и _, становится маленькими цифрами", () => {
   const cases: Record<string, string> = {
@@ -49,38 +49,49 @@ test("ответ модели: текст отдельно, рисунки от�
   assert.deepEqual(splitAnswer("<svg>1</svg><svg>2</svg>"), { text: "", svgs: ["<svg>1</svg>", "<svg>2</svg>"] });
 });
 
-test("поток режется на задания по отдельной строке @@@, даже если разделитель пришёл по кусочкам", () => {
-  const s = new Splitter();
-  assert.deepEqual(s.push("№1\nA\n@"), []);
-  assert.deepEqual(s.push("@"), []);
-  assert.deepEqual(s.push("@\n№2 @@@ в строке\nB"), ["№1\nA"]); // @@@ посреди строки не разделитель
-  assert.deepEqual(s.push("\n  @@@ конец\n"), ["№2 @@@ в строке\nB"]);
-  assert.deepEqual(s.push("<svg></svg>\n@@@"), []);
-  assert.equal(s.rest(), "<svg></svg>"); // хвостовой разделитель без перевода строки убран
+test("готовый ответ делится на задания по отдельной строке @@@", () => {
+  assert.deepEqual(tasks("№1\nA\n@@@\n№2 @@@ в строке\nB\n  @@@ конец\n№3\n@@@"), ["№1\nA", "№2 @@@ в строке\nB", "№3"]);
+  assert.deepEqual(tasks("@@@\n№1\nОтвет: 1"), ["№1\nОтвет: 1"]);
+  assert.deepEqual(tasks("   "), []);
 });
 
-test("поток: посимвольная подача даёт тот же результат, что и целиком", () => {
-  const text = "№1\nx = 2\n@@@\n№2\ny = 3\n@@@\n№3\nz = 4";
-  const whole = new Splitter(), byChar = new Splitter();
-  const a = [...whole.push(text), whole.rest()];
-  const b = [...[...text].flatMap((ch) => byChar.push(ch)), byChar.rest()];
-  assert.deepEqual(a, ["№1\nx = 2", "№2\ny = 3", "№3\nz = 4"]);
-  assert.deepEqual(b, a);
+test("одно сообщение: сверху список ответов, ниже задания через черту", () => {
+  const one = compose(["№1\nx = 2\nОтвет: 2."], 1000);
+  assert.deepEqual(one, ["№1\nx = 2\nОтвет: 2."]); // одно задание: список ответов не нужен
+  const two = compose(["Вариант 1 · №1\nрешение\nОтвет: а) 4; б) −1", "Вариант 1 · №2\nдоказательство\nч.т.д."], 1000);
+  assert.equal(two.length, 1);
+  assert.equal(two[0], `✅ Ответы\nВариант 1 · №1: а) 4; б) −1\nВариант 1 · №2: см. решение\n${RULE}\nВариант 1 · №1\nрешение\nОтвет: а) 4; б) −1\n${RULE}\nВариант 1 · №2\nдоказательство\nч.т.д.`);
+  // в задании две строки «Ответ:» (проверка и итог): в список идёт последняя
+  assert.match(compose(["№1\nОтвет: 3 (промежуточный)\nОтвет: 5", "№2\nОтвет: 6"], 1000)[0], /^✅ Ответы\n№1: 5\n№2: 6\n/);
 });
 
-test("поток: разделитель с припиской режется, даже если его строка пришла по частям", () => {
-  const s = new Splitter();
-  const out = [...s.push("№1\nОтвет: 5\n@@@"), ...s.push("\n№2\nОтвет: 7\n@@@ Рис"), ...s.push("унки\n<svg>x</svg>")];
-  assert.deepEqual(out, ["№1\nОтвет: 5", "№2\nОтвет: 7"]);
-  assert.equal(s.rest(), "<svg>x</svg>");
-  // пробел после @@@ и посимвольная подача
-  const t = new Splitter();
-  const chunks = [..."№1\nОтвет: 5\n@@@ \n№2\nОтвет: 7"].flatMap((ch) => t.push(ch));
-  assert.deepEqual([...chunks, t.rest()], ["№1\nОтвет: 5", "№2\nОтвет: 7"]);
-  // хвостовой разделитель с припиской, после которого ничего не пришло
-  const u = new Splitter();
-  assert.deepEqual(u.push("№1\nОтвет: 1\n@@@ Рисунки"), []);
-  assert.equal(u.rest(), "№1\nОтвет: 1");
+test("слишком длинный ответ делится по границам заданий, длинное задание по строкам", () => {
+  const parts = Array.from({ length: 6 }, (_, i) => `№${i + 1}\n${"строка\n".repeat(20)}Ответ: ${i}`);
+  const msgs = compose(parts, 400);
+  assert.ok(msgs.length > 1);
+  assert.ok(msgs.every((m) => m.length <= 420), String(msgs.map((m) => m.length)));
+  assert.match(msgs[0], /^\(1\/\d+\)\n✅ Ответы/);
+  for (let i = 0; i < 6; i++) assert.equal(msgs.join("\n").split(`Ответ: ${i}`).length, 2); // каждое решение ровно один раз (в списке ответов слова «Ответ:» нет)
+  const long = compose([`№1\n${"очень длинная строка решения\n".repeat(60)}Ответ: 1`], 500);
+  assert.ok(long.length > 2 && long.every((m) => m.length <= 520));
+  assert.ok(long.join("\n").includes("Ответ: 1"));
+});
+
+test("код программы в ответе не трогаем, остальной текст приводим в порядок", () => {
+  const r = splitAnswer("№1\nx^2 и my_var, **важно**\n```\nfor i in range(3):\n    x_1 = a ** 2  # x^2\n```\nH2O\nОтвет: 9");
+  assert.equal(r.text, "№1\nx² и my_var, важно\n```\nfor i in range(3):\n    x_1 = a ** 2  # x^2\n```\nH₂O\nОтвет: 9");
+  assert.equal(splitAnswer("## №1\nОтвет: 1").text, "№1\nОтвет: 1");
+});
+
+test("размер и отпечаток фото", async () => {
+  const jpeg = Buffer.from("/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/yQALCAABAAEBAREA/8wABgAQEAX/2gAIAQEAAD8A0s8g/9k=", "base64");
+  assert.deepEqual(imageSize(new Uint8Array(jpeg)), { w: 1, h: 1 });
+  const png = new Uint8Array(32);
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0, 0x06, 0x40, 0, 0, 0x04, 0xb0]);
+  assert.deepEqual(imageSize(png), { w: 1600, h: 1200 });
+  assert.equal(imageSize(new TextEncoder().encode("не картинка")), null);
+  const a = await fingerprint(new Uint8Array([1, 2, 3])), b = await fingerprint(new Uint8Array([1, 2, 3])), c = await fingerprint(new Uint8Array([1, 2, 4]));
+  assert.ok(a === b && a !== c && /^[0-9a-f]{24}$/.test(a));
 });
 
 test("ошибки Claude: что повторять, а что сразу показывать", () => {
@@ -98,6 +109,9 @@ test("ошибки Claude: что повторять, а что сразу по�
   assert.match(claudeProblem(c, api(400, "invalid_request_error", "Your credit balance is too low")).message, /кончились деньги/);
   assert.match(claudeProblem(c, api(400, "invalid_request_error", "You have reached your specified API usage limits.")).message, /лимит трат, который задан в консоли/);
   assert.match(claudeProblem(c, api(413, "request_too_large", "big")).message, /Фото слишком большое/);
+  assert.match(claudeProblem(c, api(400, "invalid_request_error", "In order to access this model, your organization or workspace must have data retention enabled.")).message, /хранения данных 30 дней/);
+  assert.ok(unavailable(api(404, "not_found_error", "model: x")) && unavailable(api(400, "invalid_request_error", "must have data retention enabled")) && !unavailable(api(400, "invalid_request_error", "messages: bad")));
+  assert.equal(activeModel(c), "claude-opus-5-5"); // в этом тесте MODEL задана как Opus: запасная не нужна
   const other = claudeProblem(c, api(400, "invalid_request_error", "messages: bad"));
   assert.ok(other instanceof Fatal);
   assert.equal(other.message, "Ошибка Claude 400: messages: bad");
@@ -118,7 +132,10 @@ test("рисунок приводится к тёмному стилю: фон, 
 test("настройки: значения по умолчанию, чистка ввода, список незаполненного", () => {
   const empty = config({} as any);
   assert.deepEqual(empty.missing, ["ANTHROPIC_API_KEY", "GREEN_URL", "GREEN_ID", "GREEN_TOKEN"]);
-  assert.equal(empty.model, "claude-opus-5-5");
+  assert.equal(empty.model, "claude-fable-5-2");
+  assert.equal(empty.fallbackModel, "claude-opus-5-5");
+  assert.equal(empty.code, true);
+  assert.equal(config({ CODE: "0" } as any).code, false);
   assert.equal(empty.effort, "high");
   assert.equal(empty.fast, false);
   assert.equal(empty.autoMax, 5);

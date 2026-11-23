@@ -9,6 +9,8 @@ export interface Env {
   GREEN_TOKEN?: string;
   GREEN_MEDIA_URL?: string; // необязательно: mediaUrl из консоли GREEN-API, если бот не угадал его сам
   MODEL?: string;
+  FALLBACK_MODEL?: string; // запасная модель, если основная недоступна на этом ключе
+  CODE?: string; // CODE=0 выключает пересчёт вычислений в песочнице Anthropic
   EFFORT?: string;
   FAST?: string;
   AUTO_MAX?: string;
@@ -32,6 +34,8 @@ export interface Cfg {
   greenToken: string;
   greenMedia: string;
   model: string;
+  fallbackModel: string;
+  code: boolean;
   effort: Effort;
   fast: boolean;
   autoMax: number;
@@ -51,7 +55,9 @@ export function config(env: Env): Cfg {
     greenId: v("GREEN_ID").replace(/\D/g, ""),
     greenToken: v("GREEN_TOKEN"),
     greenMedia: v("GREEN_MEDIA_URL").replace(/\/+$/, ""),
-    model: v("MODEL", "claude-opus-5-5"),
+    model: v("MODEL", "claude-fable-5-2"),
+    fallbackModel: v("FALLBACK_MODEL", "claude-opus-5-5"),
+    code: v("CODE") !== "0",
     effort: isEffort(effort) ? effort : "high",
     fast: v("FAST") === "1",
     autoMax: Number.isFinite(autoMax) && autoMax >= 0 ? Math.min(autoMax, 20) : 5,
