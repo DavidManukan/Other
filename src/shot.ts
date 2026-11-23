@@ -27,6 +27,7 @@ const FONTS: Record<string, ArrayBuffer> = {
 };
 export const MAX_PAGES = 30; // больше страниц картинками не шлём: такой ответ уходит текстом целиком
 const SHOT_LIMIT = 60_000; // столько даём браузеру на всё решение
+const SHOT_MAX = 1_900_000; // байт на картинку страницы: с запасом до 2 МБ на запись в хранилище чата
 
 // Браузер сегодня больше не даст снимков (кончились бесплатные минуты): до полуночи UTC не пробуем
 export class NoBrowser extends Error {
@@ -63,7 +64,8 @@ export function fakeShots(parts: string[]): Uint8Array[] {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// Возвращает картинки страниц по порядку. PNG; если страница вышла тяжелее 1,9 МБ, JPEG.
+// Возвращает картинки страниц по порядку. PNG; если страница вышла тяжелее 1,9 МБ, JPEG, когда он меньше.
+// Хранилище чата берёт не больше 2 МБ на запись: страницу тяжелее не снимаем, ответ уходит текстом.
 export async function shoot(binding: Fetcher, html: string): Promise<Uint8Array[]> {
   let browser: Awaited<ReturnType<typeof puppeteer.launch>> | undefined;
   for (let i = 0; !browser; i++) {
@@ -93,7 +95,13 @@ export async function shoot(binding: Fetcher, html: string): Promise<Uint8Array[
       const el = await page.$(`#p${i}`);
       if (!el) throw new Error(`страница ${i} не нашлась`); // без неё ответ был бы неполным
       let img = (await el.screenshot({ type: "png" })) as Uint8Array;
-      if (img.length > 1_900_000) img = (await el.screenshot({ type: "jpeg", quality: 88 })) as Uint8Array;
+      // белое на чёрном JPEG часто сжимает хуже PNG: берём его, только если вышло меньше
+      for (const quality of [88, 75, 60]) {
+        if (img.length <= SHOT_MAX) break;
+        const jpeg = (await el.screenshot({ type: "jpeg", quality })) as Uint8Array;
+        if (jpeg.length < img.length) img = jpeg;
+      }
+      if (img.length > SHOT_MAX) throw new Error(`страница ${i} слишком тяжёлая для картинки`);
       out.push(new Uint8Array(img));
     }
     if (!out.length) throw new Error("браузер не снял ни одной страницы");

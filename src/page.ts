@@ -15,7 +15,13 @@ export const PAGE_H = 1000; // выше этого страницу делим: 
 const HEAD = /^\s*(([^·\n]{1,30}·\s*){0,2}(№|Задание|Задача)\s*\S*|Исправляю\b.*|Вариант\s+\S+.*)$/;
 const LABEL = /^(Дано|Найти|Доказать|Решение|Доказательство|Обоснование|Проверка|ОДЗ|Ответ)\s*:\s*(.*)$/;
 
-const KATEX = { throwOnError: true, strict: "ignore", output: "html", trust: false, maxExpand: 2000 } as const;
+// errorColor: свой цвет-метка. Команду, которой нет (или запрещённую trust: false, вроде \url), KaTeX не бросает,
+// а рисует её исходник этим цветом: по метке узнаём такой вывод и показываем формулу обычным текстом.
+const KATEX = { throwOnError: true, strict: "ignore", output: "html", trust: false, maxExpand: 2000, errorColor: "#fe0001" } as const;
+const sound = (html: string) => {
+  if (html.includes("#fe0001")) throw new Error("KaTeX не знает команду");
+  return html;
+};
 const REL = /^(?:=|<|>|\\(?:le|leq|leqslant|ge|geq|geqslant|ne|neq|approx|equiv|sim|Rightarrow|Leftrightarrow|implies|iff)(?![A-Za-z]))/;
 
 // Формулу делим на куски по знакам отношения верхнего уровня (=, <, ≤, ⇒ …): длинная цепочка равенств
@@ -53,7 +59,7 @@ export function chunks(src: string): string[] {
 // Формула: KaTeX пишет готовый HTML. Не разобралась (опечатка модели): показываем её обычным текстом.
 export function tex(src: string): string {
   const clean = src.replace(/\\tag\*?\{[^{}]*\}/g, ""); // номера формул на странице не нужны
-  const one = (s: string) => katex.renderToString(`\\displaystyle ${s}`, KATEX);
+  const one = (s: string) => sound(katex.renderToString(`\\displaystyle ${s}`, KATEX));
   try {
     // .f: формула целиком. Она не рвётся, пока помещается в строку; не помещается: переносится между кусками .fx
     return `<span class="f">${chunks(clean).map((part, i) => `<span class="fx">${one(i ? `{}${part}` : part)}</span>`).join("<wbr>")}</span>`;
@@ -62,7 +68,7 @@ export function tex(src: string): string {
       return `<span class="f"><span class="fx">${one(clean)}</span></span>`;
     } catch {
       try {
-        return katex.renderToString(clean, { ...KATEX, displayMode: true }); // окружения вроде align живут только в выключной формуле
+        return sound(katex.renderToString(clean, { ...KATEX, displayMode: true })); // окружения вроде align живут только в выключной формуле
       } catch {
         return `<span class="raw">${esc(prettyMath(stripTex(texToPlain(src))))}</span>`;
       }
@@ -192,7 +198,8 @@ export function taskHtml(part: string, figs: Fig[]): string {
     out.push(row(line.trim()));
   }
   place();
-  return `<section class="task" data-title="${esc(title)}">${out.join("")}</section>`;
+  // заголовок продолжения на следующих листах PAGINATE пишет текстом: формулы в нём уже переведены в обычные знаки
+  return `<section class="task" data-title="${esc(prettyMath(stripTex(texToPlain(title))))}">${out.join("")}</section>`;
 }
 
 export interface Fig {
@@ -249,6 +256,7 @@ h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .row .note{flex:0 1 auto;max-width:44%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
 .ans{margin:12px 0 4px;padding:8px 12px;border:2px solid #fff;border-radius:8px}
 pre{font:17px/1.4 'DejaVu Sans Mono','Liberation Mono',monospace;border:1px solid #666;padding:10px 12px;border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}
+pre.go{border-bottom:0;border-radius:6px 6px 0 0;padding-bottom:0;margin-bottom:0}pre.on{border-top:0;border-radius:0 0 6px 6px;padding-top:0;margin-top:0}pre.go.on{border-radius:0}
 .fig{margin:10px 0}.fig svg{display:block;width:100%;height:auto}
 .raw{font-family:'DejaVu Sans',sans-serif}
 .f{white-space:nowrap}.f wbr{display:none}.f.brk{white-space:normal}.f.brk wbr{display:inline}.fx{white-space:nowrap}.fx.wide{white-space:normal}
@@ -298,15 +306,23 @@ export const PAGINATE = `(() => {
     if (!area.width || !area.height) continue;
     const aside = (el) => el.closest("defs, marker, clipPath, mask, pattern, symbol");
     const backdrop = (r) => r.width >= area.width * 0.98 && r.height >= area.height * 0.98;
-    const pts = []; // точки всех линий рисунка на экране: x, y и половина толщины линии
+    let pts = []; // точки всех линий рисунка на экране: x, y, половина толщины линии и номер фигуры по порядку рисования
     const plates = []; // закрашенные прямоугольники: подпись на такой подложке стоит там нарочно
+    // фигуры с чёрной заливкой (цвет листа): закрывают линии, нарисованные до них, а буква на таком кружке
+    // (прибор V в цепи, группа атомов на конце связи) стоит там нарочно
+    const covers = [];
+    let order = 0;
     for (const el of svg.querySelectorAll("line, path, polyline, polygon, circle, ellipse, rect")) {
+      order++;
       if (aside(el)) continue;
       const r = el.getBoundingClientRect(), cs = getComputedStyle(el), m = el.getScreenCTM();
       const rect = el.tagName.toLowerCase() === "rect";
       if (!m || cs.display === "none" || cs.visibility === "hidden" || (rect && backdrop(r))) continue;
       const stroke = cs.stroke !== "none" && parseFloat(cs.strokeWidth) > 0;
       if (rect && cs.fill !== "none") plates.push(r);
+      if (!rect && cs.fill === "rgb(0, 0, 0)" && typeof el.isPointInFill === "function") covers.push({ el, inv: m.inverse(), order, r });
+      // оси и сетка графика (stroke-width 1): числа делений стоят на них нарочно, двигать их с делений нельзя
+      if (stroke && !rect && parseFloat(cs.strokeWidth) <= 1) continue;
       if (!stroke && cs.fill === "none") continue;
       let len = 0;
       try { len = el.getTotalLength(); } catch (e) {}
@@ -316,10 +332,15 @@ export const PAGINATE = `(() => {
       const n = Math.min(3000, Math.max(1, Math.ceil(len * k / 3)));
       for (let i = 0; i <= n; i++) {
         const p = el.getPointAtLength(len * i / n);
-        pts.push([m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f, hw]);
+        pts.push([m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f, hw, order]);
       }
     }
     if (!pts.length) continue;
+    // точка (x, y) экрана внутри заливки фигуры
+    const inFill = (c, x, y) => x >= c.r.left && x <= c.r.right && y >= c.r.top && y <= c.r.bottom &&
+      c.el.isPointInFill(new DOMPoint(c.inv.a * x + c.inv.c * y + c.inv.e, c.inv.b * x + c.inv.d * y + c.inv.f));
+    // линия под чёрной фигурой, нарисованной позже, не видна: на ней буква не мешает
+    try { if (covers.length) pts = pts.filter((p) => !covers.some((c) => c.order > p[3] && inFill(c, p[0], p[1]))); } catch (e) {}
     // рамка самих букв: у строки текста сверху и снизу есть пустые поля
     const glyphs = (t) => { const r = t.getBoundingClientRect(); return { l: r.left, r: r.right, t: r.top + r.height * 0.16, b: r.bottom - r.height * 0.14 }; };
     const texts = [...svg.querySelectorAll("text")].filter((t) => !aside(t) && t.textContent.trim() && t.getBoundingClientRect().width > 0);
@@ -344,6 +365,7 @@ export const PAGINATE = `(() => {
       if (hits(b, -1) < 3 && over(b, i, 0) < (b.r - b.l) * (b.b - b.t) * 0.15) return;
       if (cs.paintOrder.indexOf("stroke") === 0 && cs.stroke !== "none") return; // у подписи своя обводка, линия под ней закрыта
       if (plates.some((r) => r.left <= b.l + 1 && r.right >= b.r - 1 && r.top <= b.t + 1 && r.bottom >= b.b - 1)) return;
+      try { if (covers.some((c) => inFill(c, (b.l + b.r) / 2, (b.t + b.b) / 2))) return; } catch (e) {}
       let best = null;
       for (const d of [5, 8, 12, 16, 21, 27]) {
         for (let a = 0; a < 16; a++) {
@@ -385,7 +407,65 @@ export const PAGINATE = `(() => {
     const y0 = Math.max(vb.y, top - 28), y1 = Math.min(vb.y + vb.height, bottom + 28);
     if (y1 - y0 > 40 && y1 - y0 < vb.height - 20) svg.setAttribute("viewBox", vb.x + " " + y0 + " " + vb.width + " " + (y1 - y0));
   }
-  // 5. Делим поток на листы
+  // 5. Блок намного выше листа (длинный абзац, листинг программы) режем на части: между блоками листы делятся,
+  // а целый такой блок дал бы лист во много экранов и картинку тяжелее, чем принимает чат.
+  // Листинг режем между строками, абзац между предложениями (если их нет, между словами); формула .f не режется.
+  const piece = Math.round((H - 60) / 3); // мелкие части плотнее заполняют листы
+  for (const b of [...flow.querySelectorAll(".task > pre.b, .task > .b.line")]) {
+    try {
+      const box = b.getBoundingClientRect();
+      if (box.height <= H - 120) continue;
+      const pre = b.tagName === "PRE";
+      const at = []; // места разреза по порядку: где начинается следующая часть, верх её строки, конец предложения ли
+      const range = document.createRange();
+      const topOf = (rs) => (rs.length && rs[0].height > 0 ? rs[0].top : null);
+      let stop = false; // перед этим узлом кончилось предложение
+      for (const node of [...b.childNodes]) {
+        if (node.nodeType === 1) {
+          const y = stop && node.classList.contains("f") ? topOf(node.getClientRects()) : null;
+          if (y !== null) at.push({ node, off: -1, y, s: true });
+          stop = false;
+          continue;
+        }
+        if (node.nodeType !== 3) continue;
+        const text = node.data;
+        const re = pre ? /\\n(?=[^\\n])/g : /\\s+(?=\\S)/g;
+        for (let m; (m = re.exec(text)); ) {
+          const off = m.index + m[0].length;
+          const s = pre || (off === m[0].length ? stop : /[.!?…;]$/.test(text.slice(0, m.index)));
+          range.setStart(node, off);
+          range.setEnd(node, off + 1);
+          const y = topOf(range.getClientRects());
+          if (y !== null) at.push({ node, off, y, s });
+        }
+        stop = pre ? false : /[.!?…;]\\s*$/.test(text);
+      }
+      const cuts = [];
+      let from = box.top, sent = null, word = null;
+      for (const c of at) {
+        if (c.y - from > piece) {
+          const cut = sent || (c.y - from > H - 160 ? word : null);
+          if (cut) { cuts.push(cut); from = cut.y; sent = word = null; }
+        }
+        if (c.y > from + 1) { word = c; if (c.s) sent = c; }
+      }
+      for (const c of cuts.reverse()) {
+        const nb = b.cloneNode(false);
+        b.after(nb);
+        if (c.off < 0) range.setStartBefore(c.node); else range.setStart(c.node, c.off);
+        range.setEndAfter(b.lastChild);
+        nb.appendChild(range.extractContents());
+        if (pre) {
+          // перевод строки на стыке остался в конце первой части: в листинге он дал бы пустую строку
+          const t = b.lastChild;
+          if (t && t.nodeType === 3) t.data = t.data.replace(/\\n$/, "");
+          b.classList.add("go");
+          nb.classList.add("on");
+        }
+      }
+    } catch (e) {}
+  }
+  // 6. Делим поток на листы
   const top = flow.getBoundingClientRect().top;
   const tasks = [...flow.querySelectorAll(".task")];
   const pages = [[]];
@@ -409,6 +489,9 @@ export const PAGINATE = `(() => {
         if (b.classList.contains("ans") && page.length > 1 && last().task === task && last().b.getBoundingClientRect().height < 260) take();
         // заголовок и вводную строку не оставляем внизу листа одних
         while (page.length > 1 && last().task === task && leads(last().b) && moved.length < 4) take();
+        // заголовок (или название предмета над ним) один на листе, следующий блок выше листа: уходит вместе с блоком,
+        // пустой лист не снимается
+        if (page.length === 1 && last().task === task && (leads(last().b) || last().b.classList.contains("cont"))) take();
         pages.push(moved);
         start = (moved.length ? moved[0].b.getBoundingClientRect().top : br.top) - top;
       }
