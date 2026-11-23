@@ -45,16 +45,16 @@ const quiet = (chat, ms = 1500) => {
 };
 
 await start(MOCK);
-writeFileSync(".dev.vars", [
-  `ANTHROPIC_API_KEY=${KEY_CLAUDE}`,
-  `GREEN_URL=http://127.0.0.1:${MOCK}/green`,
-  "GREEN_ID=1101000001",
-  `GREEN_TOKEN=${TOKEN}`,
-  `ANTHROPIC_BASE_URL=http://127.0.0.1:${MOCK}/anthropic`,
-  `GREEN_MEDIA_URL=http://127.0.0.1:${MOCK}/media`,
-  "TIME_SCALE=60",
-  "",
-].join("\n"));
+// настройки передаём флагами, файл .dev.vars не трогаем (в нём могут лежать настоящие ключи)
+const VARS = {
+  ANTHROPIC_API_KEY: KEY_CLAUDE,
+  GREEN_URL: `http://127.0.0.1:${MOCK}/green`,
+  GREEN_ID: "1101000001",
+  GREEN_TOKEN: TOKEN,
+  ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK}/anthropic`,
+  GREEN_MEDIA_URL: `http://127.0.0.1:${MOCK}/media`,
+  TIME_SCALE: "60",
+};
 const state = mkdtempSync(join(tmpdir(), "solver-e2e-")); // каждый прогон с чистого листа
 if (await fetch(`${BASE}/ready`).catch(() => null)) {
   console.log(`❌ порт ${PORT} занят: останови другой запущенный воркер`);
@@ -63,7 +63,7 @@ if (await fetch(`${BASE}/ready`).catch(() => null)) {
 // отдельная группа процессов: в конце гасим wrangler вместе с его дочерним workerd
 let log = "";
 function startDev() {
-  const p = spawn("npx", ["wrangler", "dev", "--port", String(PORT), "--ip", "127.0.0.1", "--persist-to", state], { env: { ...process.env, CI: "1", WRANGLER_SEND_METRICS: "false" }, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  const p = spawn("npx", ["wrangler", "dev", "--port", String(PORT), "--ip", "127.0.0.1", "--persist-to", state, ...Object.entries(VARS).flatMap(([k, v]) => ["--var", `${k}:${v}`])], { env: { ...process.env, CI: "1", WRANGLER_SEND_METRICS: "false" }, stdio: ["ignore", "pipe", "pipe"], detached: true });
   p.stdout.on("data", (d) => (log += d));
   p.stderr.on("data", (d) => (log += d));
   return p;

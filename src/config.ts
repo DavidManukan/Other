@@ -71,36 +71,36 @@ export async function hookKey(c: Cfg): Promise<string> {
 
 // Объект чата живёт в выбранном регионе, чтобы запросы к Claude шли из поддерживаемой страны.
 // REGION: eu (по умолчанию) или us закрепляют регион жёстко, weur/enam/... только подсказка.
-let warned = false;
 const HINTS = ["wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"];
+let pinned: boolean | undefined; // жёсткое закрепление региона доступно? решаем один раз, чтобы чат не раздвоился
 
-function chatNamespace(env: Env): DurableObjectNamespace<Chat> {
+function chatNamespace(env: Env): { ns: DurableObjectNamespace<Chat>; hint?: DurableObjectLocationHint } {
   const region = config(env).region;
-  if (region === "eu" || region === "us" || region === "fedramp") {
+  if ((region === "eu" || region === "us" || region === "fedramp") && pinned !== false) {
     try {
-      return env.CHAT.jurisdiction(region as DurableObjectJurisdiction);
+      const ns = env.CHAT.jurisdiction(region as DurableObjectJurisdiction);
+      pinned = true;
+      return { ns };
     } catch (e) {
-      if (!warned) console.log("jurisdiction недоступна, работаю с подсказкой региона:", String(e));
-      warned = true;
+      if (pinned) throw e;
+      pinned = false; // локальный запуск: там закрепления нет
+      console.log("закрепление региона недоступно, работаю с подсказкой региона:", String(e));
     }
   }
-  return env.CHAT;
-}
-
-function locationHint(env: Env): DurableObjectLocationHint {
-  const region = config(env).region;
-  return (HINTS.includes(region) ? region : region === "us" ? "enam" : "weur") as DurableObjectLocationHint;
+  const hint = (HINTS.includes(region) ? region : region === "us" ? "enam" : "weur") as DurableObjectLocationHint;
+  return { ns: env.CHAT, hint };
 }
 
 export function chatStub(env: Env, name: string): DurableObjectStub<Chat> {
-  const ns = chatNamespace(env);
-  return ns.get(ns.idFromName(name), { locationHint: locationHint(env) });
+  const { ns, hint } = chatNamespace(env);
+  const id = ns.idFromName(name);
+  return hint ? ns.get(id, { locationHint: hint }) : ns.get(id);
 }
 
 // Тот же объект по его id (id стоит в ссылке на рисунок, номер телефона в ссылку не попадает)
 export function chatById(env: Env, hex: string): DurableObjectStub<Chat> | null {
   try {
-    const ns = chatNamespace(env);
+    const { ns } = chatNamespace(env);
     return ns.get(ns.idFromString(hex));
   } catch {
     return null;

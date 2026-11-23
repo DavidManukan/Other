@@ -13,7 +13,8 @@ import { base64, clock, imageType } from "./util.ts";
 
 const SEGMENT = 13 * 60_000; // столько работает один кусок (потолок будильника 15 минут)
 const SEGMENT_TAIL = 45_000; // запас в конце куска на отправку и сохранение
-const WATCHDOG = 15.5 * 60_000; // если кусок оборвался молча (обновление кода), будильник поднимет задание снова
+const BEAT = 60_000; // пульс: пока кусок работает, раз в минуту отодвигаем сторожевой будильник
+const WATCHDOG = 150_000; // пульс пропал (площадка перезапустила объект): через столько будильник поднимет задание снова
 const HELLO = 75_000; // столько молчим, прежде чем написать «решаю»
 const BACKOFF = [15_000, 45_000, 120_000]; // паузы перед повтором, когда Claude занят
 const HISTORY_TTL = 2 * 3600_000; // через 2 часа без сообщений чат начинается заново
@@ -65,7 +66,8 @@ interface Job {
   cont: boolean; // следующий кусок продолжает ответ («дальше»)
   sent: string[]; // что уже ушло в чат в текущем куске
   svgs: string[]; // рисунки ждут своей очереди: сначала все ответы, потом картинки
-  drawn: number;
+  drawn: number; // сколько рисунков уже отправлено
+  drawing?: { i: number; tries: number }; // какой рисунок сейчас в работе и какая это попытка
   after?: number; // не раньше этого времени (пауза перед повтором)
   hello?: boolean; // «⏳ решаю» уже отправляли
   started?: number;
@@ -102,34 +104,32 @@ export class Chat extends DurableObject<Env> {
   async onWebhook(h: any, origin: string): Promise<void> {
     const chatId = String(h?.senderData?.chatId ?? "");
     const id = String(h?.idMessage ?? "");
-    if (!chatId || (await this.seen(id))) return; // шлюз иногда присылает одно сообщение дважды
-    await this.db.put<Meta>("meta", { chatId, origin });
+    if (!chatId) return;
+    const seen = (await this.db.get<string[]>("seen")) ?? [];
+    if (id && seen.includes(id)) return; // шлюз иногда присылает одно сообщение дважды
+    // Отметка «уже видели» пишется одной записью вместе с заданием: если объект упадёт на полпути,
+    // шлюз пришлёт сообщение снова и оно не потеряется.
+    const mark: Record<string, unknown> = { seen: id ? [...seen, id].slice(-200) : seen, meta: { chatId, origin } satisfies Meta };
     const md = h.messageData ?? {};
     const type = String(md.typeMessage ?? "");
     const fd = md.fileMessageData ?? {};
     try {
       if (type === "imageMessage" || (type === "documentMessage" && /^image\//.test(String(fd.mimeType ?? "")))) {
         const caption = String(fd.caption ?? "").trim();
-        await this.enqueue({ kind: "image", id, url: fd.downloadUrl ? String(fd.downloadUrl) : undefined, caption });
-      } else if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
+        return await this.enqueue({ kind: "image", id, url: fd.downloadUrl ? String(fd.downloadUrl) : undefined, caption }, mark);
+      }
+      if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
         const text = String(md.textMessageData?.textMessage ?? md.extendedTextMessageData?.text ?? "").trim();
-        if (!text || (await this.command(chatId, text))) return;
-        await this.enqueue({ kind: "text", id, text });
+        if (text && !(await this.command(chatId, text))) return await this.enqueue({ kind: "text", id, text }, mark);
       } else if (NUDGE.has(type)) {
         await this.green.send(chatId, "Пришли фото задания.");
       } // реакции, правки, удаления: молча пропускаем
+      await this.db.put(mark);
     } catch (e: any) {
       console.log(this.hide(e?.stack ?? e));
+      await this.db.put(mark);
       await this.say(chatId, `⚠️ ${this.hide(e?.message ?? e)}`);
     }
-  }
-
-  private async seen(id: string): Promise<boolean> {
-    if (!id) return false;
-    const seen = (await this.db.get<string[]>("seen")) ?? [];
-    if (seen.includes(id)) return true;
-    await this.db.put("seen", [...seen, id].slice(-200));
-    return false;
   }
 
   private async options(): Promise<{ effort: Effort; fast: boolean }> {
@@ -190,33 +190,37 @@ export class Chat extends DurableObject<Env> {
     this.epoch++;
   }
 
-  private async enqueue(j: Pick<Job, "kind" | "id" | "url" | "caption" | "text">) {
+  private async enqueue(j: Pick<Job, "kind" | "id" | "url" | "caption" | "text">, mark: Record<string, unknown>) {
     if ((await this.db.list({ prefix: "job:", limit: MAX_QUEUE })).size >= MAX_QUEUE) throw new Error("Слишком много заданий в очереди. Подожди ответов или напиши «стоп».");
     const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
     const { effort } = await this.options();
     const job: Job = { ...j, at: Date.now(), phase: "solve", step: 0, tries: 0, effort, cont: false, sent: [], svgs: [], drawn: 0, msgs: 0, tokens: 0 };
-    await this.db.put({ seq, [`job:${String(seq).padStart(9, "0")}`]: job });
+    await this.db.put({ ...mark, seq, [`job:${String(seq).padStart(9, "0")}`]: job });
     await this.db.setAlarm(Date.now());
   }
 
   // ---------- будильник: один кусок работы ----------
   async alarm(): Promise<void> {
     if (this.running) {
-      // новое сообщение пришло, пока решается прошлое: оно дождётся очереди
+      // площадка обещает не запускать два будильника сразу; это страховка на случай, если всё же запустит
       await this.db.setAlarm(Date.now() + WATCHDOG / this.k);
       return;
     }
     this.running = true;
+    let beat: ReturnType<typeof setInterval> | undefined;
     try {
       const first = await this.db.list<Job>({ prefix: "job:", limit: 1 });
       const [key, job] = [...first][0] ?? [];
       if (!key || !job) return await this.selfTest();
       if (job.after && job.after > Date.now()) return; // пауза перед повтором ещё не прошла
-      await this.db.setAlarm(Date.now() + WATCHDOG / this.k);
+      const watch = () => this.db.setAlarm(Date.now() + WATCHDOG / this.k).catch((e) => console.log("watchdog:", String(e)));
+      await watch();
+      beat = setInterval(watch, BEAT / this.k);
       await this.run(key, job);
     } catch (e: any) {
       console.log("alarm:", this.hide(e?.stack ?? e));
     } finally {
+      clearInterval(beat);
       this.running = false;
       const next = await this.db.list<Job>({ prefix: "job:", limit: 1 });
       const job = [...next.values()][0];
@@ -380,9 +384,12 @@ export class Chat extends DurableObject<Env> {
     let failed = 0;
     const total = Math.min(job.svgs.length, MAX_DRAWINGS);
     for (let i = job.drawn; i < total; i++) {
-      job.drawn = i + 1; // если рисунок роняет рендер, при повторе идём к следующему
+      // если объект упал прямо на этом рисунке, даём ему ещё одну попытку и идём дальше
+      const tries = job.drawing?.i === i ? job.drawing.tries + 1 : 1;
+      job.drawing = { i, tries };
       await save();
       try {
+        if (tries > 2) throw new Error("рисунок дважды уронил рендер");
         let png = await renderPng(job.svgs[i]);
         if (png.length > 1_900_000) png = await renderPng(job.svgs[i], 800);
         const id = crypto.randomUUID().replace(/-/g, "");
@@ -393,6 +400,8 @@ export class Chat extends DurableObject<Env> {
         console.log("drawing:", this.hide(e));
         failed++;
       }
+      job.drawn = i + 1;
+      await save();
     }
     if (failed) await this.say(chatId, `(рисунков не получилось: ${failed})`);
     await this.finish(key, job, chatId);

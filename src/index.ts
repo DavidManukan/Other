@@ -1,9 +1,9 @@
 // Solver: фото задания в WhatsApp -> Claude -> ответ обратно в WhatsApp.
 // Cloudflare Worker. Вход только принимает вебхук и отдаёт задание объекту чата (src/chat.ts),
 // поэтому шлюз получает ответ сразу, а решение идёт в фоне сколько нужно.
-import { type Env, chatById, chatStub, config, hookKey } from "./config.ts";
+import { type Env, chatById, chatStub, config, hider, hookKey } from "./config.ts";
 import { STATUS } from "./chat.ts";
-import { sameSecret } from "./util.ts";
+import { esc, sameSecret } from "./util.ts";
 
 export { Chat } from "./chat.ts";
 
@@ -19,7 +19,14 @@ export default {
         return chat ? await chat.image(img.slice(64)) : new Response("no", { status: 404 });
       }
       if (url.pathname !== "/") return new Response("no", { status: 404 });
-      const html = await chatStub(env, STATUS).statusPage(url.origin);
+      let html: string;
+      try {
+        html = await chatStub(env, STATUS).statusPage(url.origin);
+      } catch (e) {
+        // фоновый объект не поднялся: показываем причину, а не пустую страницу ошибки Cloudflare
+        console.log("status:", String(e));
+        html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Solver</title><body style="font:18px/1.5 -apple-system,sans-serif;margin:16px"><h2>Solver: проверка</h2><p>❌ Фоновая часть бота не запустилась: ${esc(hider(config(env))(e)).slice(0, 300)}</p><p>Обнови страницу через минуту. Если не помогло, добавь в Variables and Secrets переменную REGION со значением weur.</p></body>`;
+      }
       return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
     }
     if (req.method !== "POST") return new Response("no", { status: 405 });
