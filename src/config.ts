@@ -3,6 +3,9 @@ import type { Chat } from "./chat.ts";
 
 export interface Env {
   CHAT: DurableObjectNamespace<Chat>;
+  BROWSER?: Fetcher; // браузер Cloudflare: снимает страницу с решением
+  PAGES?: string; // PAGES=0: всегда отвечать текстом, без картинок-страниц
+  SHOT?: string; // только для локальных тестов: mock вместо настоящего браузера
   ANTHROPIC_API_KEY?: string;
   GREEN_URL?: string;
   GREEN_ID?: string;
@@ -41,6 +44,7 @@ export interface Cfg {
   autoMax: number;
   region: string;
   owners: string[];
+  pages: boolean;
   missing: string[];
 }
 
@@ -63,6 +67,7 @@ export function config(env: Env): Cfg {
     autoMax: Number.isFinite(autoMax) && autoMax >= 0 ? Math.min(autoMax, 20) : 5,
     region: v("REGION", "eu").toLowerCase(),
     owners: v("OWNER").split(/[,;\s]+/).filter(Boolean),
+    pages: v("PAGES") !== "0",
     missing: (["ANTHROPIC_API_KEY", "GREEN_URL", "GREEN_ID", "GREEN_TOKEN"] as const).filter((k) => !v(k)),
   };
 }
@@ -78,6 +83,13 @@ export const hider = (c: Cfg) => (x: unknown): string =>
 export async function hookKey(c: Cfg): Promise<string> {
   if (!c.greenToken) return "";
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("solver:" + c.greenToken));
+  return [...new Uint8Array(d)].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Ключ личной ссылки на журнал событий. Отдельный от секрета вебхука: ссылка из чата не даёт слать боту сообщения.
+export async function logKey(c: Cfg): Promise<string> {
+  if (!c.greenToken) return "";
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("solver:log:" + c.greenToken));
   return [...new Uint8Array(d)].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 

@@ -7,12 +7,15 @@
     "dev": "wrangler dev",
     "check": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
-    "e2e": "node test/e2e.mjs"
+    "e2e": "node test/e2e.mjs",
+    "e2e:browser": "node test/browser.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.12.0",
+    "@cloudflare/puppeteer": "^2.0.1",
     "@resvg/resvg-wasm": "2.6.2",
-    "dejavu-fonts-ttf": "2.37.3"
+    "dejavu-fonts-ttf": "2.37.3",
+    "katex": "^0.16.47"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261123.1",

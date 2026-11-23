@@ -1,7 +1,7 @@
 // Solver: фото задания в WhatsApp -> Claude -> ответ обратно в WhatsApp.
 // Cloudflare Worker. Вход только принимает вебхук и отдаёт задание объекту чата (src/chat.ts),
 // поэтому шлюз получает ответ сразу, а решение идёт в фоне сколько нужно.
-import { type Env, chatById, chatStub, config, hider, hookKey, publicOrigin } from "./config.ts";
+import { type Env, chatById, chatStub, config, hider, hookKey, logKey, publicOrigin } from "./config.ts";
 import { STATUS } from "./chat.ts";
 import { esc, sameSecret } from "./util.ts";
 
@@ -26,7 +26,8 @@ export default {
       let html: string;
       try {
         // журнал событий показываем только по личной ссылке (она приходит в ответе на «ping»)
-        const priv = !!key && sameSecret(url.searchParams.get("k") ?? "", key);
+        const mine = await logKey(c);
+        const priv = !!mine && sameSecret(url.searchParams.get("k") ?? "", mine);
         html = await chatStub(env, STATUS).statusPage(origin, priv);
       } catch (e) {
         // фоновый объект не поднялся: показываем причину, а не пустую страницу ошибки Cloudflare

@@ -23,12 +23,12 @@ export class Green {
     this.hide = hider(c);
   }
 
-  async call(method: string, body?: unknown, ms = 10_000): Promise<any> {
+  async call(method: string, body?: unknown, ms = 10_000, query = ""): Promise<any> {
     const { greenUrl, greenId, greenToken } = this.c;
     if (!/^https?:\/\//.test(greenUrl)) throw new GreenError("GREEN_URL должен начинаться с https://", 400);
     let r: Response;
     try {
-      r = await fetch(`${greenUrl}/waInstance${greenId}/${method}/${greenToken}`, {
+      r = await fetch(`${greenUrl}/waInstance${greenId}/${method}/${greenToken}${query}`, {
         method: body === undefined ? "GET" : "POST",
         headers: body === undefined ? undefined : { "content-type": "application/json" },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -60,8 +60,27 @@ export class Green {
   }
 
   send(chatId: string, message: string, ms = 30_000): Promise<any> {
-    const text = message.length > 19_000 ? message.slice(0, 19_000) + "\n(обрезано)" : message;
-    return this.retry(() => this.call("sendMessage", { chatId, message: text, linkPreview: false }, ms));
+    return this.retry(() => this.call("sendMessage", { chatId, message: clip(message), linkPreview: false }, ms));
+  }
+
+  // Принял ли шлюз сообщение, на отправку которого мы не дождались ответа. Смотрим его журнал исходящих:
+  // если сообщение там есть, второй раз его не шлём. Не удалось узнать: считаем, что не принял (лучше дубль, чем потеря).
+  async wasSent(chatId: string, since: number, what: { text: string } | { file: string }): Promise<boolean> {
+    try {
+      const minutes = Math.min(1440, Math.ceil((Date.now() - since) / 60_000) + 2);
+      const list = await this.call("lastOutgoingMessages", undefined, 10_000, `?minutes=${minutes}`);
+      if (!Array.isArray(list)) return false;
+      const from = Math.floor(since / 1000) - 5;
+      const head = (s: unknown) => String(s ?? "").trim().slice(0, 200);
+      return list.some((m: any) => {
+        if (m?.chatId !== chatId || Number(m.timestamp) < from) return false;
+        if ("file" in what) return String(m.fileName ?? "") === what.file;
+        return head(m.textMessage ?? m.extendedTextMessage?.text) === head(clip(what.text));
+      });
+    } catch (e) {
+      console.log("журнал исходящих не открылся:", this.hide(e));
+      return false;
+    }
   }
 
   // Адрес для загрузки файлов: в консоли GREEN-API это mediaUrl (apiUrl с «media» вместо «api»)
@@ -76,27 +95,32 @@ export class Green {
     }
   }
 
-  // Рисунок. Сначала загружаем файл прямо в шлюз: так сразу видно, принял он его или нет.
+  // Картинка (страница решения или рисунок). Сначала загружаем файл прямо в шлюз: так сразу видно, принял он его или нет.
   // Если загрузка не удалась, шлюз забирает картинку сам по ссылке на воркер.
-  async sendImage(chatId: string, png: Uint8Array, url: string): Promise<void> {
+  // name: имя файла, своё у каждой картинки: по нему потом видно в журнале шлюза, дошла ли она.
+  async sendImage(chatId: string, image: Uint8Array, url: string, name: string, caption = ""): Promise<void> {
     const media = this.mediaUrl();
+    const type = /\.jpe?g$/i.test(name) ? "image/jpeg" : "image/png";
     if (media && Date.now() > Green.uploadOffUntil) {
       try {
         const form = new FormData();
         form.append("chatId", chatId);
-        form.append("fileName", "risunok.png");
-        form.append("file", new Blob([png], { type: "image/png" }), "risunok.png");
+        form.append("fileName", name);
+        if (caption) form.append("caption", caption);
+        form.append("file", new Blob([image], { type }), name);
         const r = await fetch(`${media}/waInstance${this.c.greenId}/sendFileByUpload/${this.c.greenToken}`, { method: "POST", body: form, signal: AbortSignal.timeout(45_000) });
         const t = await r.text();
         if (!r.ok) throw new Error(`${r.status} ${this.hide(t).slice(0, 150)}`);
         Green.uploadFails = 0;
         return;
       } catch (e: any) {
-        console.log("загрузка рисунка не удалась, отправляю по ссылке:", this.hide(e?.message ?? e));
+        // Ответа не дождались: файл мог уйти. По ссылке следом не шлём, иначе картинка придёт дважды.
+        if (e?.name === "TimeoutError") throw new GreenError("GREEN-API sendFileByUpload: не ответил за 45 с", undefined, true);
+        console.log("загрузка картинки не удалась, отправляю по ссылке:", this.hide(e?.message ?? e));
         if (++Green.uploadFails >= 2) Green.uploadOffUntil = Date.now() + 600_000; // не тратим время на заведомо неудачные попытки
       }
     }
-    await this.retry(() => this.call("sendFileByUrl", { chatId, urlFile: url, fileName: "risunok.png" }, 20_000));
+    await this.retry(() => this.call("sendFileByUrl", { chatId, urlFile: url, fileName: name, ...(caption ? { caption } : {}) }, 20_000));
   }
   private static uploadFails = 0;
   private static uploadOffUntil = 0;
@@ -104,8 +128,13 @@ export class Green {
   // Фото задания. Больше max байт не читаем: огромный файл не должен уронить бота.
   async photo(chatId: string, idMessage: string, url: string | undefined, until: number, max: number): Promise<Uint8Array> {
     const load = async (u: string) => {
-      const r = await fetch(u, { signal: AbortSignal.timeout(Math.min(20_000, left(until))) });
-      if (!r.ok) throw new Error(`фото не скачалось: ${r.status}`);
+      let r: Response;
+      try {
+        r = await fetch(u, { signal: AbortSignal.timeout(Math.min(20_000, left(until))) });
+      } catch (e: any) {
+        throw new GreenError("фото не скачалось: нет связи", undefined, e?.name === "TimeoutError");
+      }
+      if (!r.ok) throw new GreenError(`фото не скачалось: ${r.status}`, r.status);
       if (Number(r.headers.get("content-length")) > max) throw new TooBig();
       const parts: Uint8Array[] = [];
       let size = 0;
@@ -128,9 +157,13 @@ export class Green {
       }
     }
     const j = await this.call("downloadFile", { chatId, idMessage }, Math.min(15_000, left(until)));
-    if (!j?.downloadUrl) throw new Error("GREEN-API не дал ссылку на фото");
+    if (!j?.downloadUrl) throw new GreenError("GREEN-API не дал ссылку на фото", 404);
     return await load(j.downloadUrl);
   }
 }
 
 export class TooBig extends Error {}
+
+export const CAPTION_MAX = 1000; // подпись к картинке: у шлюза предел 1024 знака
+// Длиннее шлюз не принимает
+export const clip = (message: string) => (message.length > 19_000 ? message.slice(0, 19_000) + "\n(обрезано)" : message);

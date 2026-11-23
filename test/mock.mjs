@@ -4,7 +4,8 @@ import http from "node:http";
 export const calls = []; // всё, что бот отправил «в WhatsApp»
 export const claude = []; // тела запросов к «Claude»
 export const settings = { webhookUrl: "", incomingWebhook: "no" };
-export const flags = { uploadBroken: false, sendDown: "", send466: "", noFable: false }; // тест может «сломать» шлюз: загрузку файлов или отправку в чат
+// тест может «сломать» шлюз: загрузку файлов, отправку в чат, ответ на отправку (сообщение ушло, а ответа нет), выдачу фото
+export const flags = { uploadBroken: false, sendDown: "", send466: "", sendHang: "", photoDown: 0, noFable: false };
 // Большое фото (2,5 МБ): проверяем, что оно без потерь переживает хранение по частям
 export const BIG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from(Uint8Array.from({ length: 2_500_000 }, (_, i) => (i * 31 + (i >> 8)) & 255))]);
 const counters = new Map();
@@ -32,7 +33,8 @@ function sse(res, events, { gap = 5 } = {}) {
   next();
 }
 
-function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks = [], container } = {}) {
+function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks = [], container, after = "" } = {}) {
+  if (after) return notes(text, blocks, after, model);
   const ev = [
     { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", model: model ?? "claude-fable-5-2", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1200, output_tokens: 1 } } },
     { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
@@ -54,7 +56,22 @@ function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks =
   return { ev, gap };
 }
 
-export const CONT = "Продолжай с того места, где остановился. Уже написанное не повторяй.";
+// текст-заметка, проверка в песочнице, потом настоящий ответ
+function notes(before, blocks, after, model) {
+  const ev = [{ type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", model: model ?? "claude-fable-5-2", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1200, output_tokens: 1 } } }];
+  let index = 0;
+  const say = (text) => {
+    ev.push({ type: "content_block_start", index, content_block: { type: "text", text: "" } }, { type: "content_block_delta", index, delta: { type: "text_delta", text } }, { type: "content_block_stop", index });
+    index++;
+  };
+  say(before);
+  for (const block of blocks) (ev.push({ type: "content_block_start", index, content_block: block }, { type: "content_block_stop", index }), index++);
+  say(after);
+  ev.push({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 345 } }, { type: "message_stop" });
+  return { ev, gap: 5 };
+}
+
+export const CONT = "Ответ оборвался. Продолжай со следующей строки после уже написанного: написанное не повторяй, незаконченный рисунок начни заново целиком.";
 export const NUDGE = "Теперь напиши готовый ответ целиком, по формату.";
 // пересчёт кодом в песочнице: так его видит клиент
 const CHECK = [
@@ -101,12 +118,13 @@ function anthropic(req, res, body) {
   if (scenario === "S_REFUSE") return send("", { stop: "refusal" });
   if (scenario === "S_REFMID") return send("№1\nОтвет: 5\n@@@\n№2\nначало", { stop: "refusal" });
   if (scenario === "S_CUT" && text !== CONT) return send("№1\nx^2 = 16\nОтвет: 4\n@@@\n№2\nначало решения, которое не помести", { stop: "max_tokens" });
-  if (scenario === "S_CUT") return send("лось в первый кусок.\nОтвет: 7 см2");
+  if (scenario === "S_CUT") return send("начало решения, которое не поместилось в первый кусок.\nОтвет: 7 см2");
   if (scenario === "S_WAIT") return send("№1\nОтвет: 42", { think: 2500 });
   if (scenario === "S_HELLO") return send("№1\nОтвет: 42", { think: 4500 });
   if (scenario === "S_LONG" || (scenario === "S_CRASH" && n === 1)) return send("№1\nОтвет: 1\n@@@\n" + "очень длинное решение ".repeat(400), { gap: 40 });
   if (scenario === "S_CRASH") return send("№1\nОтвет: 9");
   if (scenario === "S_MANY") return send(Array.from({ length: 45 }, (_, i) => `№${i + 1}\nОтвет: ${i}`).join("\n@@@\n"), { gap: 1 });
+  if (scenario === "S_LONGCARD") return send(Array.from({ length: 30 }, (_, i) => `№${i + 1}\nОтвет: значение номер ${i} получилось таким, как и ожидалось`).join("\n@@@\n"), { gap: 1 });
   if (scenario === "S_HUGE") return send(Array.from({ length: 30 }, (_, i) => `№${i + 1}\n${"строка решения с выкладками\n".repeat(22)}Ответ: ${i}`).join("\n@@@\n"), { gap: 1 });
   if (scenario === "S_PAUSE") {
     // пересчёт затянулся: ход приходит с pause_turn, его нужно продолжить тем же сообщением и в том же контейнере
@@ -123,7 +141,11 @@ function anthropic(req, res, body) {
     for (const ev of m) if (typeof ev !== "number") res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
     return setTimeout(() => res.destroy(), 200);
   }
-  if (scenario === "S_DROP") return send(" решена\nОтвет: 20");
+  if (scenario === "S_DROP") return send("половина решена\nОтвет: 20");
+  if (scenario === "S_TEX") return send("№1\nДано:\n$AB = 6$ см\nНайти: $x$\nРешение:\n$x^2 = \\dfrac{9}{4}$ | $\\cdot 4$\n$x = \\pm \\dfrac{3}{2}$\nОтвет: $x = \\pm \\dfrac{3}{2}$.\n@@@\n№2\nH2SO4 и $v_0 = 5$ м/с\nОтвет: $\\sqrt{34}$ см\n@@@\n№3\nОтвет: $x \\in (2; 4]$\n@@@\n" + SVG);
+  if (scenario === "S_NOSHOT") return send("№1\nSHOT_FAIL\n$x^2 = 9$\nОтвет: $3$\n@@@\n" + SVG);
+  if (scenario === "S_SHOTQ") return send("№1\nSHOT_QUOTA\nОтвет: $\\dfrac{1}{2}$");
+  if (scenario === "S_NOTES") return send("Проверю вычисления в песочнице.", { blocks: CHECK, after: "№1\nОтвет: 31" });
   // обычный ответ: два задания и рисунок в конце
   return send(ANSWER);
 }
@@ -136,18 +158,26 @@ function green(req, res, method, body) {
   if (method === "getStateInstance") return json({ stateInstance: "authorized" });
   if (method === "getSettings") return json(settings);
   if (method === "setSettings") return (Object.assign(settings, body), json({ saveSettings: true }));
-  if (method === "downloadFile") return json({ downloadUrl: `http://127.0.0.1:${PORT}/photo.jpg` });
+  if (method === "downloadFile") {
+    if (flags.photoDown > 0) return (res.writeHead(503), res.end("storage is down"));
+    return json({ downloadUrl: `http://127.0.0.1:${PORT}/photo.jpg` });
+  }
+  if (method === "lastOutgoingMessages") {
+    // журнал исходящих: всё, что шлюз принял
+    return json(calls.filter((c) => c.chatId).map((c) => ({ type: "outgoing", chatId: c.chatId, timestamp: Math.floor(c.at / 1000), typeMessage: c.text !== undefined ? "extendedTextMessage" : "imageMessage", textMessage: c.text, fileName: c.fileName, caption: c.caption })));
+  }
   if (method === "sendMessage") {
     if (flags.sendDown && body.chatId.startsWith(flags.sendDown)) return (res.writeHead(503), res.end("gateway is down"));
     if (flags.send466 && body.chatId.startsWith(flags.send466)) return (res.writeHead(466), res.end(JSON.stringify({ invokeStatus: { method: "sendMessage", used: 3, total: 3, status: "QUOTE_ALLOWED_EXCEEDED" } })));
     calls.push({ method, at: Date.now(), chatId: body.chatId, text: body.message });
+    if (flags.sendHang && body.chatId.startsWith(flags.sendHang) && !/^(📥|➕)/.test(body.message)) return; // сообщение принято, а ответа шлюз так и не дал
     return json({ idMessage: "OUT" + calls.length });
   }
   if (method === "sendFileByUrl") {
     // как настоящий шлюз: сам забирает картинку по ссылке
     return fetch(body.urlFile).then(async (r) => {
       const b = Buffer.from(await r.arrayBuffer());
-      calls.push({ method, at: Date.now(), chatId: body.chatId, url: body.urlFile, status: r.status, type: r.headers.get("content-type"), png: b.subarray(0, 4).toString("hex") === "89504e47", bytes: b.length, body: b });
+      calls.push({ method, at: Date.now(), chatId: body.chatId, url: body.urlFile, fileName: body.fileName, caption: body.caption, status: r.status, type: r.headers.get("content-type"), png: b.subarray(0, 4).toString("hex") === "89504e47", bytes: b.length, body: b });
       json({ idMessage: "OUT" + calls.length });
     }, (e) => {
       calls.push({ method, error: String(e) });
@@ -165,7 +195,7 @@ async function upload(req, res, bytes) {
   const form = await new Response(bytes, { headers: { "content-type": req.headers["content-type"] } }).formData();
   const file = form.get("file");
   const b = Buffer.from(await file.arrayBuffer());
-  calls.push({ method: "sendFileByUpload", at: Date.now(), chatId: form.get("chatId"), fileName: form.get("fileName"), type: file.type, png: b.subarray(0, 4).toString("hex") === "89504e47", bytes: b.length, body: b });
+  calls.push({ method: "sendFileByUpload", at: Date.now(), chatId: form.get("chatId"), fileName: form.get("fileName"), caption: form.get("caption") ?? undefined, type: file.type, png: b.subarray(0, 4).toString("hex") === "89504e47", bytes: b.length, body: b });
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ idMessage: "OUT" + calls.length, urlFile: "https://example.invalid/file.png" }));
 }
@@ -186,6 +216,12 @@ export function start(port) {
         body = raw;
       }
       const url = new URL(req.url, "http://x");
+      if (url.pathname === "/flaky.jpg") {
+        // хранилище шлюза временно не отдаёт файл
+        if (flags.photoDown > 0) return (flags.photoDown--, res.writeHead(503), res.end("storage is down"));
+        res.writeHead(200, { "content-type": "image/jpeg" });
+        return res.end(Buffer.concat([JPEG, Buffer.from([7, 7, 7])]));
+      }
       if (url.pathname === "/photo.jpg") {
         res.writeHead(200, { "content-type": "image/jpeg" });
         return res.end(JPEG);

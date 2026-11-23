@@ -127,6 +127,13 @@ export async function ask(c: Cfg, o: AskOptions): Promise<Answer> {
         continue;
       }
       const off = disabled.get(model) ?? new Set<Feature>();
+      // у fast-режима свой, меньший лимит запросов: если упёрлись в него, этот запрос идёт на обычной скорости
+      const spend = e instanceof Anthropic.RateLimitError && (e.errorCode === "enforced_spend_limit_reached" || e.errorCode === "contract_spend_limit_reached");
+      if (o.fast && !off.has("speed") && !spend && e instanceof Anthropic.APIError && (e.status === 429 || e.status === 529)) {
+        console.log("fast: лимит или перегрузка, повторяю на обычной скорости");
+        o = { ...o, fast: false };
+        continue;
+      }
       const next = blamed(e, o, c, off);
       if (!next) {
         restore();
@@ -140,15 +147,28 @@ export async function ask(c: Cfg, o: AskOptions): Promise<Answer> {
   }
 }
 
-const textOf = (content: Content) => content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
 const has = (content: Content, type: string) => content.some((b) => (b.type as string) === type);
+const isTool = (type: string) => type === "server_tool_use" || type.endsWith("_tool_result");
+const texts = (content: Content) => content.flatMap((b) => (b.type === "text" && b.text.trim() ? [b.text] : []));
+// Часть хода после перехода на запасную модель (всё, что было до него, запасная модель переписывает заново)
+const tail = (content: Content) => content.slice(content.map((b) => b.type as string).lastIndexOf("fallback") + 1);
+// Готовый ответ: текст после последнего обращения к песочнице. Заметки, которые модель писала между
+// проверками («сейчас пересчитаю»), читателю не нужны. У Fable 5.2 они и так уходят в размышления,
+// а запасные модели пишут их обычным текстом.
+export function answerText(content: Content): string {
+  const t = tail(content);
+  const lastTool = t.reduce((k, b, i) => (isTool(b.type as string) ? i : k), -1);
+  return texts(t.slice(lastTool + 1)).join("");
+}
+// Весь текст хода: если после проверок модель ничего не написала, ответ мог остаться перед ними
+export const allText = (content: Content): string => texts(tail(content)).join("\n\n");
 
 // Один ход модели. Пересчёт в песочнице идёт на стороне Anthropic; если он затянулся, ход приходит
 // с пометкой pause_turn, и его нужно продолжить, вернув модели её же сообщение без изменений.
 async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
   let messages = o.messages;
   let container: string | undefined;
-  let out = "";
+  const blocks: Content = []; // всё, что модель написала за этот ход, по порядку
   let checks = 0;
   let nudged = false;
   const tokens = { in: 0, out: 0 };
@@ -158,18 +178,23 @@ async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
       r = await attempt(c, model, o, messages, container);
     } catch (e) {
       // срок вышел или Claude отвалился уже после того, как часть ответа написана: её не теряем
-      if ((e instanceof Timeout || e instanceof Busy) && out.trim()) return { text: out, cut: true, refused: false, tokens, model, checks };
+      const sofar = answerText(blocks);
+      if ((e instanceof Timeout || e instanceof Busy) && sofar.trim()) return { text: sofar, cut: true, refused: false, tokens, model, checks };
       throw e;
     }
-    out += r.text;
     tokens.in += r.tokens.in;
     tokens.out += r.tokens.out;
-    if (!r.msg) return { text: out, cut: true, refused: false, tokens, model, checks };
+    // поток оборвался на полуслове: берём написанное после последней проверки
+    if (!r.msg) return { text: r.fresh ? r.text : answerText(blocks) + r.text, cut: true, refused: false, tokens, model, checks };
     const msg = r.msg;
+    blocks.push(...msg.content);
     checks += msg.content.filter((b) => b.type === "server_tool_use").length;
+    const out = answerText(blocks);
+    // pause_turn здесь значит «ход не закончен»: если продолжить его нельзя, ответ считается оборванным
+    const cut = msg.stop_reason === "max_tokens" || msg.stop_reason === "model_context_window_exceeded" || msg.stop_reason === "pause_turn";
     const done: Answer = {
-      text: out,
-      cut: msg.stop_reason === "max_tokens" || msg.stop_reason === "model_context_window_exceeded",
+      text: cut ? out : out || allText(blocks),
+      cut,
       refused: msg.stop_reason === "refusal",
       tokens,
       model: msg.model,
@@ -198,7 +223,8 @@ async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
 }
 
 interface Attempt {
-  text: string;
+  text: string; // если поток оборвался: текст, написанный после последней проверки в этом потоке
+  fresh?: boolean; // в оборванном потоке была проверка: текст прошлых кругов к ответу уже не относится
   tokens: { in: number; out: number };
   msg?: Anthropic.Beta.BetaMessage; // нет, если ответ оборвался на полуслове
 }
@@ -238,22 +264,27 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   o.stop?.addEventListener("abort", interrupt);
 
   let out = "";
+  let fresh = false;
   let opened = false; // поток открылся: модель приняла запрос и начала работать
   try {
     const stream = client(c).beta.messages.stream(params, { signal: ctrl.signal });
     for await (const ev of stream) {
       opened = true;
       if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") out += ev.delta.text;
+      else if (ev.type === "content_block_start" && (isTool(ev.content_block.type as string) || (ev.content_block.type as string) === "fallback")) {
+        out = ""; // всё, что было написано до проверки, это заметки, а не ответ
+        fresh = true;
+      }
     }
     const msg = await stream.finalMessage();
-    return { text: textOf(msg.content) || out, tokens: { in: msg.usage.input_tokens, out: msg.usage.output_tokens }, msg };
+    return { text: "", tokens: { in: msg.usage.input_tokens, out: msg.usage.output_tokens }, msg };
   } catch (e) {
     // «стоп» или новое фото: причину решает вызывающий
     if (o.stop?.aborted) throw o.stop.reason instanceof Error ? o.stop.reason : new Stopped("стоп");
     // Срок вышел или связь оборвалась посреди ответа: написанное не теряем, остальное в следующем куске
     if (out.trim()) {
       console.log("ответ оборван:", e instanceof Error ? e.message : String(e));
-      return { text: out, tokens: { in: 0, out: 0 } };
+      return { text: out, fresh, tokens: { in: 0, out: 0 } };
     }
     // Срок вышел. Если модель всё это время думала, следующую попытку делаем на ступень проще.
     // Если поток так и не открылся (очередь у Claude, зависшее соединение), модель ни при чём: просто повтор.

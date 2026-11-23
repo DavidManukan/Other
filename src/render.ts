@@ -13,7 +13,7 @@ export async function renderPng(svg: string, width = 1200): Promise<Uint8Array> 
   const r = new Resvg(fixSvg(svg), {
     font: { fontBuffers: [new Uint8Array(font)], defaultFontFamily: "DejaVu Sans", loadSystemFonts: false },
     fitTo: { mode: "width", value: width },
-    background: "#171717",
+    background: "#000000",
   });
   try {
     const img = r.render();
