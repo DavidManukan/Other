@@ -5,7 +5,7 @@ import katex from "katex";
 import "katex/contrib/mhchem"; // химическая запись \ce{…}, если модель всё же напишет формулу так
 import { fixSvg } from "./svg.ts";
 import { mathSpans, stripTex, texToPlain } from "./tex.ts";
-import { answerAt, HEAD as TASK_HEAD, prettyMath } from "./text.ts";
+import { answerAt, HEAD as TASK_HEAD, prettyMath, sheetContext } from "./text.ts";
 import { esc } from "./util.ts";
 
 export const PAGE_W = 560; // ширина страницы в точках CSS
@@ -23,6 +23,9 @@ const sound = (html: string) => {
   return html;
 };
 const REL = /^(?:=|<|>|\\(?:le|leq|leqslant|ge|geq|geqslant|ne|neq|approx|equiv|sim|Rightarrow|Leftrightarrow|implies|iff)(?![A-Za-z]))/;
+
+// Задание про электронную таблицу: в его строках C2 и A1 это ячейки, индексы у них не ставятся. Выставляется на время разбора задания.
+let sheet = false;
 
 // Формулу делим на куски по знакам отношения верхнего уровня (=, <, ≤, ⇒ …): длинная цепочка равенств
 // переносится на странице перед знаком, а не посреди скобки или модуля.
@@ -58,7 +61,8 @@ export function chunks(src: string): string[] {
 
 // Формула: KaTeX пишет готовый HTML. Не разобралась (опечатка модели): показываем её обычным текстом.
 export function tex(src: string): string {
-  const clean = src.replace(/\\tag\*?\{[^{}]*\}/g, ""); // номера формул на странице не нужны
+  const clean = src.replace(/\\tag\*?\{[^{}]*\}/g, "") // номера формул на странице не нужны
+    .replace(/\\(?:sfrac|nicefrac)(?![A-Za-z])/g, "\\frac"); // таких дробей KaTeX не знает, рисуем обычной
   const one = (s: string) => sound(katex.renderToString(`\\displaystyle ${s}`, KATEX));
   try {
     // .f: формула целиком. Она не рвётся, пока помещается в строку; не помещается: переносится между кусками .fx
@@ -70,7 +74,7 @@ export function tex(src: string): string {
       try {
         return sound(katex.renderToString(clean, { ...KATEX, displayMode: true })); // окружения вроде align живут только в выключной формуле
       } catch {
-        return `<span class="raw">${esc(prettyMath(stripTex(texToPlain(src))))}</span>`;
+        return `<span class="raw">${esc(prettyMath(stripTex(texToPlain(src)), sheet || undefined))}</span>`;
       }
     }
   }
@@ -79,7 +83,7 @@ export function tex(src: string): string {
 // Строка с формулами $…$ -> HTML
 export function inline(text: string): string {
   // вне формул разметки быть не должно: что осталось (знак $ без пары, команда без $), переводится в обычные знаки
-  return mathSpans(text).map((s) => (s.math ? tex(s.body) : esc(prettyMath(stripTex(s.body))))).join("");
+  return mathSpans(text).map((s) => (s.math ? tex(s.body) : s.lit ? esc(s.body) : esc(prettyMath(stripTex(s.body), sheet || undefined)))).join("");
 }
 
 // Пометка справа от преобразования: «выражение | что сделали». Черту ищем только вне формул.
@@ -93,7 +97,12 @@ function annotated(line: string): [string, string] | null {
       at = i;
     }
   }
-  return at < 0 ? null : [line.slice(0, at).trimEnd(), line.slice(at + 1).trim()];
+  if (at < 0) return null;
+  const left = line.slice(0, at).trimEnd(), right = line.slice(at + 1).trim();
+  // Пометка справа короткая («·2», «раскрываем скобки»). Длинный хвост или черта внутри скобок («P(A | B)») это обычный текст:
+  // строкой с пометкой он стал бы узкой колонкой, которую нельзя разрезать по листам
+  if (right.length > 70 || left.split("(").length > left.split(")").length) return null;
+  return [left, right];
 }
 
 const row = (line: string): string => {
@@ -122,6 +131,14 @@ function figure(svg: string, own: boolean): string {
 
 // Одно задание -> HTML. figs: рисунки этого задания
 export function taskHtml(part: string, figs: Fig[]): string {
+  sheet = sheetContext(part);
+  try {
+    return taskBody(part, figs);
+  } finally {
+    sheet = false;
+  }
+}
+function taskBody(part: string, figs: Fig[]): string {
   const lines = part.split("\n");
   const out: string[] = [];
   let title = "";
@@ -199,7 +216,7 @@ export function taskHtml(part: string, figs: Fig[]): string {
   }
   place();
   // заголовок продолжения на следующих листах PAGINATE пишет текстом: формулы в нём уже переведены в обычные знаки
-  return `<section class="task" data-title="${esc(prettyMath(stripTex(texToPlain(title))))}">${out.join("")}</section>`;
+  return `<section class="task" data-title="${esc(prettyMath(stripTex(texToPlain(title)), sheet || undefined))}">${out.join("")}</section>`;
 }
 
 export interface Fig {
@@ -302,6 +319,7 @@ export const PAGINATE = `(() => {
   }
   // 3. Подписи на рисунке. Буква, которая легла на линию или на соседнюю подпись, сдвигается на ближайшее свободное место.
   for (const svg of flow.querySelectorAll(".fig svg")) {
+   try { // рисунок с вырожденным преобразованием (scale(0)) оставляем как есть: ошибка здесь стоила бы всех страниц ответа
     const area = svg.getBoundingClientRect();
     if (!area.width || !area.height) continue;
     const aside = (el) => el.closest("defs, marker, clipPath, mask, pattern, symbol");
@@ -348,9 +366,10 @@ export const PAGINATE = `(() => {
     const glyphs = (t) => { const r = t.getBoundingClientRect(); return { l: r.left, r: r.right, t: r.top + r.height * 0.16, b: r.bottom - r.height * 0.14 }; };
     const texts = [...svg.querySelectorAll("text")].filter((t) => !aside(t) && t.textContent.trim() && t.getBoundingClientRect().width > 0);
     const boxes = texts.map(glyphs);
-    const hits = (b, pad) => {
+    // floor: линии, нарисованные не позже фигуры с этим номером, не считаются
+    const hitsFrom = (b, pad, floor) => {
       let n = 0;
-      for (const p of pts) if (p[0] > b.l - pad - p[2] && p[0] < b.r + pad + p[2] && p[1] > b.t - pad - p[2] && p[1] < b.b + pad + p[2]) n++;
+      for (const p of pts) if (p[3] > floor && p[0] > b.l - pad - p[2] && p[0] < b.r + pad + p[2] && p[1] > b.t - pad - p[2] && p[1] < b.b + pad + p[2]) n++;
       return n;
     };
     const over = (b, i, pad) => {
@@ -363,12 +382,17 @@ export const PAGINATE = `(() => {
     };
     texts.forEach((t, i) => {
       const b = boxes[i], cs = getComputedStyle(t);
+      // Буква на чёрной фигуре (прибор V в цепи, группа атомов на конце связи) стоит там нарочно: линии, нарисованные до фигуры,
+      // ей не мешают, даже где широкая подпись выходит за край кружка. Мешает только линия, проведённая поверх фигуры позже
+      // (радиус в закрашенном круге).
+      let floor = 0;
+      try { for (const c of covers) if (c.order > floor && inFill(c, (b.l + b.r) / 2, (b.t + b.b) / 2)) floor = c.order; } catch (e) {}
+      const hits = (box, pad) => hitsFrom(box, pad, floor);
       const now = hits(b, -1) + over(b, i, 0) / 9;
       // три точки это около сантиметра линии под буквой; касание краем (связь в формуле, выноска) не в счёт
       if (hits(b, -1) < 3 && over(b, i, 0) < (b.r - b.l) * (b.b - b.t) * 0.15) return;
       if (cs.paintOrder.indexOf("stroke") === 0 && cs.stroke !== "none") return; // у подписи своя обводка, линия под ней закрыта
       if (plates.some((r) => r.left <= b.l + 1 && r.right >= b.r - 1 && r.top <= b.t + 1 && r.bottom >= b.b - 1)) return;
-      try { if (covers.some((c) => inFill(c, (b.l + b.r) / 2, (b.t + b.b) / 2))) return; } catch (e) {}
       let best = null;
       for (const d of [5, 8, 12, 16, 21, 27]) {
         for (let a = 0; a < 16; a++) {
@@ -389,6 +413,7 @@ export const PAGINATE = `(() => {
       t.setAttribute("data-moved", "1");
       boxes[i] = glyphs(t);
     });
+   } catch (e) {}
   }
   // 4. У рисунка убираем пустые полосы сверху и снизу: холст обрезается по тому, что на нём нарисовано
   for (const svg of flow.querySelectorAll(".fig svg")) {
@@ -432,10 +457,10 @@ export const PAGINATE = `(() => {
         }
         if (node.nodeType !== 3) continue;
         const text = node.data;
-        const re = pre ? /\\n(?=[^\\n])/g : /\\s+(?=\\S)/g;
+        const re = pre ? /\\n(?=[^\\n])|[ \\t]+(?=\\S)/g : /\\s+(?=\\S)/g;
         for (let m; (m = re.exec(text)); ) {
           const off = m.index + m[0].length;
-          const s = pre || (off === m[0].length ? stop : /[.!?…;]$/.test(text.slice(0, m.index)));
+          const s = pre ? m[0][0] === "\\n" : (off === m[0].length ? stop : /[.!?…;]$/.test(text.slice(0, m.index)));
           range.setStart(node, off);
           range.setEnd(node, off + 1);
           const y = topOf(range.getClientRects());

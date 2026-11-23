@@ -3,6 +3,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Cfg, Effort } from "./config.ts";
 import { PROMPT } from "./prompt.ts";
+import { plainText } from "./text.ts";
 import { left } from "./util.ts";
 
 export class Timeout extends Error {} // время куска вышло, а модель ещё ничего не написала
@@ -241,41 +242,60 @@ export const allText = (content: Content): string => texts(content).join("\n\n")
 // Что решила основная модель по замечаниям проверяющего. body: решение, которое уже отправлено человеку.
 // Ошибиться здесь можно в обе стороны, и обе плохи: прислать «исправление» к верному ответу или подтвердить неверный.
 // Поэтому всё неоднозначное это null: запрос повторяется (число попыток ограничено), и в чат ничего лишнего не уходит.
+// 0. Ответ оборван или модель отказалась: ни подтвердить, ни исправить по нему нельзя.
 // 1. Итоговое слово (текст после последнего пересчёта кодом) содержит целое задание с ответом, которого в отправленном
-//    решении не было: это исправление. Строки согласия по другим заданиям («В №1 всё верно») из него убираются.
-// 2. Итоговое слово это согласие («ВСЁ ВЕРНО» без «не» перед ним), и по ходу модель не получила ни одного ответа,
+//    решении не было, и отдельной строки «ВСЁ ВЕРНО» в нём нет: это исправление. Строки вроде «В №1 всё верно» из него убираются.
+// 2. В итоговом слове есть строка согласия без оговорок, и по ходу модель не получила ни одного ответа,
 //    которого нет в отправленном решении: решение устояло. Повтор прежнего ответа рядом с согласием это тоже согласие.
-// 3. Согласия нет, но раньше в ходе есть целое задание с новым ответом (после него модель только пересчитала кодом): исправление.
-// 4. Оборванный ответ, отказ, согласие вперемешку с другим ответом, заметка без задания: null.
-const AGREE = /(?<![а-яё])вс[её]\s+верно(?![а-яё])/gi;
-const agrees = (s: string) => [...s.matchAll(AGREE)].some((m) => !/(^|[^а-яё])не[\s,:—–-]*$/i.test(s.slice(0, m.index)));
+// 3. Задание переписано, а ответы прежние: исправлять нечего.
+// 4. Согласия нет, но раньше в ходе есть целое задание с новым ответом (после него модель только пересчитала кодом): исправление.
+// Ответы сравниваются по смыслу записи: «0,5» и «1/2», «4 см²» и «S = 4 см^2», ответ с единицей и без неё считаются одним ответом.
+const PHRASE = /(?<![а-яё])вс[её]\s+верно[\s.!*]*$/i;
+// Согласие это строка, которая кончается словами «всё верно» и не содержит оговорок («не», «кроме», «вроде») и номера задания:
+// «В №1 всё верно» говорит об одном задании, а не обо всём решении
+const HEDGE = /(^|[^а-яё])(не|кроме|но|возможно|вроде|почти|если|наверное|кажется)(?![а-яё])|№|задани|задач|вариант|пункт/i;
+const agrees = (s: string) => s.split("\n").some((l) => {
+  const m = PHRASE.exec(l);
+  return !!m && !HEDGE.test(l.slice(0, m.index));
+});
 const TASK = /^\s*(?:[^·\n]{1,30}·\s*){0,2}(?:№\s*\S+|(?:Задание|Задача|Вариант)\s+\d\S*)/; // заголовок задания, а не фраза «Вариант с ошибкой проверен»
 const whole = (text: string) => text.split(/^[ \t]*@@@.*$/m).some((t) => {
   const rows = t.split("\n");
   const head = rows.findIndex((r) => TASK.test(r));
   return head >= 0 && rows.findLastIndex((r) => /^[ \t]*Ответ:/.test(r)) > head;
 });
-const squeeze = (s: string) => s.replace(/[\s$]/g, "").replace(/[.;]+$/, "").toLowerCase();
+// Ответ в виде, удобном для сравнения: без разметки и пробелов, десятичная запятая как точка, без «S =» в начале
+const squeeze = (s: string) => plainText(s).replace(/\s/g, "").replace(/(\d),(\d)/g, "$1.$2").replace(/−/g, "-").replace(/[.;]+$/, "").toLowerCase().replace(/^[a-zа-яё][a-zа-яё0-9₀-₉()]*=/, "");
+// Число в начале ответа и единица после него: «0.5м/с» -> [0.5, «м/с»], «1/2» -> [0.5, «»]. Не число: null
+function value(x: string): [number, string] | null {
+  const m = /^(-?\d+(?:\.\d+)?)(?:\/(\d+(?:\.\d+)?))?/.exec(x);
+  if (!m || /\d/.test(x.slice(m[0].length))) return null;
+  return [m[2] ? Number(m[1]) / Number(m[2]) : Number(m[1]), x.slice(m[0].length)];
+}
+function same(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  if (short && long.startsWith(short) && !/\d/.test(long.slice(short.length))) return true; // тот же ответ, у одного дописана единица
+  const x = value(a), y = value(b);
+  return !!x && !!y && Math.abs(x[0] - y[0]) < 1e-9 && (!x[1] || !y[1] || x[1] === y[1]);
+}
 const answersOf = (text: string) => [...text.matchAll(/^[ \t]*Ответ:[ \t]*(.+)$/gm)].map((m) => squeeze(m[1])).filter(Boolean);
 // Ответы из текста, которых нет среди ответов отправленного решения. Без решения под рукой (body пуст) сравнить не с чем: новым считается любой
 function fresh(text: string, body: string): string[] {
-  const sent = new Set(answersOf(body));
-  return answersOf(text).filter((x) => !body || !sent.has(x));
+  const sent = answersOf(body);
+  return answersOf(text).filter((x) => !body || !sent.some((y) => same(x, y)));
 }
-const SAYS = /(?<![а-яё])вс[её]\s+верно(?![а-яё])/i;
 
 export function judgeReply(a: Pick<Answer, "text" | "tail" | "all" | "cut" | "refused">, body = ""): { ok: true } | { fix: string } | null {
+  if (a.cut || a.refused) return null;
   const last = (a.tail ?? a.text).trim();
-  const broken = a.cut || a.refused;
-  if (!broken && whole(last) && fresh(last, body).length) {
-    return { fix: last.split("\n").filter((r) => !(SAYS.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim() };
+  const pure = last.split("\n").some((l) => /^[\s*]*вс[её]\s+верно[\s.!*]*$/i.test(l)); // отдельная строка «ВСЁ ВЕРНО»
+  if (!pure && whole(last) && fresh(last, body).length) {
+    return { fix: last.split("\n").filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim() };
   }
-  if (agrees(last)) {
-    if (broken && last.length > 60) return null; // оборвано посреди разбора: что шло бы дальше, неизвестно
-    return body && fresh(a.all ?? a.text, body).length ? null : { ok: true };
-  }
-  if (!broken && body && whole(last)) return { ok: true }; // задание переписано, а ответы те же: исправлять нечего
-  return !broken && whole(a.text) && fresh(a.text, body).length ? { fix: a.text } : null;
+  if (agrees(last)) return body && fresh(a.all ?? a.text, body).length ? null : { ok: true };
+  if (body && whole(last) && !fresh(last, body).length) return { ok: true };
+  return !pure && whole(a.text) && fresh(a.text, body).length ? { fix: a.text } : null;
 }
 
 // Один ход модели. Пересчёт в песочнице идёт на стороне Anthropic; если он затянулся, ход приходит

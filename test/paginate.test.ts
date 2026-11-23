@@ -77,3 +77,31 @@ test("шапка продолжения на следующих листах б�
     assert.equal(texLeak(c), null);
   }
 });
+
+test("буква на линии, проведённой поверх закрашенного круга, уходит с неё; широкая подпись на маленьком кружке остаётся", { skip }, async () => {
+  const radius = await lay(TASK, [svg(`<circle cx="400" cy="260" r="180" fill="black" stroke="#fff" stroke-width="4"/><line x1="400" y1="260" x2="580" y2="260" stroke="#fff" stroke-width="4"/><text x="490" y="270" fill="#fff" font-size="30" text-anchor="middle">R</text>`)]);
+  assert.deepEqual(radius.moved, ["R"]);
+  const chain = await lay(TASK, [svg(`<line x1="150" y1="250" x2="650" y2="250" stroke="#fff" stroke-width="3"/><circle cx="400" cy="250" r="26" fill="#000"/><text x="400" y="262" fill="#fff" font-size="30" text-anchor="middle">CH2</text>`)]);
+  assert.deepEqual(chain.moved, []);
+});
+
+test("рисунок с вырожденным преобразованием не роняет раскладку", { skip }, async () => {
+  const r = await lay(TASK, [svg(`<g transform="scale(0)"><circle cx="400" cy="300" r="40" fill="#000"/></g><g transform="scale(1 0)"><text x="100" y="100" fill="#fff" font-size="30">A</text></g><line x1="100" y1="300" x2="700" y2="300" stroke="#fff" stroke-width="4"/><text x="380" y="310" fill="#fff" font-size="30">M</text>`)]);
+  assert.ok(r.total >= 1);
+});
+
+test("абзац с чертой внутри скобок это обычный текст: он режется по листам, а не становится узкой колонкой", { skip }, async () => {
+  const para = "Вероятность · №1\nУсловная вероятность P(A | B) показывает, как часто событие A наступает при условии B. " + Array.from({ length: 40 }, (_, i) => `Рассуждение ${i + 1}: в опыте ${i + 1} мы считаем исходы и делим одно число на другое.`).join(" ") + "\nОтвет: 0,5";
+  const r = await lay([para]);
+  assert.ok(r.total >= 3 && Math.max(...r.heights) <= PAGE_H + 120, JSON.stringify(r.heights));
+  for (let i = 1; i <= 40; i++) assert.ok(r.text.includes(`Рассуждение ${i}: в опыте`), `пропало рассуждение ${i}`);
+});
+
+test("листинг с одной очень длинной строкой тоже режется по листам", { skip }, async () => {
+  const data = Array.from({ length: 700 }, (_, i) => i * 7 % 1000).join(", ");
+  const r = await lay(["Информатика · №5\nПрограмма:\n```\ndata = [" + data + "]\nprint(sum(data))\n```\nОтвет: 1"]);
+  assert.ok(r.total >= 2 && Math.max(...r.heights) <= PAGE_H + 120, JSON.stringify(r.heights));
+  // шапки продолжения и номера листов в сравнение не идут
+  const body = r.text.replace(/Информатика · №5 \(продолжение\)/g, "").replace(/\d+ \/ \d+/g, "");
+  assert.ok(body.replace(/\s+/g, "").includes(data.replace(/\s+/g, "")), "числа из листинга потерялись");
+});

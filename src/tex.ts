@@ -14,7 +14,9 @@ const SYM: Record<string, string> = {
   land: "∧", wedge: "∧", lor: "∨", vee: "∨", neg: "¬", lnot: "¬", oplus: "⊕", sum: "Σ", prod: "∏", int: "∫", oint: "∮",
   ell: "ℓ", hbar: "ħ", prime: "′", quad: " ", qquad: "  ", lbrace: "{", rbrace: "}", langle: "⟨", rangle: "⟩", mid: "|", vert: "|",
   backslash: "\\", colon: ":", lt: "<", gt: ">", ast: "∗", star: "⋆", propto: "∝", cong: "≅", ll: "≪", gg: "≫", simeq: "≃",
-  lessdot: "⋖", gtrdot: "⋗", smile: "◡", frown: "⌢", nparallel: "∦", nmid: "∤", therefore: "∴", because: "∵",
+  lessdot: "⋖", gtrdot: "⋗", R: "ℝ", N: "ℕ", Z: "ℤ", Q: "ℚ", C: "ℂ", reals: "ℝ", Reals: "ℝ", natnums: "ℕ", cnums: "ℂ", Complex: "ℂ",
+  infin: "∞", isin: "∈", empty: "∅", plusmn: "±", sub: "⊂", sube: "⊆", supe: "⊇", exist: "∃", sdot: "⋅",
+  smile: "◡", frown: "⌢", nparallel: "∦", nmid: "∤", therefore: "∴", because: "∵",
   lvert: "|", rvert: "|", lVert: "‖", rVert: "‖", Vert: "‖", lfloor: "⌊", rfloor: "⌋", lceil: "⌈", rceil: "⌉",
   varkappa: "ϰ", varrho: "ρ", varsigma: "ς", Pi: "Π", Xi: "Ξ", Upsilon: "Υ", supset: "⊃", supseteq: "⊇", nsubseteq: "⊈",
   otimes: "⊗", leqq: "≤", geqq: "≥", rightleftharpoons: "⇄", leftrightarrows: "⇄", triangleq: "≜", bot: "⊥", top: "⊤",
@@ -84,7 +86,7 @@ const DROP = new Set([
 ]);
 // Все команды, которые понимает этот разбор. Слово после «\», которого здесь нет, командой LaTeX не считаем:
 // путь к файлу C:\Users или «\n» в рассказе о программе остаются как были.
-const STRUCT = ["frac", "dfrac", "tfrac", "cfrac", "sqrt", "mathbb", "vec", "overrightarrow", "overleftarrow", "ce", "pu", "overline", "bar", "binom", "dbinom", "tbinom", "pmod", "bmod", "mod", "not", "operatorname", "begin", "end", "tag", "abs", "norm", "Bbb", ...Object.keys(XARR)];
+const STRUCT = ["frac", "dfrac", "tfrac", "cfrac", "sfrac", "nicefrac", "sqrt", "mathbb", "vec", "overrightarrow", "overleftarrow", "ce", "pu", "overline", "bar", "binom", "dbinom", "tbinom", "pmod", "bmod", "mod", "not", "operatorname", "begin", "end", "tag", "abs", "norm", "Bbb", ...Object.keys(XARR)];
 const BIG = new Set(["lim", "sum", "prod", "int", "max", "min", "sup", "inf"]);
 const KNOWN = new Set<string>([...Object.keys(SYM), ...WRAP, ...TWO, ...THREE, ...GONE, ...FUNCS, ...DROP, ...STRUCT]);
 
@@ -168,7 +170,7 @@ function conv(s: string): string {
       i += m[0].length;
       const name = m[1];
       last = name;
-      if (name === "frac" || name === "dfrac" || name === "tfrac" || name === "cfrac") {
+      if (name === "frac" || name === "dfrac" || name === "tfrac" || name === "cfrac" || name === "sfrac" || name === "nicefrac") {
         const fn = AFTER_FN.test(out);
         const a = group(), b = group();
         const f = `${paren(a)}/${below(b)}`;
@@ -249,11 +251,12 @@ export function texToPlain(tex: string): string {
 
 // Делит строку на обычный текст и формулы: $…$ и $$…$$. Непарный знак $ остаётся текстом.
 // Код в `…` и путь к файлу формулой не бывают: знак $ в них (`^\d+$`) ни с чем не спаривается.
-export function mathSpans(text: string): { math: boolean; body: string }[] {
-  const out: { math: boolean; body: string }[] = [];
+// lit: кусок, который не разметка и не трогается вовсе (код в `…`, путь к файлу, ссылка на ячейку таблицы)
+export function mathSpans(text: string): { math: boolean; body: string; lit?: boolean }[] {
+  const out: { math: boolean; body: string; lit?: boolean }[] = [];
   const re = /\$\$([^$]+?)\$\$|\$(?!\s)((?:\\.|[^$\\\n])+?)(?<!\s)\$/g;
   for (const [part, lit] of pieces(text)) {
-    if (lit) { out.push({ math: false, body: part }); continue; }
+    if (lit) { out.push({ math: false, body: part, lit: true }); continue; }
     let at = 0;
     for (let m = re.exec(part); m; m = re.exec(part)) {
       if (m.index > at) out.push({ math: false, body: part.slice(at, m.index) });
@@ -276,7 +279,7 @@ const isCommand = (name: string) => KNOWN.has(name);
 const MARKUP = /[\\$]|[\^_]\{/; // без этих знаков разметки LaTeX в тексте быть не может
 // \имя{…} с именем из двух букв и больше это LaTeX, даже если команды нет в списках; \d{3} из регулярного выражения нет
 // Норма \|a\| это пара знаков; одиночный «\|» встречается в коде (grep 'foo\|bar') и разметкой не считается
-const NORM = /\\\|[^|\n]*?\\\|/;
+const NORM = /(?<![\p{L}\p{N}])\\\|[^|\n]*?\\\|(?![\p{L}\p{N}])/u;
 const hot = (t: string): boolean => {
   for (const m of t.matchAll(/\\([A-Za-z]+)(\{)?|[\^_]\{/g)) if (m[1] === undefined || isCommand(m[1]) || (m[2] && m[1].length > 1)) return true;
   return NORM.test(t);
@@ -288,15 +291,19 @@ const hot = (t: string): boolean => {
 const SAFE = /`[^`\n]+`|(?<![^\s"'«(\[])[A-Za-z]:\\[^\s$`{}]*(?![^\s,;.!?)»"'\]])/g;
 // У настоящего пути есть хотя бы одна папка или файл, чьё имя не команда LaTeX: «f:\mathbb R» и «x:\alpha» это формулы без знаков $
 const pathLike = (s: string) => s.slice(3).split("\\").some((seg) => seg !== "" && (!/^[A-Za-z]+$/.test(seg) || (seg.length > 1 && !isCommand(seg))));
-const literal = (s: string) => (s[0] === "`" ? !hot(s) && !/\$(?!\s)[^$\n]+(?<!\s)\$/.test(s) : pathLike(s));
+// Код в `…` разбираем, только если в нём команда LaTeX или он целиком одна формула `$…$`:
+// регулярное выражение `^a$|^b$`, PHP `$x=$y;` и шаблон `${a}+${b}` остаются кодом
+const literal = (s: string) => (s[0] === "`" ? !hot(s) && !/^`\$[^$`]+\$`$/.test(s) : pathLike(s));
+// Ссылка на ячейку электронной таблицы со знаком $ ($A$1, C$3, =$B2): это не формула LaTeX
+const CELL = String.raw`(?<![\w$])(?:\$[A-Z]{1,3}\$\d+|[A-Z]{1,3}\$\d+)(?!\w)|(?<=[=+\-*/(:;,])\$[A-Z]{1,3}\d+(?!\w)`;
 // Что началось раньше, то и считается: в «$f`(x) = 2x$ и $g`(x) = 3$» обратная кавычка это штрих внутри формулы, а не начало кода,
 // а в «`^\d+$` и `^[a-z]+$`» знак $ стоит внутри кода и формулу не открывает
-const SPANS = new RegExp(`(\\$\\$[^$]+?\\$\\$|\\$(?!\\s)(?:\\\\.|[^$\\\\\\n])+?(?<!\\s)\\$)|${SAFE.source}`, "g");
+const SPANS = new RegExp(`(?<cell>${CELL})|(?<math>\\$\\$[^$]+?\\$\\$|\\$(?!\\s)(?:\\\\.|[^$\\\\\\n])+?(?<!\\s)\\$)|${SAFE.source}`, "g");
 function pieces(text: string): [string, boolean][] {
   const out: [string, boolean][] = [];
   let at = 0;
   for (const m of text.matchAll(SPANS)) {
-    if (m[1] !== undefined || !literal(m[0])) continue;
+    if (m.groups!.math !== undefined || (m.groups!.cell === undefined && !literal(m[0]))) continue;
     out.push([text.slice(at, m.index), false], [m[0], true]);
     at = m.index! + m[0].length;
   }
@@ -413,7 +420,7 @@ function strip(text: string): string {
       .replace(/\\\\(?![A-Za-zА-Яа-яЁё])/g, " ")
       .replace(/\\([,;:!> ])/g, " ")
       .replace(/\\([%&#_{}])/g, "$1")
-      .replace(/\\\|([^|\n]*?)\\\|/g, "‖$1‖")
+      .replace(/(?<![\p{L}\p{N}])\\\|([^|\n]*?)\\\|(?![\p{L}\p{N}])/gu, "‖$1‖")
       .replace(/\\[()[\]]/g, "")
       .replace(/([\^_])\{([^{}\n]*)\}/g, "$1($2)")
       .replace(/\$/g, "") // знак $ без пары: формулы тут нет, а знак остался бы мусором
@@ -426,7 +433,7 @@ function strip(text: string): string {
 // \имя{…} считается разметкой, даже если такой команды нет в списках: так тесты заметят пробел в списках.
 export function texLeak(text: string): string | null {
   for (const block of text.split(/```[\s\S]*?```/)) {
-    const piece = keep(block, (s) => s).replace(SAFE, (m) => (literal(m) ? " " : m));
+    const piece = pieces(block).map(([s, lit]) => (lit ? " " : s)).join("");
     for (const m of piece.matchAll(/\\([A-Za-z]+)(\{)?|\\[()[\]\\{}%&#_]|\\\|[^|\n]*?\\\||(?<=[^\s\\])\\[,;:!](?=[^\s\\])|\$|[\^_]\{/g)) {
       if (m[1] !== undefined && !isCommand(m[1]) && !(m[2] && m[1].length > 1)) continue;
       return piece.slice(Math.max(0, m.index! - 12), m.index! + 24);

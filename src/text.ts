@@ -16,12 +16,17 @@ export function subscripts(text: string, sub: (d: string) => string): string {
     .replace(IDX, (_m: string, l: string, d: string) => l + sub(d));
 }
 
-export function prettyMath(text: string): string {
+// Признаки задания про электронную таблицу: слово «ячейка», формула «=A1*B2», ссылка со знаком $ ($A$1, C$3).
+// В таком задании C2 и A1 это ячейки, а не углерод с индексом: индексы там не ставим.
+const SHEET = /ячейк|[Ээ]лектронн\S* таблиц|Excel|(?<![^\s"'«(`])=\$?[A-Z]{1,3}\$?\d|\$[A-Z]{1,3}\$\d|[A-Z]{1,3}\$\d/;
+export const sheetContext = (text: string): boolean => SHEET.test(text);
+// sheet: текст из задания про электронную таблицу (по умолчанию определяется по самому тексту)
+export function prettyMath(text: string, sheet = sheetContext(text)): string {
   const fix = (map: Record<string, string>) => (m: string, g1?: string, g2?: string) => conv(g1 ?? g2 ?? "", map) ?? m;
-  // адреса сайтов не трогаем: в них цифры после букв значат своё
-  return text.split(/(https?:\/\/\S+)/).map((piece, i) => {
+  // адреса сайтов и код в `…` не трогаем: в них цифры после букв и знак ^ значат своё
+  return text.split(/(https?:\/\/\S+|`[^`\n]+`)/).map((piece, i) => {
     if (i % 2) return piece;
-    const t = subscripts(piece.replace(ION, (_m, el: string, d: string, sign: string) => el + SUP[d] + SUP[sign]), (d) => conv(d, SUB) ?? d)
+    const t = (sheet ? piece : subscripts(piece.replace(ION, (_m, el: string, d: string, sign: string) => el + SUP[d] + SUP[sign]), (d) => conv(d, SUB) ?? d))
       .replace(/(?<![А-Яа-я])(мм|см|дм|км|м)([23])(?!\d)/g, (_m, u, d) => u + SUP[d]); // см2 -> см²
     return t
       .replace(/\^\{([^{}]{1,12})\}|\^\(([^()]{1,12})\)/g, (m, a, b) => (b ? conv(`(${b})`, SUP) : conv(a, SUP)) ?? m)
