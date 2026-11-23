@@ -25,7 +25,7 @@ const FONTS: Record<string, ArrayBuffer> = {
   "KaTeX_Main-Italic": mainItalic, "KaTeX_Main-Regular": mainRegular, "KaTeX_Math-BoldItalic": mathBoldItalic, "KaTeX_Math-Italic": mathItalic,
   "KaTeX_Script-Regular": script, "KaTeX_Size1-Regular": size1, "KaTeX_Size2-Regular": size2, "KaTeX_Size3-Regular": size3, "KaTeX_Size4-Regular": size4,
 };
-export const MAX_PAGES = 20;
+export const MAX_PAGES = 30; // больше страниц картинками не шлём: такой ответ уходит текстом целиком
 const SHOT_LIMIT = 60_000; // столько даём браузеру на всё решение
 
 // Браузер сегодня больше не даст снимков (кончились бесплатные минуты): до полуночи UTC не пробуем
@@ -86,11 +86,12 @@ export async function shoot(binding: Fetcher, html: string): Promise<Uint8Array[
     await page.setViewport({ width: PAGE_W, height: 800, deviceScaleFactor: 2 });
     await page.setContent(html, { waitUntil: "load", timeout: 30_000 });
     await page.evaluate("document.fonts.ready.then(() => true)");
-    const n = Math.min(MAX_PAGES, Number(await page.evaluate(PAGINATE)) || 0);
+    const n = Number(await page.evaluate(PAGINATE)) || 0;
+    if (n > MAX_PAGES) throw new Error(`ответ занял ${n} страниц, это слишком много для картинок`);
     const out: Uint8Array[] = [];
     for (let i = 1; i <= n; i++) {
       const el = await page.$(`#p${i}`);
-      if (!el) continue;
+      if (!el) throw new Error(`страница ${i} не нашлась`); // без неё ответ был бы неполным
       let img = (await el.screenshot({ type: "png" })) as Uint8Array;
       if (img.length > 1_900_000) img = (await el.screenshot({ type: "jpeg", quality: 88 })) as Uint8Array;
       out.push(new Uint8Array(img));
