@@ -182,6 +182,7 @@ interface Job {
   msgs: number;
   tokens: number;
   usd?: number; // примерная цена всех запросов к Claude по этой работе
+  lean?: boolean; // файлы PDF прошлых работ в запросы этой работы не идут: вместе с ними запрос слишком велик
   checks: number; // сколько раз модель пересчитывала вычисления кодом
   model?: string;
 }
@@ -303,6 +304,7 @@ export class Chat extends DurableObject<Env> {
   // Решение этой работы начинается заново: всё, что успели написать, выбрасываем
   private rewind(job: Job, wait: number) {
     job.acc = "";
+    job.lean = undefined;
     job.body = undefined;
     job.parts = undefined;
     job.turn = undefined;
@@ -425,7 +427,9 @@ export class Chat extends DurableObject<Env> {
         `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}, пересчёт кодом ${this.c.code ? "вкл" : "выкл"}, вторая проверка ${o.check ? "вкл" : "выкл"}, решение: ${o.pages ? "картинкой" : "текстом"}${queue ? `, в работе: ${queue}` : ""}\n` +
           (mine
             ? `Команды: решай, стоп, сброс, картинкой / текстом, быстро / средне / умно / макс, fast вкл / fast выкл, проверка вкл / выкл, расход, лимит 3 / лимит выкл, доступ закрыть / открыть\nЖурнал: ${origin}/?k=${await logKey(this.c)}`
-            : "Команды: решай, стоп, сброс, картинкой / текстом"),
+            : "Команды: решай, стоп, сброс, картинкой / текстом") +
+          // хозяин по первому сообщению это временно: постоянным его делает переменная
+          (mine && !this.c.owners.length ? `\nСовет: добавь в Cloudflare переменную OWNER со значением ${chatId}, тогда хозяином не сможет стать никто другой.` : ""),
       );
       return true;
     }
@@ -714,7 +718,8 @@ export class Chat extends DurableObject<Env> {
         // Попытка засчитывается до сборки запроса: если объект упадёт на ней (фото и PDF в памяти) или посреди запроса, счётчик это запомнит
         job.tries++;
         await save();
-        let messages = await this.toApi(turns);
+        // lean: в первом куске решено не брать файлы прошлых работ; продолжение ответа собирается так же
+        let messages = await this.toApi(turns, job.lean ? content : undefined);
         // Длинный PDF (учебник целиком) в одно решение не берём: сначала бесплатно считаем, сколько он займёт
         if (!job.acc && job.shots.some((x) => x.pdf)) {
           const size = await inputTokens(this.c, messages);
@@ -725,6 +730,7 @@ export class Chat extends DurableObject<Env> {
             if (stop.aborted) throw stop.reason;
             if (own !== null && own > PDF_TOKENS) return await this.finish(key, job, chatId, "Файл слишком длинный для одного решения. Пришли фото нужных страниц или файл покороче.");
             messages = await this.toApi(turns, content); // файлы прошлых работ в этот запрос не берём
+            job.lean = true;
           }
         }
 
@@ -1285,7 +1291,7 @@ export class Chat extends DurableObject<Env> {
           messages: [{ role: "user", content: input.question }, { role: "assistant", content: input.body }, { role: "user", content: judgeText(q.issues ?? "") }],
           effort: input.effort, fast: false, until, stop: stop.signal, spent,
         });
-        const r = judgeReply(a);
+        const r = judgeReply(a, input.body);
         if (!r) throw new Busy("основная модель не дописала разбор замечаний");
         return await close(r);
       } finally {

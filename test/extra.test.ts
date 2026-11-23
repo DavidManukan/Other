@@ -97,7 +97,7 @@ test("попытка засчитывается до сборки запроса
   const src = readFileSync(new URL("../src/chat.ts", import.meta.url), "utf8");
   const body = src.slice(src.indexOf("private async solve("), src.indexOf("private async pack("));
   const tries = body.indexOf("job.tries++");
-  assert.ok(tries > 0 && tries < body.indexOf("this.toApi(turns)") && tries < body.indexOf("inputTokens(") && tries < body.indexOf("await ask("));
+  assert.ok(tries > 0 && tries < body.indexOf("this.toApi(turns") && tries < body.indexOf("inputTokens(") && tries < body.indexOf("await ask("));
 });
 
 test("вердикт второй проверки: верно, ошибка с замечаниями, ответ не по форме", () => {
@@ -121,29 +121,40 @@ test("вердикт проверяющего: последняя строка �
   assert.deepEqual(verdict("ВЕРДИКТ: ОШИБКА\n№2: получается 7\nПересчитал ещё раз, ошибся я.\nВЕРДИКТ: ВЕРНО"), { ok: true });
 });
 
-test("решение основной модели по замечаниям: согласие, оборванный ответ, исправление, заметка", () => {
-  const reply = (blocks: never, cut = false, refused = false) => judgeReply({ text: answerText(blocks, cut), tail: tailText(blocks), cut, refused });
-  // пересчёт со строкой «Ответ:», потом согласие: решение остаётся
+test("решение основной модели по замечаниям: согласие, исправление, противоречие, оборванный ответ, заметка", () => {
+  const BODY = "№1\nx = 2\nОтвет: 4 см²\n\n№2\nРешение второго.\nОтвет: 5";
+  const reply = (blocks: never, cut = false, refused = false) => judgeReply({ text: answerText(blocks, cut), tail: tailText(blocks), all: allText(blocks), cut, refused }, BODY);
+  // пересчёт с прежним ответом, потом согласие: решение остаётся
   assert.deepEqual(reply(turn("Пересчитаю №2.\nОтвет: 5", null, "ВСЁ ВЕРНО")), { ok: true });
   assert.deepEqual(reply(turn("№2\nПересчитаю.\nОтвет: 5", null, "ВСЁ ВЕРНО")), { ok: true });
-  // согласие, а следом повтор ответа
+  // согласие, а следом повтор прежнего ответа
   assert.deepEqual(reply(turn("ВСЁ ВЕРНО\n№2\nОтвет: 5")), { ok: true });
-  // согласие другими словами
+  // согласие другими словами и любым регистром
   assert.deepEqual(reply(turn("Замечание ошибочно: ВСЁ ВЕРНО")), { ok: true });
   assert.deepEqual(reply(turn("Пересчёт подтвердил решение.\n\nВСЁ ВЕРНО")), { ok: true });
-  // «не всё верно» это не согласие
-  assert.deepEqual(reply(turn("НЕ ВСЁ ВЕРНО.\n№2\nПересчёт: 3 + 4 = 7\nОтвет: 7")), { fix: "НЕ ВСЁ ВЕРНО.\n№2\nПересчёт: 3 + 4 = 7\nОтвет: 7" });
+  assert.deepEqual(reply(turn("Всё верно.")), { ok: true });
+  // задание переписано, а ответ прежний: исправлять нечего
+  assert.deepEqual(reply(turn("№2\nДругим способом получаем то же.\nОтвет: 5")), { ok: true });
+  // «в №1 всё верно», а №2 исправлен: это исправление, строка согласия в него не идёт
+  assert.deepEqual(reply(turn("В №1 ВСЁ ВЕРНО.\n№2\nПересчёт: 3 + 4 = 7\nОтвет: 7")), { fix: "№2\nПересчёт: 3 + 4 = 7\nОтвет: 7" });
+  assert.deepEqual(reply(turn("НЕ ВСЁ ВЕРНО.\n№2\nПересчёт: 3 + 4 = 7\nОтвет: 7")), { fix: "№2\nПересчёт: 3 + 4 = 7\nОтвет: 7" });
+  // получила другой ответ и тут же написала «всё верно»: неясно, что подтверждено. Ни исправления, ни подтверждения
+  assert.equal(reply(turn("№2\nПересчёт: 3 + 4 = 7\nОтвет: 7", null, "ВСЁ ВЕРНО")), null);
   assert.equal(reply(turn("Тут не ВСЁ ВЕРНО")), null);
-  // оборван прямо на строке «Ответ:» или после первого из двух заданий: не исправление, повтор
+  // оборван на строке «Ответ:» или после первого из двух заданий: не исправление, повтор
   assert.equal(reply(turn("№2\nПересчёт\nОтвет: x = 12"), true), null);
   assert.equal(reply(turn("№2\nОтвет: 7\n@@@\n"), true), null);
   assert.equal(reply(turn("№2\nОтвет: 7"), false, true), null); // отказ
-  // настоящее исправление, в том числе со строкой-заметкой после пересчёта
+  assert.equal(reply(turn("В №1 ВСЁ ВЕРНО, а вот во втором задании при пересчёте получается совсем другое число, сейчас"), true), null);
+  // настоящее исправление, в том числе когда после него идёт только заметка о пересчёте
   assert.deepEqual(reply(turn("№2\nПересчёт: 3 + 4 = 7\nОтвет: 7")), { fix: "№2\nПересчёт: 3 + 4 = 7\nОтвет: 7" });
   assert.deepEqual(reply(turn("№2\nОтвет: 7", null, "Проверка подтвердила.")), { fix: "№2\nОтвет: 7" });
-  // заметка без заголовка задания исправлением не считается
-  assert.equal(reply(turn("Пересчитаю №2.\nОтвет: 5", null, "Проверка завершена.")), null);
+  // заметка без заголовка задания и фраза, похожая на заголовок, исправлением не считаются
+  assert.equal(reply(turn("Пересчитаю №2.\nОтвет: 7", null, "Проверка завершена.")), null);
+  assert.equal(reply(turn("Вариант с ошибкой проверен.\nОтвет: 7", null, "Готово")), null);
   assert.equal(reply(turn("Не уверен, нужно подумать.")), null);
+  // короткий ответ не считается «тем же» из-за случайного совпадения цифры в решении
+  assert.deepEqual(judgeReply({ text: "№2\nОтвет: 7", tail: "№2\nОтвет: 7", cut: false, refused: false }, "№2\nx = 17\nОтвет: 5"), { fix: "№2\nОтвет: 7" });
 });
 
 test("файл с заданием: фото и PDF определяются по содержимому", () => {

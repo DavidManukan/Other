@@ -3,7 +3,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Cfg, Effort } from "./config.ts";
 import { PROMPT } from "./prompt.ts";
-import { HEAD } from "./text.ts";
 import { left } from "./util.ts";
 
 export class Timeout extends Error {} // время куска вышло, а модель ещё ничего не написала
@@ -239,24 +238,44 @@ export const tailText = (content: Content): string => segments(content).at(-1) ?
 // Весь текст хода: если после проверок модель ничего не написала, ответ мог остаться перед ними
 export const allText = (content: Content): string => texts(content).join("\n\n");
 
-// Что решила основная модель по замечаниям. Порядок важен.
-// 1. Итоговое слово (текст после последнего пересчёта) содержит «ВСЁ ВЕРНО» без «не» перед ним: решение остаётся,
-//    что бы ни стояло раньше. Модель часто пишет пересчёт со строкой «Ответ:» и только потом соглашается.
-// 2. Ответ оборван или модель отказалась: исправление из него не собрать, null (повторить, число попыток ограничено).
-// 3. В ответе есть целое задание (заголовок и после него строка «Ответ:»): это исправление. Заметка вроде «Пересчитаю №2. Ответ: 5»
-//    заголовка не имеет и исправлением не считается.
-// 4. Иначе ответ не по форме: null.
-export function judgeReply(a: Pick<Answer, "text" | "tail" | "cut" | "refused">): { ok: true } | { fix: string } | null {
-  const last = a.tail ?? a.text;
-  const agreed = [...last.matchAll(/ВС[ЕЁ] ВЕРНО/g)].some((m) => !/(^|[^а-яё])не[\s,:—–-]*$/i.test(last.slice(0, m.index)));
-  if (agreed) return { ok: true };
-  if (a.cut || a.refused) return null;
-  const whole = a.text.split(/^[ \t]*@@@.*$/m).some((t) => {
-    const rows = t.split("\n");
-    const head = rows.findIndex((r) => HEAD.test(r));
-    return head >= 0 && rows.findLastIndex((r) => /^[ \t]*Ответ:/.test(r)) > head;
-  });
-  return whole ? { fix: a.text } : null;
+// Что решила основная модель по замечаниям проверяющего. body: решение, которое уже отправлено человеку.
+// Ошибиться здесь можно в обе стороны, и обе плохи: прислать «исправление» к верному ответу или подтвердить неверный.
+// Поэтому всё неоднозначное это null: запрос повторяется (число попыток ограничено), и в чат ничего лишнего не уходит.
+// 1. Итоговое слово (текст после последнего пересчёта кодом) содержит целое задание с ответом, которого в отправленном
+//    решении не было: это исправление. Строки согласия по другим заданиям («В №1 всё верно») из него убираются.
+// 2. Итоговое слово это согласие («ВСЁ ВЕРНО» без «не» перед ним), и по ходу модель не получила ни одного ответа,
+//    которого нет в отправленном решении: решение устояло. Повтор прежнего ответа рядом с согласием это тоже согласие.
+// 3. Согласия нет, но раньше в ходе есть целое задание с новым ответом (после него модель только пересчитала кодом): исправление.
+// 4. Оборванный ответ, отказ, согласие вперемешку с другим ответом, заметка без задания: null.
+const AGREE = /(?<![а-яё])вс[её]\s+верно(?![а-яё])/gi;
+const agrees = (s: string) => [...s.matchAll(AGREE)].some((m) => !/(^|[^а-яё])не[\s,:—–-]*$/i.test(s.slice(0, m.index)));
+const TASK = /^\s*(?:[^·\n]{1,30}·\s*){0,2}(?:№\s*\S+|(?:Задание|Задача|Вариант)\s+\d\S*)/; // заголовок задания, а не фраза «Вариант с ошибкой проверен»
+const whole = (text: string) => text.split(/^[ \t]*@@@.*$/m).some((t) => {
+  const rows = t.split("\n");
+  const head = rows.findIndex((r) => TASK.test(r));
+  return head >= 0 && rows.findLastIndex((r) => /^[ \t]*Ответ:/.test(r)) > head;
+});
+const squeeze = (s: string) => s.replace(/[\s$]/g, "").replace(/[.;]+$/, "").toLowerCase();
+const answersOf = (text: string) => [...text.matchAll(/^[ \t]*Ответ:[ \t]*(.+)$/gm)].map((m) => squeeze(m[1])).filter(Boolean);
+// Ответы из текста, которых нет среди ответов отправленного решения. Без решения под рукой (body пуст) сравнить не с чем: новым считается любой
+function fresh(text: string, body: string): string[] {
+  const sent = new Set(answersOf(body));
+  return answersOf(text).filter((x) => !body || !sent.has(x));
+}
+const SAYS = /(?<![а-яё])вс[её]\s+верно(?![а-яё])/i;
+
+export function judgeReply(a: Pick<Answer, "text" | "tail" | "all" | "cut" | "refused">, body = ""): { ok: true } | { fix: string } | null {
+  const last = (a.tail ?? a.text).trim();
+  const broken = a.cut || a.refused;
+  if (!broken && whole(last) && fresh(last, body).length) {
+    return { fix: last.split("\n").filter((r) => !(SAYS.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim() };
+  }
+  if (agrees(last)) {
+    if (broken && last.length > 60) return null; // оборвано посреди разбора: что шло бы дальше, неизвестно
+    return body && fresh(a.all ?? a.text, body).length ? null : { ok: true };
+  }
+  if (!broken && body && whole(last)) return { ok: true }; // задание переписано, а ответы те же: исправлять нечего
+  return !broken && whole(a.text) && fresh(a.text, body).length ? { fix: a.text } : null;
 }
 
 // Один ход модели. Пересчёт в песочнице идёт на стороне Anthropic; если он затянулся, ход приходит

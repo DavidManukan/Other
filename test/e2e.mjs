@@ -666,7 +666,7 @@ try {
   ok(await until(() => answers("976").some((t) => t.includes("Ответ: 42")), 30_000), "доступ закрыт: уже оплаченный ответ чужому чату доставлен", JSON.stringify(texts("976")));
   ok(await until(async () => (await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text()).includes("доступ закрыт: задание чужого чата снято без решения")), "доступ закрыт: задание из очереди снято, запись в журнале");
   ok(await until(async () => (await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text()).split("вторая проверка не состоялась: доступ закрыт").length === 3, 30_000), "доступ закрыт: обе проверки чужого чата сняты, запись в журнале");
-  ok(reqs("S_CLOSEDQ").length === 0 && answers("976").length === 1, "доступ закрыт: чужое задание из очереди не решалось, чату ничего не написано", JSON.stringify(texts("976")));
+  ok(reqs("S_CLOSEDQ").length === 0 && answers("976").filter((t) => !t.startsWith("⏳")).length === 1,"доступ закрыт: чужое задание из очереди не решалось, чату ничего не написано", JSON.stringify(texts("976")));
   ok(reqs("S_CLSCHK").filter(isCheck).length === 0 && reqs("977a").filter(isJudge).length === 0 && !texts("977").some((t) => t.startsWith("⚠️") || t.startsWith("✅ Перепроверил")), "доступ закрыт: проверки чужого чата сняты без запросов и без сообщений ему", JSON.stringify([reqs("S_CLSCHK").filter(isCheck).length, reqs("977a").filter(isJudge).length]));
   await photo("975", "S_SHUT");
   await text("975", "ping");
