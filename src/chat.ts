@@ -27,6 +27,7 @@ const MAX_SENDS = 35; // сообщений за один запуск (у бе�
 const MAX_QUEUE = 10; // заданий в очереди одного чата
 const PHOTO_CHUNK = 1_000_000; // значение в хранилище ограничено по размеру, фото режем на части
 const PHOTO_MAX = 5_000_000; // больше не берём: такое фото не нужно и бьёт по памяти
+const MAX_PHOTOS = 3; // столько последних фото бот помнит и столько решает одним запросом, если они пришли подряд
 const IMG_TTL = 86_400_000; // рисунки храним сутки
 const LOG_MAX = 12;
 const CUT_NOTE = "(ответ слишком длинный: пришли фото по частям)";
@@ -71,6 +72,7 @@ interface Job {
   step: number; // сколько раз ответ уже продолжали
   tries: number; // попытки текущего куска
   effort: Effort;
+  more?: { id: string; url?: string; caption?: string }[]; // фото, которые пришли следом и решаются вместе с этим
   cont: boolean; // следующий кусок продолжает ответ («дальше»)
   sent: string[]; // что уже ушло в чат в текущем куске
   outbox: string[]; // готовые ответы, которые ещё не ушли: шлюз не принял или кончился запас запросов на запуск
@@ -86,6 +88,8 @@ interface Job {
   tokens: number;
 }
 
+const photoKeys = (p: PhotoMeta) => Array.from({ length: p.n }, (_, i) => `photo:${p.id}:${i}`);
+
 class Delivery extends Error {} // ответ готов, но шлюз его сейчас не принимает: Claude не переспрашиваем, ждём шлюз
 
 export class Chat extends DurableObject<Env> {
@@ -94,7 +98,7 @@ export class Chat extends DurableObject<Env> {
   private hide: (x: unknown) => string;
   private running = false;
   private stop: AbortController | null = null;
-  private photo: { id: string; type: PhotoMeta["type"]; data: string } | null = null;
+  private photos = new Map<string, { type: PhotoMeta["type"]; data: string }>(); // фото, уже прочитанные из хранилища
   private page = new Map<boolean, { at: number; html: string }>();
   private epoch = 0; // растёт на «сброс»: решение, начатое до сброса, память уже не трогает
   private owner: boolean | undefined; // этот чат принадлежит хозяину бота
@@ -134,7 +138,13 @@ export class Chat extends DurableObject<Env> {
       }
       if (type === "textMessage" || type === "extendedTextMessage" || type === "quotedMessage") {
         const text = String(md.textMessageData?.textMessage ?? md.extendedTextMessageData?.text ?? "").trim();
-        if (text && !(await this.command(meta, text))) return await this.enqueue({ kind: "text", id, text }, mark);
+        if (text && !(await this.command(meta, text))) {
+          // ответ на конкретное сообщение: модели нужно знать, на какое именно
+          const q = md.quotedMessage ?? {};
+          const quoted = String(q.textMessage ?? q.caption ?? "").trim();
+          const about = quoted ? `\n\n(это ответ на сообщение: «${quoted.slice(0, 1500)}»)` : /image/i.test(String(q.typeMessage ?? "")) ? "\n\n(это ответ на фото задания)" : "";
+          return await this.enqueue({ kind: "text", id, text: text + about }, mark);
+        }
       } else if (NUDGE.has(type)) {
         await this.green.send(chatId, "Пришли фото задания.");
       } // реакции, правки, удаления: молча пропускаем
@@ -221,9 +231,9 @@ export class Chat extends DurableObject<Env> {
   }
 
   private async forget() {
-    const p = await this.db.get<PhotoMeta>("photo");
-    await this.db.delete(["hist", "photo", ...Array.from({ length: p?.n ?? 0 }, (_, i) => `photo:${i}`)]);
-    this.photo = null;
+    const list = (await this.db.get<PhotoMeta[]>("photos")) ?? [];
+    await this.db.delete(["hist", "photos", ...list.flatMap(photoKeys)].slice(0, 128));
+    this.photos.clear();
     this.epoch++;
   }
 
@@ -342,16 +352,45 @@ export class Chat extends DurableObject<Env> {
     let content: Block[];
     if (job.cont) content = [{ type: "text", text: "дальше" }];
     else if (job.kind === "image") {
-      if ((await this.db.get<PhotoMeta>("photo"))?.id !== job.id) {
-        const bytes = await this.green.photo(chatId, job.id, job.url, Date.now() + 40_000, PHOTO_MAX);
-        const type = imageType(bytes);
-        if (!type) {
-          await this.db.delete(key);
-          return void (await this.say(chatId, "Не понял формат фото. Пришли обычное фото."));
+      if (!job.more) {
+        // Фото, которые успели прийти следом (страницы одной работы), решаем одним запросом: модель видит их вместе
+        const queue = await this.db.list<Job>({ prefix: "job:", limit: MAX_PHOTOS + 1 });
+        const next: [string, Job][] = [];
+        for (const [k, j] of queue) {
+          if (k === key) continue;
+          if (j.kind !== "image" || next.length >= MAX_PHOTOS - 1) break;
+          next.push([k, j]);
         }
-        await this.savePhoto(job.id, bytes, type);
+        job.more = next.map(([, j]) => ({ id: j.id, url: j.url, caption: j.caption }));
+        const gone = this.db.delete(next.map(([k]) => k)); // вместе с записью задания это одна операция
+        await save();
+        await gone;
       }
-      content = [{ type: "photo", id: job.id }, { type: "text", text: job.caption ? `Реши задания на фото. Подпись: ${job.caption}` : "Реши задания на фото." }];
+      const shots = [{ id: job.id, url: job.url, caption: job.caption }, ...job.more];
+      const have = new Set(((await this.db.get<PhotoMeta[]>("photos")) ?? []).map((p) => p.id));
+      const ready: typeof shots = [];
+      for (const shot of shots) {
+        if (!have.has(shot.id)) {
+          let type: PhotoMeta["type"] | null = null;
+          try {
+            const bytes = await this.green.photo(chatId, shot.id, shot.url, Date.now() + 40_000, PHOTO_MAX);
+            if ((type = imageType(bytes))) await this.savePhoto(shot.id, bytes, type);
+          } catch (e) {
+            if (shots.length === 1) throw e;
+            console.log("фото не скачалось:", this.hide(e));
+          }
+          if (!type) continue;
+        }
+        ready.push(shot);
+      }
+      if (!ready.length) {
+        await this.db.delete(key);
+        return void (await this.say(chatId, "Не понял формат фото. Пришли обычное фото."));
+      }
+      if (ready.length < shots.length) await this.say(chatId, `(фото не открылось: ${shots.length - ready.length}. Пришли его ещё раз.)`);
+      const captions = ready.map((x) => x.caption).filter(Boolean).join("; ");
+      const lead = ready.length > 1 ? `Реши задания на фото. Фото ${ready.length}: они пришли подряд, это страницы одной работы по порядку.` : "Реши задания на фото.";
+      content = [...ready.map((x): Block => ({ type: "photo", id: x.id })), { type: "text", text: captions ? `${lead} Подпись: ${captions}` : lead }];
     } else content = [{ type: "text", text: job.text ?? "" }];
 
     const epoch = this.epoch;
@@ -561,44 +600,51 @@ export class Chat extends DurableObject<Env> {
     await this.db.put("hist", { at: Date.now(), turns: t });
   }
 
-  // Фото храним только последнее: на него ссылаются «объясни шаг» и «реши №5 с прошлого фото»
+  // Помним несколько последних фото: условие бывает на одном, рисунок на другом, и по ним задают вопросы
   private async savePhoto(id: string, bytes: Uint8Array, type: PhotoMeta["type"]) {
-    const old = await this.db.get<PhotoMeta>("photo");
-    const n = Math.ceil(bytes.length / PHOTO_CHUNK);
-    const parts: Record<string, unknown> = { photo: { id, type, n } satisfies PhotoMeta };
-    for (let i = 0; i < n; i++) parts[`photo:${i}`] = bytes.slice(i * PHOTO_CHUNK, (i + 1) * PHOTO_CHUNK);
+    const list = (await this.db.get<PhotoMeta[]>("photos")) ?? [];
+    const meta: PhotoMeta = { id, type, n: Math.ceil(bytes.length / PHOTO_CHUNK) };
+    const next = [...list.filter((p) => p.id !== id), meta];
+    const drop = next.splice(0, Math.max(0, next.length - MAX_PHOTOS));
+    const parts: Record<string, unknown> = { photos: next };
+    for (let i = 0; i < meta.n; i++) parts[`photo:${id}:${i}`] = bytes.slice(i * PHOTO_CHUNK, (i + 1) * PHOTO_CHUNK);
     await this.db.put(parts);
-    if (old && old.n > n) await this.db.delete(Array.from({ length: old.n - n }, (_, i) => `photo:${n + i}`));
-    this.photo = { id, type, data: base64(bytes) };
+    if (drop.length) await this.db.delete(drop.flatMap(photoKeys));
+    for (const p of drop) this.photos.delete(p.id);
+    this.photos.set(id, { type, data: base64(bytes) });
   }
 
-  private async loadPhoto() {
-    const p = await this.db.get<PhotoMeta>("photo");
-    if (!p) return null;
-    if (this.photo?.id === p.id) return this.photo;
-    const parts = await this.db.get<Uint8Array>(Array.from({ length: p.n }, (_, i) => `photo:${i}`));
-    const bytes = new Uint8Array([...parts.values()].reduce((s, b) => s + b.byteLength, 0));
+  private async loadPhoto(p: PhotoMeta) {
+    const cached = this.photos.get(p.id);
+    if (cached) return cached;
+    const parts = await this.db.get<Uint8Array>(photoKeys(p));
+    const bytes = new Uint8Array([...parts.values()].reduce((sum, b) => sum + b.byteLength, 0));
     let at = 0;
-    for (let i = 0; i < p.n; i++) {
-      const b = parts.get(`photo:${i}`);
+    for (const k of photoKeys(p)) {
+      const b = parts.get(k);
       if (!b) return null;
       bytes.set(new Uint8Array(b), at);
       at += b.byteLength;
     }
-    return (this.photo = { id: p.id, type: p.type, data: base64(bytes) });
+    const photo = { type: p.type, data: base64(bytes) };
+    this.photos.set(p.id, photo);
+    return photo;
   }
 
   private async toApi(turns: Turn[]): Promise<Anthropic.Beta.BetaMessageParam[]> {
-    const photo = await this.loadPhoto();
+    const used = new Set(turns.flatMap((t) => (typeof t.content === "string" ? [] : t.content.flatMap((b) => (b.type === "photo" ? [b.id] : [])))));
+    const photos = new Map<string, { type: PhotoMeta["type"]; data: string }>();
+    for (const p of (await this.db.get<PhotoMeta[]>("photos")) ?? []) {
+      const photo = used.has(p.id) ? await this.loadPhoto(p) : null;
+      if (photo) photos.set(p.id, photo);
+    }
     return turns.map((t) => ({
       role: t.role,
-      content: typeof t.content === "string" ? t.content : t.content.map((b): Anthropic.Beta.BetaContentBlockParam =>
-        b.type === "text"
-          ? b
-          : photo && photo.id === b.id
-          ? { type: "image", source: { type: "base64", media_type: photo.type, data: photo.data } }
-          : { type: "text", text: "[фото задания]" }
-      ),
+      content: typeof t.content === "string" ? t.content : t.content.map((b): Anthropic.Beta.BetaContentBlockParam => {
+        if (b.type === "text") return b;
+        const photo = photos.get(b.id);
+        return photo ? { type: "image", source: { type: "base64", media_type: photo.type, data: photo.data } } : { type: "text", text: "[фото задания, уже не хранится]" };
+      }),
     }));
   }
 

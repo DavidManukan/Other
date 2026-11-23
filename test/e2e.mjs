@@ -275,11 +275,25 @@ try {
   await photo("905", "", undefined, `http://127.0.0.1:${MOCK}/notphoto`);
   ok(await until(() => texts("905").includes("Не понял формат фото. Пришли обычное фото.")), "не картинка: понятное сообщение", JSON.stringify(texts("905")));
 
-  // --- два фото подряд: решаются по очереди, ничего не теряется ---
-  await photo("906", "", "Q1");
+  // --- фото подряд: первое решается сразу, пришедшие следом решаются вместе, модель видит все ---
+  const imgs = (m) => (Array.isArray(m.content) ? m.content.filter((x) => x.type === "image").length : 0);
+  await photo("906", "S_HELLO серия906", "Q1");
+  await sleep(700);
   await photo("906", "", "Q2");
-  ok(await until(() => of("906").filter((c) => c.method === "sendFileByUpload").length === 2, 30_000), "два фото подряд: оба решены");
-  ok(texts("906").length === 4, "два фото подряд: четыре ответа", JSON.stringify(texts("906").length));
+  await photo("906", "вторая страница", "Q3");
+  ok(await until(() => texts("906").filter((t) => t.includes("Ответ: 42")).length === 2, 30_000), "три фото подряд: все решены", JSON.stringify(texts("906")));
+  const series = claude.filter((b) => JSON.stringify(b.messages).includes("серия906"));
+  ok(series.length === 2 && imgs(series[0].messages.at(-1)) === 1 && imgs(series[1].messages.at(-1)) === 2, "три фото подряд: первое отдельно, два следующих одним запросом", JSON.stringify(series.map((b) => b.messages.map(imgs))));
+  ok(series[1].messages.at(-1).content.at(-1).text.includes("Фото 2") && series[1].messages.at(-1).content.at(-1).text.includes("вторая страница") && imgs(series[1].messages[0]) === 1, "серия: модель видит и прошлое фото, и подпись");
+  await photo("906", "", "Q4");
+  ok(await until(() => claude.filter((b) => JSON.stringify(b.messages).includes("серия906")).length === 3, 30_000), "четвёртое фото решается");
+  const fourth = claude.filter((b) => JSON.stringify(b.messages).includes("серия906")).at(-1);
+  ok(fourth.messages.reduce((n, m) => n + imgs(m), 0) === 3 && JSON.stringify(fourth.messages[0]).includes("уже не хранится"), "в памяти три последних фото, самое старое заменено пометкой", JSON.stringify(fourth.messages.map(imgs)));
+
+  // --- ответ на конкретное сообщение: модель знает, на какое ---
+  const bq = claude.length;
+  await hook("916", { typeMessage: "quotedMessage", extendedTextMessageData: { text: "объясни" }, quotedMessage: { typeMessage: "textMessage", textMessage: "№2 Ответ: 5" } });
+  ok(await until(() => claude.length > bq) && claude[bq].messages.at(-1).content[0].text === "объясни\n\n(это ответ на сообщение: «№2 Ответ: 5»)", "цитата уходит модели вместе с вопросом", JSON.stringify(claude[bq]?.messages.at(-1)));
 
   // --- загрузка файлов в шлюз не работает: рисунок уходит запасным путём, по ссылке ---
   flags.uploadBroken = true;
