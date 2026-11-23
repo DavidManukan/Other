@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "solver",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  // Ключи (ANTHROPIC_API_KEY, GREEN_URL, GREEN_ID, GREEN_TOKEN) сюда НЕ писать:
+  // они задаются в панели Cloudflare → Settings → Variables and Secrets.
+  "keep_vars": true,
+  "durable_objects": {
+    "bindings": [{ "name": "CHAT", "class_name": "Chat" }],
+    // при обновлении кода даём идущему решению до 15 минут, чтобы оно закончило кусок
+    "code_update_strategy": { "mode": "deferred", "max_delay": 900 }
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat"] }],
+  "rules": [{ "type": "Data", "globs": ["**/*.ttf"], "fallthrough": true }],
+  "observability": { "enabled": true }
+}
