@@ -34,7 +34,7 @@ function sse(res, events, { gap = 5 } = {}) {
   next();
 }
 
-function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks = [], container, after = "" } = {}) {
+function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks = [], container, after = "", out = 345 } = {}) {
   if (after) return notes(text, blocks, after, model);
   const ev = [
     { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", model: model ?? "claude-fable-5-2", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1200, output_tokens: 1, cache_read_input_tokens: 5000, cache_creation_input_tokens: 400 } } },
@@ -52,7 +52,7 @@ function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks =
     for (let i = 0; i < text.length; i += 17) ev.push({ type: "content_block_delta", index, delta: { type: "text_delta", text: text.slice(i, i + 17) } });
     ev.push({ type: "content_block_stop", index });
   }
-  ev.push({ type: "message_delta", delta: { stop_reason: stop, stop_sequence: null, ...(container ? { container: { id: container, expires_at: "2027-01-01T00:00:00Z" } } : {}) }, usage: { output_tokens: 345 } });
+  ev.push({ type: "message_delta", delta: { stop_reason: stop, stop_sequence: null, ...(container ? { container: { id: container, expires_at: "2027-01-01T00:00:00Z" } } : {}) }, usage: { output_tokens: out } });
   ev.push({ type: "message_stop" });
   return { ev, gap };
 }
@@ -142,6 +142,8 @@ function anthropic(req, res, body) {
   if (scenario === "S_REFMID") return send("№1\nОтвет: 5\n@@@\n№2\nначало", { stop: "refusal" });
   if (scenario === "S_CUT" && text !== CONT) return send("№1\nx^2 = 16\nОтвет: 4\n@@@\n№2\nначало решения, которое не помести", { stop: "max_tokens" });
   if (scenario === "S_CUT") return send("начало решения, которое не поместилось в первый кусок.\nОтвет: 7 см2");
+  // ответ оборван, и этот кусок дорогой (миллион токенов выхода): после него дневной лимит исчерпан
+  if (scenario === "S_CAPCUT") return send("№1\nx^2 = 16\nОтвет: 4\n@@@\n№2\nначало решения, которое не помести", { stop: "max_tokens", out: 1_000_000 });
   if (scenario === "S_WAIT") return send("№1\nОтвет: 42", { think: 2500 });
   if (scenario === "S_SLOWB") return send("№1\nОтвет: 42", { think: 8000 });
   if (scenario === "S_HELLO") return send("№1\nОтвет: 42", { think: 4500 });
@@ -251,14 +253,17 @@ export function start(port) {
         res.writeHead(200, { "content-type": "image/jpeg" });
         return res.end(Buffer.concat([JPEG, Buffer.from([7, 7, 7])]));
       }
-      if (url.pathname === "/task.pdf" || url.pathname === "/task2.pdf") {
+      if (url.pathname === "/task.pdf" || url.pathname === "/task2.pdf" || url.pathname === "/mid.pdf" || url.pathname === "/mid2.pdf") {
         res.writeHead(200, { "content-type": "application/pdf" });
         return res.end(Buffer.from(`%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n% ${url.pathname}\n%%EOF\n`));
       }
       if (url.pathname === "/anthropic/v1/messages/count_tokens" && req.method === "POST") {
         counted.push(body);
         res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ input_tokens: JSON.stringify(body.messages).includes("S_BIGPDF") ? 400_000 : 5_000 }));
+        // файлы mid*.pdf считаются по 100 тысяч токенов: два таких в одном запросе уже не помещаются, один помещается
+        const docs = body.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((b) => b.type === "document");
+        const mid = docs.filter((b) => Buffer.from(b.source.data, "base64").toString().includes("/mid")).length;
+        return res.end(JSON.stringify({ input_tokens: JSON.stringify(body.messages).includes("S_BIGPDF") ? 400_000 : 5_000 + mid * 100_000 }));
       }
       if (url.pathname === "/photo.jpg") {
         res.writeHead(200, { "content-type": "image/jpeg" });

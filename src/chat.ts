@@ -73,7 +73,6 @@ interface Opts {
   effort?: Effort;
   fast?: boolean;
   pages?: boolean; // решение картинкой (страницы) или текстом
-  check?: boolean; // вторая, независимая проверка готового решения
 }
 // Расход за сутки (UTC). Лежит в служебном объекте.
 interface Day {
@@ -81,7 +80,7 @@ interface Day {
   tokens: number;
   n: number; // запросов к Claude
   browser: number; // мс работы браузера, который снимает страницы
-  unpriced?: number; // запросов на модели, цену которой бот не знает
+  unpriced?: number; // запросов, посчитанных примерно (модель с неизвестной ценой, оборванный поток)
 }
 // Общие настройки бота из служебного объекта
 interface Gate {
@@ -89,6 +88,7 @@ interface Gate {
   cap: number | null; // дневной лимит расходов, доллары
   today: number; // потрачено сегодня
   owner: string | null;
+  check: boolean; // вторая проверка решений: одна на весь бот, как лимит и доступ, иначе «выкл» у хозяина не спасает от трат в чужих чатах
 }
 // Вторая проверка. В объекте чата лежит то, что нужно проверить; очередь проверок ведёт отдельный объект «чат#check»,
 // чтобы проверка шла параллельно со следующими заданиями и не задерживала их.
@@ -144,6 +144,7 @@ interface Outcome {
   refused: boolean;
   empty: boolean;
   noted?: boolean; // пометки «оборван» и «не дорешала» уже отправлены
+  capped?: string; // ответ оборван дневным лимитом: это сообщение уходит после него
 }
 interface Job {
   id: string;
@@ -223,7 +224,7 @@ export class Chat extends DurableObject<Env> {
   private owner: boolean | undefined; // этот чат принадлежит хозяину бота
   private k: number; // масштаб времени: 1 в работе, больше только в локальных тестах
   private gateAt = 0;
-  private gateVal: Gate = { closed: false, cap: null, today: 0, owner: null };
+  private gateVal: Gate;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -231,6 +232,7 @@ export class Chat extends DurableObject<Env> {
     this.green = new Green(this.c);
     this.hide = hider(this.c);
     this.k = Math.max(1, Number(env.TIME_SCALE) || 1);
+    this.gateVal = { closed: false, cap: null, today: 0, owner: null, check: this.c.check };
   }
 
   private get db() {
@@ -255,8 +257,12 @@ export class Chat extends DurableObject<Env> {
     const type = String(md.typeMessage ?? "");
     const fd = md.fileMessageData ?? {};
     try {
-      const pdf = type === "documentMessage" && (/pdf/i.test(String(fd.mimeType ?? "")) || /\.pdf$/i.test(String(fd.fileName ?? "")));
-      if (type === "imageMessage" || pdf || (type === "documentMessage" && /^image\//.test(String(fd.mimeType ?? "")))) {
+      // Файл без понятного типа (сканеры и пересылка часто шлют PDF как application/octet-stream) берём как файл:
+      // что это на самом деле, question() решает по содержимому, а не по названию
+      const mime = String(fd.mimeType ?? "").toLowerCase();
+      const unknown = mime === "" || mime === "application/octet-stream" || mime === "binary/octet-stream";
+      const pdf = type === "documentMessage" && (/pdf/.test(mime) || /\.pdf$/i.test(String(fd.fileName ?? "")) || unknown);
+      if (type === "imageMessage" || pdf || (type === "documentMessage" && /^image\//.test(mime))) {
         const shot: Shot = { id, url: fd.downloadUrl ? String(fd.downloadUrl) : undefined, caption: String(fd.caption ?? "").trim().slice(0, 2000) || undefined, fwd: forwarded(fd) || undefined, pdf: pdf || undefined, at: Date.now() };
         return await this.photoIn(chatId, shot, mark);
       }
@@ -357,7 +363,7 @@ export class Chat extends DurableObject<Env> {
 
   private async options(): Promise<{ effort: Effort; fast: boolean; pages: boolean; check: boolean }> {
     const o = (await this.db.get<Opts>("opts")) ?? {};
-    return { effort: o.effort ?? this.c.effort, fast: o.fast ?? this.c.fast, pages: o.pages ?? this.c.pages, check: o.check ?? this.c.check };
+    return { effort: o.effort ?? this.c.effort, fast: o.fast ?? this.c.fast, pages: o.pages ?? this.c.pages, check: (await this.gate()).check };
   }
 
   // Общие настройки (доступ, дневной лимит, сегодняшний расход) лежат в служебном объекте; чат помнит их полминуты
@@ -383,13 +389,13 @@ export class Chat extends DurableObject<Env> {
   private async bill(job: Job | null, list: Spent[]) {
     if (!list.length) return;
     const tokens = list.reduce((n, s) => n + s.in + s.out + s.read + s.write, 0);
-    const usd = list.reduce((n, s) => n + (s.usd ?? 0), 0);
+    const usd = list.reduce((n, s) => n + s.usd, 0);
     if (job) {
       job.tokens += tokens;
       job.usd = (job.usd ?? 0) + usd;
     }
     try {
-      await chatStub(this.env, STATUS).spend({ usd, tokens, requests: list.length, unpriced: list.filter((s) => s.usd === null).length });
+      await chatStub(this.env, STATUS).spend({ usd, tokens, requests: list.length, unpriced: list.filter((s) => s.approx).length });
     } catch (e) {
       console.log("spend:", this.hide(e));
     }
@@ -485,13 +491,19 @@ export class Chat extends DurableObject<Env> {
         await this.green.send(chatId, cap === null ? "Дневной лимит снят ✅" : `Дневной лимит: ${money(cap)} ✅ Когда он исчерпан, бот ждёт следующих суток (сутки считаются по UTC).`);
       } else if (acc) {
         const closed = acc[1].startsWith("закр");
+        // Без OWNER хозяином считается первый, кто написал команду: закрытый им бот запер бы настоящего хозяина
+        if (closed && !this.c.owners.length) {
+          await this.green.send(chatId, `Закрыть доступ можно, только когда задана переменная OWNER. Добавь в Cloudflare переменную OWNER со значением ${chatId}`);
+          return true;
+        }
         await hub.setGate({ closed });
         this.gateAt = 0;
         await this.green.send(chatId, closed ? "Доступ закрыт ✅ Бот отвечает только тебе." : "Доступ открыт ✅ Бот отвечает всем, кто ему напишет.");
       } else if (chk) {
         const check = chk[1] === "вкл" || chk[1] === "on";
-        await this.db.put<Opts>("opts", { ...((await this.db.get<Opts>("opts")) ?? {}), check });
-        await this.green.send(chatId, check ? `Вторая проверка включена ✅ После ответа решение перепроверяет ${this.c.checkModel}; найдёт ошибку, пришлю исправление.` : "Вторая проверка выключена ✅");
+        await hub.setGate({ check });
+        this.gateAt = 0;
+        await this.green.send(chatId, check ? `Вторая проверка включена ✅ Во всех чатах после ответа решение перепроверяет ${this.c.checkModel}; найдёт ошибку, пришлю исправление.` : "Вторая проверка выключена ✅ Во всех чатах.");
       }
       return true;
     }
@@ -667,60 +679,85 @@ export class Chat extends DurableObject<Env> {
 
     // 1. Спрашиваем Claude. Если ответ уже готов (прошлый запуск не смог его доставить), этот шаг пропускаем
     if (!job.done) {
+      // Общие настройки читаем свежими: это последняя точка перед платным запросом (и для повторов, и для продолжений)
+      const gate = await this.gate(true);
+      // доступ закрыт: на чужие задания, ждущие в очереди, деньги хозяина не тратим и чужому чату ничего не пишем
+      if (gate.closed && !this.mine(chatId, gate)) {
+        await this.db.delete(key);
+        return void (await this.note("доступ закрыт: задание чужого чата снято без решения"));
+      }
+      // Дневной лимит расходов, который задал хозяин: когда он исчерпан, новых запросов к Claude не делаем
+      const capped = gate.cap !== null && gate.today >= gate.cap;
+      const capNote = capped ? `дневной лимит исчерпан (${money(gate.today)} из ${money(gate.cap!)})` : "";
+      const capText = !capped ? "" : this.mine(chatId, gate)
+        ? `Дневной лимит расходов исчерпан: потрачено ${money(gate.today)} из ${money(gate.cap!)}. Напиши «лимит выкл» или подними лимит и пришли задание ещё раз.`
+        : "На сегодня бот закончил работу. Пришли задание завтра.";
+      if (capped && !job.acc) {
+        await this.note(`${capNote}: задание не решено`);
+        return await this.finish(key, job, chatId, capText);
+      }
       const content = await this.question(key, job, chatId);
       if (!content) return;
-      const turns: Turn[] = [...(await this.history()), { role: "user", content }];
-      // если ответ обрезало, продолжаем его: уже написанное модель видит как свой текст
-      if (job.acc) turns.push({ role: "assistant", content: job.acc }, { role: "user", content: [{ type: "text", text: CONT }] });
 
-      // Дневной лимит расходов, который задал хозяин: когда он исчерпан, новых запросов к Claude не делаем
-      const gate = await this.gate(true);
-      if (gate.cap !== null && gate.today >= gate.cap) {
-        await this.note(`дневной лимит исчерпан (${money(gate.today)} из ${money(gate.cap)}): задание не решено`);
-        return await this.finish(key, job, chatId, this.mine(chatId, gate)
-          ? `Дневной лимит расходов исчерпан: потрачено ${money(gate.today)} из ${money(gate.cap)}. Напиши «лимит выкл» или подними лимит и пришли задание ещё раз.`
-          : "На сегодня бот закончил работу. Пришли задание завтра.");
-      }
-      const messages = await this.toApi(turns);
-      // Длинный PDF (учебник целиком) в одно решение не берём: сначала бесплатно считаем, сколько он займёт
-      if (!job.acc && job.shots.some((x) => x.pdf)) {
-        const size = await inputTokens(this.c, messages);
-        if (stop.aborted) throw stop.reason;
-        if (size !== null && size > PDF_TOKENS) return await this.finish(key, job, chatId, "Файл слишком длинный для одного решения. Пришли фото нужных страниц или файл покороче.");
-      }
-
-      // долгое молчание похоже на поломку: один раз даём знать, что бот жив
-      const hello = job.hello ? undefined : setTimeout(() => {
-        if (stop.aborted) return;
-        job.hello = true;
-        this.ctx.waitUntil(this.say(chatId, "⏳ Ещё решаю, скоро пришлю."));
-      }, HELLO / this.k);
-
-      const { fast } = await this.options();
-      job.tries++; // попытка засчитывается до запроса: если объект упадёт посреди него, счётчик это запомнит
-      await save();
       let a: Answer;
-      const bills: Spent[] = [];
-      try {
-        a = await ask(this.c, { messages, effort: job.effort, fast, until: end - SEGMENT_TAIL / this.k, stop, spent: (s) => bills.push(s) });
-      } finally {
-        clearTimeout(hello);
-        await this.bill(job, bills); // расход считаем при любом исходе: оборванный запрос тоже стоит денег
-      }
-      job.checks += a.checks;
-      job.model = a.model;
-      const full = job.acc ? `${job.acc}\n${a.text.replace(/^\s*\n/, "")}` : a.text; // продолжение начинается с новой строки
-      if (a.cut && !a.text.trim() && job.effort !== "low") throw new Timeout("лимит токенов ушёл на размышления"); // повтор на ступень проще
-      if (a.cut && a.text.trim() && job.step < this.c.autoMax) {
-        const next = seam(full);
-        if (next.length > job.acc.length) {
-          job.acc = next;
-          job.step++;
-          job.tries = 0;
-          return await save(); // следующий будильник продолжит со свежим запасом времени
+      let full: string;
+      if (capped) {
+        // Лимит кончился посреди длинного ответа: уже оплаченное начало доставляем как оборванный ответ, Claude не спрашиваем
+        await this.note(`${capNote}: отправляю начало ответа без продолжения`);
+        a = { text: "", cut: true, refused: false, tokens: { in: 0, out: 0 }, model: job.model ?? this.c.model, checks: 0 };
+        full = job.acc;
+      } else {
+        const turns: Turn[] = [...(await this.history()), { role: "user", content }];
+        // если ответ обрезало, продолжаем его: уже написанное модель видит как свой текст
+        if (job.acc) turns.push({ role: "assistant", content: job.acc }, { role: "user", content: [{ type: "text", text: CONT }] });
+
+        // Попытка засчитывается до сборки запроса: если объект упадёт на ней (фото и PDF в памяти) или посреди запроса, счётчик это запомнит
+        job.tries++;
+        await save();
+        let messages = await this.toApi(turns);
+        // Длинный PDF (учебник целиком) в одно решение не берём: сначала бесплатно считаем, сколько он займёт
+        if (!job.acc && job.shots.some((x) => x.pdf)) {
+          const size = await inputTokens(this.c, messages);
+          if (stop.aborted) throw stop.reason;
+          if (size !== null && size > PDF_TOKENS) {
+            // Отказ решает только новый материал: большой файл из прошлой работы не должен мешать короткому новому
+            const own = await inputTokens(this.c, await this.toApi([{ role: "user", content }]));
+            if (stop.aborted) throw stop.reason;
+            if (own !== null && own > PDF_TOKENS) return await this.finish(key, job, chatId, "Файл слишком длинный для одного решения. Пришли фото нужных страниц или файл покороче.");
+            messages = await this.toApi(turns, content); // файлы прошлых работ в этот запрос не берём
+          }
         }
-        // за весь кусок не дописано ни одной целой строки: продолжать нечего, пробуем на ступень проще
-        if (job.effort !== "low") throw new Timeout("ответ оборвался, не дописав ни строки");
+
+        // долгое молчание похоже на поломку: один раз даём знать, что бот жив
+        const hello = job.hello ? undefined : setTimeout(() => {
+          if (stop.aborted) return;
+          job.hello = true;
+          this.ctx.waitUntil(this.say(chatId, "⏳ Ещё решаю, скоро пришлю."));
+        }, HELLO / this.k);
+
+        const { fast } = await this.options();
+        const bills: Spent[] = [];
+        try {
+          a = await ask(this.c, { messages, effort: job.effort, fast, until: end - SEGMENT_TAIL / this.k, stop, spent: (s) => bills.push(s) });
+        } finally {
+          clearTimeout(hello);
+          await this.bill(job, bills); // расход считаем при любом исходе: оборванный запрос тоже стоит денег
+        }
+        job.checks += a.checks;
+        job.model = a.model;
+        full = job.acc ? `${job.acc}\n${a.text.replace(/^\s*\n/, "")}` : a.text; // продолжение начинается с новой строки
+        if (a.cut && !a.text.trim() && job.effort !== "low") throw new Timeout("лимит токенов ушёл на размышления"); // повтор на ступень проще
+        if (a.cut && a.text.trim() && job.step < this.c.autoMax) {
+          const next = seam(full);
+          if (next.length > job.acc.length) {
+            job.acc = next;
+            job.step++;
+            job.tries = 0;
+            return await save(); // следующий будильник продолжит со свежим запасом времени
+          }
+          // за весь кусок не дописано ни одной целой строки: продолжать нечего, пробуем на ступень проще
+          if (job.effort !== "low") throw new Timeout("ответ оборвался, не дописав ни строки");
+        }
       }
 
       // 2. Ответ готов. С этой записи Claude по этой работе больше не спрашиваем: дальше только доставка
@@ -731,7 +768,7 @@ export class Chat extends DurableObject<Env> {
       job.turn = epoch === this.epoch ? content : undefined; // «сброс» пришёл, пока модель думала: в очищенную память эта пара не пойдёт
       job.outbox = [];
       job.packed = false;
-      job.done = { cut: a.cut, refused: a.refused, empty: !job.parts.length };
+      job.done = { cut: a.cut, refused: a.refused, empty: !job.parts.length, ...(capped ? { capped: capText } : {}) };
       job.acc = "";
       await save();
     }
@@ -762,7 +799,7 @@ export class Chat extends DurableObject<Env> {
       a.noted = true; // пометка уходит один раз, даже если объект перезапустится до конца работы
       await this.db.put(key, job);
       if (a.refused) await this.say(chatId, "(модель остановилась и не дорешала. Пересними оставшиеся задания.)");
-      if (a.cut) await this.say(chatId, CUT_NOTE);
+      if (a.cut) await this.say(chatId, a.capped ?? CUT_NOTE); // оборван лимитом: прислать остальное отдельно сейчас не выйдет, поэтому говорим про лимит
     }
     if (job.svgs.length) {
       job.done = undefined;
@@ -873,6 +910,8 @@ export class Chat extends DurableObject<Env> {
     const have = new Set(list.map((p) => p.id));
     const sizes = new Map(list.map((p) => [p.id, p.size ?? p.n * PHOTO_CHUNK]));
     const ready: Shot[] = [];
+    const big = new Set<Shot>(); // файлы больше 5 МБ: повторная отправка не поможет, о них говорим отдельно
+    let tooBig: unknown;
     for (const shot of job.shots) {
       if (!have.has(shot.id)) {
         let type: PhotoMeta["type"] | null = null;
@@ -893,6 +932,7 @@ export class Chat extends DurableObject<Env> {
             throw new Busy("фото пока не скачивается");
           }
           if (job.shots.length === 1) throw e;
+          if (e instanceof TooBig) (big.add(shot), (tooBig = e));
           console.log("фото не скачалось:", this.hide(e));
         }
         if (!type) continue;
@@ -900,18 +940,20 @@ export class Chat extends DurableObject<Env> {
       if (shot.hash && ready.some((x) => x.hash === shot.hash)) continue; // то же фото ушло дважды
       ready.push(shot);
     }
+    if (!ready.length && tooBig) throw tooBig; // все файлы слишком большие: alarm скажет про размер
     if (!ready.length) {
       await this.db.delete(key);
       await this.say(chatId, "Не понял формат файла. Пришли обычное фото или PDF.");
       return null;
     }
-    const lost = job.shots.filter((x) => !ready.includes(x) && !x.hash).length;
+    const lost = job.shots.filter((x) => !ready.includes(x) && !x.hash && !big.has(x)).length;
     // слишком тяжёлые фото (их шлют файлом) в один запрос не помещаются: берём, сколько влезает
     let weight = 0;
     const fit = ready.filter((x, i) => (weight += sizes.get(x.id) ?? 0) <= PHOTO_BUDGET || i === 0);
     const heavy = ready.length - fit.length;
     job.shots = fit; // повторы и неоткрывшиеся фото убираем, чтобы не разбираться с ними при каждом запуске
     if (lost) await this.say(chatId, `(не открылось: ${lost}. Пришли ещё раз.)`);
+    if (big.size) await this.say(chatId, `(файл больше 5 МБ не взял: ${big.size}. Пришли фото нужных страниц или файл поменьше.)`);
     if (heavy) await this.say(chatId, `(всё вместе слишком тяжёлое, взял первые ${fit.length}. Остальное пришли обычным фото.)`);
     const n = fit.length;
     const content: Block[] = [];
@@ -1063,8 +1105,10 @@ export class Chat extends DurableObject<Env> {
 
   // Разговор -> запрос к Claude. Фото берём в пределах бюджета: сначала фото текущей работы,
   // потом фото прошлых работ от новых к старым. Что не поместилось, заменяется пометкой.
-  private async toApi(turns: Turn[]): Promise<Anthropic.Beta.BetaMessageParam[]> {
+  // now: материалы текущей работы. С ним файлы PDF прошлых работ не берём: весь запрос вышел бы слишком длинным.
+  private async toApi(turns: Turn[], now?: Block[]): Promise<Anthropic.Beta.BetaMessageParam[]> {
     const metas = new Map(((await this.db.get<PhotoMeta[]>("photos")) ?? []).map((p) => [p.id, p]));
+    const fresh = now ? new Set(now.flatMap((b) => (b.type === "photo" ? [b.id] : []))) : null;
     const order: string[] = [];
     for (const t of [...turns].reverse()) {
       if (typeof t.content !== "string") for (const b of t.content) if (b.type === "photo" && !order.includes(b.id)) order.push(b.id);
@@ -1074,7 +1118,7 @@ export class Chat extends DurableObject<Env> {
     for (const id of order) {
       const p = metas.get(id);
       const size = p ? (p.size ?? p.n * PHOTO_CHUNK) : 0;
-      if (!p || (size > budget && photos.size > 0)) continue;
+      if (!p || (size > budget && photos.size > 0) || (fresh && !fresh.has(id) && p.type === "application/pdf")) continue;
       const photo = await this.loadPhoto(p);
       if (!photo) continue;
       budget -= size;
@@ -1089,7 +1133,7 @@ export class Chat extends DurableObject<Env> {
           ? photo.type === "application/pdf"
             ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: photo.data } }
             : { type: "image", source: { type: "base64", media_type: photo.type, data: photo.data } }
-          : { type: "text", text: metas.has(b.id) ? "[фото прошлой работы, в этот запрос не помещается]" : "[фото задания, уже не хранится]" };
+          : { type: "text", text: !metas.has(b.id) ? "[фото задания, уже не хранится]" : metas.get(b.id)!.type === "application/pdf" ? "[файл прошлой работы, в этот запрос не помещается]" : "[фото прошлой работы, в этот запрос не помещается]" };
       }),
     }));
   }
@@ -1205,6 +1249,8 @@ export class Chat extends DurableObject<Env> {
       const input = (await main.checkInput(q.ref)) as unknown as CheckWork | null;
       if (!input) return void (await this.db.delete(key)); // проверку отменили («стоп», «сброс») или фото уже не хранится
       const gate = await this.gate(true);
+      // доступ закрыт: проверку чужого чата снимаем без запросов и без сообщения ему
+      if (gate.closed && !this.mine(q.chatId, gate)) return await close({ failed: "доступ закрыт, проверка чужого чата снята" });
       if (gate.cap !== null && gate.today >= gate.cap) return await close({ failed: "дневной лимит расходов исчерпан" });
       const until = Date.now() + (SEGMENT - SEGMENT_TAIL) / this.k;
       const bills: Spent[] = [];
@@ -1275,16 +1321,21 @@ export class Chat extends DurableObject<Env> {
 
   async gateInfo(): Promise<Gate> {
     const key = `spend:${day(Date.now())}`;
-    const got = await this.db.get<unknown>(["closed", "cap", "owner", key]);
-    const cap = got.get("cap");
-    return { closed: got.get("closed") === true, cap: typeof cap === "number" ? cap : null, today: (got.get(key) as Day | undefined)?.usd ?? 0, owner: (got.get("owner") as string | undefined) ?? null };
+    const got = await this.db.get<unknown>(["closed", "cap", "owner", "check", key]);
+    const cap = got.get("cap"), check = got.get("check");
+    return { closed: got.get("closed") === true, cap: typeof cap === "number" ? cap : null, today: (got.get(key) as Day | undefined)?.usd ?? 0, owner: (got.get("owner") as string | undefined) ?? null, check: typeof check === "boolean" ? check : this.c.check };
   }
 
-  async setGate(p: { closed?: boolean; cap?: number | null }): Promise<void> {
+  async setGate(p: { closed?: boolean; cap?: number | null; check?: boolean }): Promise<void> {
     if (p.closed !== undefined) await this.db.put("closed", p.closed);
+    if (p.check !== undefined) await this.db.put("check", p.check);
     if (p.cap === null) await this.db.delete("cap");
     else if (typeof p.cap === "number") await this.db.put("cap", p.cap);
-    await this.log(p.closed !== undefined ? (p.closed ? "доступ закрыт: бот отвечает только хозяину" : "доступ открыт") : p.cap === null ? "дневной лимит снят" : `дневной лимит: ${money(p.cap ?? 0)}`);
+    await this.log(
+      p.closed !== undefined ? (p.closed ? "доступ закрыт: бот отвечает только хозяину" : "доступ открыт")
+      : p.check !== undefined ? `вторая проверка ${p.check ? "включена" : "выключена"} для всех чатов`
+      : p.cap === null ? "дневной лимит снят" : `дневной лимит: ${money(p.cap ?? 0)}`,
+    );
   }
 
   // Ответ на команду «расход»
@@ -1303,7 +1354,8 @@ export class Chat extends DurableObject<Env> {
       `Браузер для страниц сегодня: ${Math.round((today?.browser ?? 0) / 1000)} с из 600 бесплатных`,
       `Дневной лимит: ${g.cap === null ? "не задан" : money(g.cap)} (команды: лимит 3, лимит выкл)`,
       `Доступ: ${g.closed ? "закрыт, бот отвечает только тебе" : "открыт"} (команды: доступ закрыть, доступ открыть)`,
-      today?.unpriced ? "(часть запросов шла на модели, цену которой бот не знает: в сумму они не вошли)" : "",
+      `Вторая проверка: ${g.check ? `вкл, модель ${this.c.checkModel}` : "выкл"} (команды: проверка вкл, проверка выкл)`,
+      today?.unpriced ? `(запросов посчитано примерно: ${today.unpriced}. Модель с неизвестной ценой считается по цене заказанной, оборванный поток по написанному)` : "",
     ].filter(Boolean).join("\n");
   }
 

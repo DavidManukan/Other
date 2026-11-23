@@ -34,7 +34,7 @@ test("сценарий раскладки по листам разбираетс
 });
 
 test("сценарий раскладки: тонкие линии (оси, сетка) и линии под чёрными фигурами не мешают подписям, высокий блок режется, заголовок не остаётся один", () => {
-  assert.match(PAGINATE, /parseFloat\(cs\.strokeWidth\) <= 1\) continue/);
+  assert.match(PAGINATE, /parseFloat\(cs\.strokeWidth\) \* k <= area\.width \/ 800/);
   assert.match(PAGINATE, /isPointInFill/);
   assert.match(PAGINATE, /\.task > pre\.b, \.task > \.b\.line/);
   assert.match(PAGINATE, /page\.length === 1 && last\(\)\.task === task/);

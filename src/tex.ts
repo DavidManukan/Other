@@ -14,7 +14,7 @@ const SYM: Record<string, string> = {
   land: "∧", wedge: "∧", lor: "∨", vee: "∨", neg: "¬", lnot: "¬", oplus: "⊕", sum: "Σ", prod: "∏", int: "∫", oint: "∮",
   ell: "ℓ", hbar: "ħ", prime: "′", quad: " ", qquad: "  ", lbrace: "{", rbrace: "}", langle: "⟨", rangle: "⟩", mid: "|", vert: "|",
   backslash: "\\", colon: ":", lt: "<", gt: ">", ast: "∗", star: "⋆", propto: "∝", cong: "≅", ll: "≪", gg: "≫", simeq: "≃",
-  smile: "◡", frown: "⌢", nparallel: "∦", nmid: "∤", therefore: "∴", because: "∵",
+  lessdot: "⋖", gtrdot: "⋗", smile: "◡", frown: "⌢", nparallel: "∦", nmid: "∤", therefore: "∴", because: "∵",
   lvert: "|", rvert: "|", lVert: "‖", rVert: "‖", Vert: "‖", lfloor: "⌊", rfloor: "⌋", lceil: "⌈", rceil: "⌉",
   varkappa: "ϰ", varrho: "ρ", varsigma: "ς", Pi: "Π", Xi: "Ξ", Upsilon: "Υ", supset: "⊃", supseteq: "⊇", nsubseteq: "⊈",
   otimes: "⊗", leqq: "≤", geqq: "≥", rightleftharpoons: "⇄", leftrightarrows: "⇄", triangleq: "≜", bot: "⊥", top: "⊤",
@@ -61,7 +61,7 @@ const GONE = new Set(["phantom", "hphantom", "vphantom", "color", "label", "ref"
 const FUNCS = new Set([
   "sin", "cos", "tan", "cot", "tg", "ctg", "sec", "csc", "cosec", "arcsin", "arccos", "arctan", "arctg", "arcctg", "sinh", "cosh", "tanh", "coth", "sh", "ch", "th", "cth",
   "ln", "lg", "log", "exp", "lim", "max", "min", "sup", "inf", "det", "dim", "deg", "gcd", "ker", "arg", "Pr", "hom",
-  "cotg", "liminf", "limsup", "argmax", "argmin", "sgn",
+  "cotg", "liminf", "limsup", "argmax", "argmin", "sgn", "arccot", "arcsec", "arccsc", "sech", "csch", "lcm",
 ]);
 const NOT: Record<string, string> = { "=": "≠", "∈": "∉", "⊂": "⊄", "⊆": "⊈", "≡": "≢", "<": "≮", ">": "≯", "|": "∤", "∥": "∦" };
 const GLUE = /[\p{L}\p{N})′⁰¹²³⁴-⁹ⁿˣ₀-₉]$/u; // после такого знака имя функции нужно отделить пробелом: «2 sin x cos x»
@@ -211,8 +211,11 @@ function conv(s: string): string {
       else if (name in SYM) out += SYM[name];
       else if (FUNCS.has(name)) out += (GLUE.test(out) ? " " : "") + name; // sin, cos, tg, log
       else if (!/^[A-Za-z]+$/.test(name)) out += name; // \%, \{, \$ …
-      // команда, которой нет в списках: её имя человеку ничего не скажет, а аргумент (\emph{важно}) остаётся
+      else if (name.length === 1 && name in BB) out += BB[name]; // \R, \N, \Z: множества чисел
+      // Команда, которой нет в списках. С аргументом (\emph{важно}) это оформление: имя не нужно, аргумент остаётся.
+      // Без аргумента это чаще всего функция (\arccot x, \lcm(4, 6)): без имени формула потеряла бы смысл
       else if (/^ *\{/.test(s.slice(i))) out += group();
+      else out += (GLUE.test(out) ? " " : "") + name;
       continue;
     }
     last = c === " " ? last : c === "^" || c === "_" ? last : "";
@@ -272,21 +275,28 @@ export const plainMath = (text: string): string => mathSpans(text).map((s) => (s
 const isCommand = (name: string) => KNOWN.has(name);
 const MARKUP = /[\\$]|[\^_]\{/; // без этих знаков разметки LaTeX в тексте быть не может
 // \имя{…} с именем из двух букв и больше это LaTeX, даже если команды нет в списках; \d{3} из регулярного выражения нет
+// Норма \|a\| это пара знаков; одиночный «\|» встречается в коде (grep 'foo\|bar') и разметкой не считается
+const NORM = /\\\|[^|\n]*?\\\|/;
 const hot = (t: string): boolean => {
-  for (const m of t.matchAll(/\\([A-Za-z]+)(\{)?|\\\||[\^_]\{/g)) if (m[1] === undefined || isCommand(m[1]) || (m[2] && m[1].length > 1)) return true;
-  return false;
+  for (const m of t.matchAll(/\\([A-Za-z]+)(\{)?|[\^_]\{/g)) if (m[1] === undefined || isCommand(m[1]) || (m[2] && m[1].length > 1)) return true;
+  return NORM.test(t);
 };
 // Путь к файлу (C:\data\in\input.txt) и код в `…` разметкой не считаем и не трогаем: в них обратная черта, $ и скобки значат своё.
 // Код в `…` всё же разбираем, если в нём команда LaTeX или пара $…$: так модель иногда пишет формулы,
 // а случайная пара обратных кавычек в тексте не должна прятать формулу между ними.
 // Путь стоит отдельным словом и кончается пробелом или знаком препинания: «f:\mathbb{R}\to\mathbb{R}» в формуле путём не считается.
 const SAFE = /`[^`\n]+`|(?<![^\s"'«(\[])[A-Za-z]:\\[^\s$`{}]*(?![^\s,;.!?)»"'\]])/g;
-const literal = (s: string) => s[0] !== "`" || (!hot(s) && !/\$(?!\s)[^$\n]+(?<!\s)\$/.test(s));
+// У настоящего пути есть хотя бы одна папка или файл, чьё имя не команда LaTeX: «f:\mathbb R» и «x:\alpha» это формулы без знаков $
+const pathLike = (s: string) => s.slice(3).split("\\").some((seg) => seg !== "" && (!/^[A-Za-z]+$/.test(seg) || (seg.length > 1 && !isCommand(seg))));
+const literal = (s: string) => (s[0] === "`" ? !hot(s) && !/\$(?!\s)[^$\n]+(?<!\s)\$/.test(s) : pathLike(s));
+// Что началось раньше, то и считается: в «$f`(x) = 2x$ и $g`(x) = 3$» обратная кавычка это штрих внутри формулы, а не начало кода,
+// а в «`^\d+$` и `^[a-z]+$`» знак $ стоит внутри кода и формулу не открывает
+const SPANS = new RegExp(`(\\$\\$[^$]+?\\$\\$|\\$(?!\\s)(?:\\\\.|[^$\\\\\\n])+?(?<!\\s)\\$)|${SAFE.source}`, "g");
 function pieces(text: string): [string, boolean][] {
   const out: [string, boolean][] = [];
   let at = 0;
-  for (const m of text.matchAll(SAFE)) {
-    if (!literal(m[0])) continue;
+  for (const m of text.matchAll(SPANS)) {
+    if (m[1] !== undefined || !literal(m[0])) continue;
     out.push([text.slice(at, m.index), false], [m[0], true]);
     at = m.index! + m[0].length;
   }
@@ -388,14 +398,22 @@ function strip(text: string): string {
   return text.split("\n").map((line) => {
     if (!MARKUP.test(line)) return line;
     const l = line.replace(/\\\$/g, ""); // \$ это настоящий знак доллара
-    // строка без формул (рассказ про обратную черту в Windows): меняем только \% \& \#, остальное как было
-    if (!hot(l) && !/\$|\\[()[\]|]/.test(l)) return l.replace(/\\([%&#])/g, "$1").replace(//g, "$");
+    // Строка без формул (рассказ про обратную черту в Windows): остальное в ней остаётся как было, меняем только то,
+    // что обычным текстом быть не может: \% \& \#, пару \{ … \}, «x\_1» и тонкий пробел между числом и единицей «5\,кг»
+    if (!hot(l) && !/\$|\\[()[\]]/.test(l)) {
+      return l.replace(/\\([%&#])/g, "$1")
+        .replace(/\\\{([^{}\\\n]*)\\\}/g, "{$1}")
+        .replace(/(?<=[\p{L}\p{N}])\\_(?=[\p{L}\p{N}])/gu, "_")
+        .replace(/(?<=[^\s\\])\\[,;:](?=[^\s\\])/g, " ")
+        .replace(/(?<=[^\s\\])\\!(?=[^\s\\])/g, "")
+        .replace(//g, "$");
+    }
     return bare(l, texToPlain)
       .replace(/\\([A-Za-z]+)\*?/g, (m, n: string) => (!isCommand(n) ? m : n in SYM ? SYM[n] : FUNCS.has(n) ? n : ""))
       .replace(/\\\\(?![A-Za-zА-Яа-яЁё])/g, " ")
       .replace(/\\([,;:!> ])/g, " ")
       .replace(/\\([%&#_{}])/g, "$1")
-      .replace(/\\\|/g, "‖")
+      .replace(/\\\|([^|\n]*?)\\\|/g, "‖$1‖")
       .replace(/\\[()[\]]/g, "")
       .replace(/([\^_])\{([^{}\n]*)\}/g, "$1($2)")
       .replace(/\$/g, "") // знак $ без пары: формулы тут нет, а знак остался бы мусором
@@ -409,7 +427,7 @@ function strip(text: string): string {
 export function texLeak(text: string): string | null {
   for (const block of text.split(/```[\s\S]*?```/)) {
     const piece = keep(block, (s) => s).replace(SAFE, (m) => (literal(m) ? " " : m));
-    for (const m of piece.matchAll(/\\([A-Za-z]+)(\{)?|\\[()[\]\\|{}%&#_]|\$|[\^_]\{/g)) {
+    for (const m of piece.matchAll(/\\([A-Za-z]+)(\{)?|\\[()[\]\\{}%&#_]|\\\|[^|\n]*?\\\||(?<=[^\s\\])\\[,;:!](?=[^\s\\])|\$|[\^_]\{/g)) {
       if (m[1] !== undefined && !isCommand(m[1]) && !(m[2] && m[1].length > 1)) continue;
       return piece.slice(Math.max(0, m.index! - 12), m.index! + 24);
     }

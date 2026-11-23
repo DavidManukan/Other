@@ -76,8 +76,8 @@ if (await fetch(`${BASE}/ready`).catch(() => null)) {
 }
 // отдельная группа процессов: в конце гасим wrangler вместе с его дочерним workerd
 let log = "";
-function startDev() {
-  const p = spawn("npx", ["wrangler", "dev", "--port", String(PORT), "--ip", "127.0.0.1", "--persist-to", state, ...Object.entries(VARS).flatMap(([k, v]) => ["--var", `${k}:${v}`])], { env: { ...process.env, CI: "1", WRANGLER_SEND_METRICS: "false" }, stdio: ["ignore", "pipe", "pipe"], detached: true });
+function startDev(extra = {}) {
+  const p = spawn("npx", ["wrangler", "dev", "--port", String(PORT), "--ip", "127.0.0.1", "--persist-to", state, ...Object.entries({ ...VARS, ...extra }).flatMap(([k, v]) => ["--var", `${k}:${v}`])], { env: { ...process.env, CI: "1", WRANGLER_SEND_METRICS: "false" }, stdio: ["ignore", "pipe", "pipe"], detached: true });
   p.stdout.on("data", (d) => (log += d));
   p.stderr.on("data", (d) => (log += d));
   return p;
@@ -484,19 +484,49 @@ try {
   ok(await until(() => texts("111").includes("Дневной лимит снят ✅")), "лимит: снят командой");
   await photo("974", "S_LIMC");
   ok(await until(() => answers("974").some((t) => t.includes("Ответ: 5"))), "после снятия лимита бот снова решает", JSON.stringify(texts("974")));
+  // без OWNER хозяин назначен первым, кто написал команду: закрыть доступ так нельзя, иначе чужой запер бы настоящего хозяина
   await text("111", "доступ закрыть");
-  ok(await until(() => texts("111").some((t) => t.startsWith("Доступ закрыт ✅"))), "доступ: закрыт командой");
-  await photo("975", "S_SHUT");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Закрыть доступ можно, только когда задана переменная OWNER") && t.endsWith("OWNER со значением 111@c.us"))), "доступ без OWNER: не закрывается, подсказка про переменную", JSON.stringify(texts("111").slice(-1)));
+  await sleep(800);
   await text("975", "ping");
-  await sleep(2000);
-  ok(of("975").length === 0 && reqs("S_SHUT").length === 0, "доступ закрыт: чужому чату бот не отвечает и ничего не решает", JSON.stringify(texts("975")));
-  await text("111", "ping");
-  ok(await until(() => texts("111").at(-1).startsWith("pong")), "доступ закрыт: хозяин работает как обычно");
-  await text("111", "доступ открыть");
-  ok(await until(() => texts("111").some((t) => t.startsWith("Доступ открыт ✅"))), "доступ: открыт командой");
-  await sleep(800); // чат помнит общие настройки полсекунды (время в тестах ускорено)
-  await text("975", "ping");
-  ok(await until(() => texts("975").some((t) => t.startsWith("pong"))), "доступ открыт: чужой чат снова получает ответ", JSON.stringify(texts("975")));
+  ok(await until(() => texts("975").some((t) => t.startsWith("pong"))), "доступ без OWNER остался открытым", JSON.stringify(texts("975")));
+
+  // --- дневной лимит кончился посреди длинного ответа: оплаченное начало доставлено, Claude больше не спрошен ---
+  const capRep = texts("111").length;
+  await text("111", "расход");
+  ok(await until(() => texts("111").slice(capRep).some((t) => t.startsWith("Расход на Claude"))), "расход перед лимитом");
+  const spentNow = Number(/сегодня: \$(\d+\.\d\d)/.exec(texts("111").at(-1))?.[1] ?? 0);
+  const capSum = (spentNow + 5).toFixed(2);
+  await text("111", `лимит ${capSum}`);
+  ok(await until(() => texts("111").some((t) => t.startsWith(`Дневной лимит: $${capSum} ✅`))), "лимит чуть выше сегодняшнего расхода", JSON.stringify(texts("111").slice(-1)));
+  const capFrom = texts("111").length;
+  await photo("111", "S_CAPCUT");
+  ok(await until(() => texts("111").slice(capFrom).some((t) => t.startsWith("Дневной лимит расходов исчерпан"))), "лимит посреди ответа: хозяину сказано про лимит", JSON.stringify(texts("111").slice(capFrom)));
+  const capMsgs = texts("111").slice(capFrom).filter((t) => !ACK.test(t));
+  ok(capMsgs.length === 2 && capMsgs[0].includes("x² = 16") && capMsgs[0].includes("Ответ: 4") && capMsgs[1].startsWith("Дневной лимит расходов исчерпан"), "лимит посреди ответа: уже написанное начало доставлено, потом причина", JSON.stringify(capMsgs));
+  ok(reqs("S_CAPCUT").length === 1 && !reqs("S_CAPCUT").some((b) => lastText(b) === CONT), "лимит посреди ответа: продолжение у Claude не заказано");
+  await text("111", "лимит выкл");
+  ok(await until(() => texts("111").filter((t) => t === "Дневной лимит снят ✅").length === 2), "лимит снят снова");
+
+  // --- PDF прошлой работы в памяти чата: новый небольшой файл решается, старый в запрос не идёт ---
+  await pdf("978", "S_PDFA", `http://127.0.0.1:${MOCK}/mid.pdf`);
+  ok(await until(() => answers("978").some((t) => t.includes("Ответ: 5"))), "первый большой PDF решён", JSON.stringify(texts("978")));
+  await pdf("978", "S_PDFB", `http://127.0.0.1:${MOCK}/mid2.pdf`);
+  ok(await until(() => answers("978").filter((t) => t.includes("Ответ: 5")).length === 2), "новый PDF не отвергнут из-за старого в памяти", JSON.stringify(texts("978")));
+  const pb = reqs("S_PDFB")[0];
+  ok(pb && pb.messages.flatMap((m) => docs(m)).length === 1 && JSON.stringify(pb.messages).includes("[файл прошлой работы, в этот запрос не помещается]") && Buffer.from(docs(pb.messages.at(-1))[0].source.data, "base64").toString().includes("/mid2.pdf"), "в запросе только новый файл, старый заменён пометкой", JSON.stringify(pb?.messages.map((m) => (Array.isArray(m.content) ? m.content.map((x) => x.type) : "text"))));
+
+  // --- файл без понятного типа (application/octet-stream, имя без .pdf): решает содержимое ---
+  await hook("979", { typeMessage: "documentMessage", fileMessageData: { downloadUrl: `http://127.0.0.1:${MOCK}/task.pdf`, caption: "S_OCTET", mimeType: "application/octet-stream", fileName: "scan" } });
+  ok(await until(() => answers("979").some((t) => t.includes("Ответ: 5"))) && texts("979")[0] === "📥 Принял файл, решаю.", "файл без типа: принят и решён", JSON.stringify(texts("979")));
+  ok(docs(reqs("S_OCTET")[0]?.messages.at(-1) ?? { content: [] }).length === 1, "файл без типа ушёл в Claude документом PDF");
+
+  // --- в работе из нескольких файлов один больше 5 МБ: понятное сообщение про размер, а не «не открылось» ---
+  await photo("980", "S_WAIT big980", "BG1");
+  ok(await until(() => reqs("big980").length === 1), "большой файл в работе: решение началось");
+  await photo("980", "", "BG2", `http://127.0.0.1:${MOCK}/huge.jpg`);
+  ok(await until(() => answers("980").some((t) => t.includes("Ответ: 42")), 30_000), "большой файл в работе: остальное решено", JSON.stringify(texts("980")));
+  ok(answers("980").some((t) => t.startsWith("(файл больше 5 МБ не взял: 1.")) && !answers("980").some((t) => t.startsWith("(не открылось")), "большой файл в работе: сказано про размер", JSON.stringify(texts("980")));
   page = await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text();
   ok(/токенов \d+, примерно \$\d+\.\d\d/.test(page), "журнал: у решённого задания видна примерная цена", page.split("Последние события")[1]?.slice(0, 400));
 
@@ -577,15 +607,15 @@ try {
   ok(await until(() => reqs("S_FIXQ").filter(isJudge).length === 1, 10_000), "очередь: проверка первой работы нашла ошибку");
   await sleep(800); // исправление записано в очередь чата
   const f3 = fixes().length;
-  await photo("111", "вторая страница");
+  await photo("111", "лист 2 второй работы", "FQ2", `http://127.0.0.1:${MOCK}/photo2.jpg`);
   ok(await until(() => texts("111").includes("➕ Добавил к прошлому: теперь 2 фото. Решение пришлю одним ответом."), 5000), "очередь: второе фото добавлено к работе, а не стало отдельной", JSON.stringify(texts("111").slice(-3)));
   ok(await until(() => fixes().length === f3 + 1, 40_000), "очередь: исправление первой работы пришло", JSON.stringify(texts("111").slice(-3)));
-  const mainB = claude.filter((b) => !isCheck(b) && !isJudge(b) && JSON.stringify(b.messages).includes("вторая страница"));
+  const mainB = claude.filter((b) => !isCheck(b) && !isJudge(b) && JSON.stringify(b.messages).includes("лист 2 второй работы"));
   ok(mainB.length === 1 && imgs(mainB[0].messages.at(-1)) === 2 && JSON.stringify(mainB[0].messages.at(-1)).includes("S_SLOWB"), "очередь: вторая работа решена один раз, с обоими фото", JSON.stringify(mainB.map((b) => imgs(b.messages.at(-1)))));
   const seqQ = texts("111");
   ok(seqQ.findLastIndex((t) => t.includes("Ответ: 42")) < seqQ.findLastIndex((t) => t.startsWith("⚠️ Исправление")), "очередь: исправление пришло после ответа на вторую работу");
   await text("111", "проверка выкл");
-  ok(await until(() => texts("111").includes("Вторая проверка выключена ✅")), "вторая проверка: выключена командой");
+  ok(await until(() => texts("111").includes("Вторая проверка выключена ✅ Во всех чатах.")), "вторая проверка: выключена командой");
   await photo("111", "S_NOCHK");
   ok(await until(() => answers("111").filter((t) => t.includes("Ответ: 5")).length > 0 && reqs("S_NOCHK").length === 1), "без второй проверки: обычное решение");
   await sleep(1500);
@@ -610,7 +640,7 @@ try {
   await sleep(800);
   process.kill(-dev.pid, "SIGKILL");
   await sleep(1500);
-  dev = startDev();
+  dev = startDev({ OWNER: "111" }); // заодно задаём хозяина: ниже проверяется закрытый доступ
   ok(await ready(), "перезапуск: воркер поднялся снова");
   ok(await until(() => answers("908").some((t) => t.includes("Ответ: 9")), 45_000), "перезапуск: бот сам решил задание заново", JSON.stringify(texts("908").map((t) => t.slice(0, 60))));
   await sleep(1500);
@@ -618,6 +648,39 @@ try {
   const b13 = claude.length;
   await text("913", "объясни первое S_BIG");
   ok(await until(() => claude.length > b13) && sentPhoto() === sha(BIG), "после перезапуска большое фото читается из хранилища без потерь");
+
+  // --- с OWNER (воркер перезапущен с ней) хозяин закрывает доступ; вторая проверка одна на весь бот ---
+  await text("111", "проверка вкл");
+  ok(await until(() => texts("111").filter((t) => t.startsWith("Вторая проверка включена ✅ Во всех чатах")).length === 2), "вторая проверка включена для всех чатов", JSON.stringify(texts("111").slice(-1)));
+  await sleep(800); // чат помнит общие настройки полсекунды (время в тестах ускорено)
+  // проверка долгая: основная модель встанет в очередь проверок уже после закрытия доступа
+  await photo("977", "S_CHKLONG 977a");
+  ok(await until(() => reqs("977a").filter(isCheck).length === 1, 30_000), "вторая проверка включена хозяином и идёт в чужом чате");
+  await text("976", "S_SLOWB вопрос976");
+  await photo("976", "S_CLOSEDQ");
+  ok(await until(() => texts("976").includes("📥 Принял фото, решу сразу после текущего.")), "чужое задание ждёт в очереди");
+  await photo("977", "S_CLSCHK 977b");
+  ok(await until(() => answers("977").filter((t) => t.includes("Ответ: 5")).length === 2), "вторая работа чужого чата решена до закрытия", JSON.stringify(texts("977")));
+  await text("111", "доступ закрыть");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Доступ закрыт ✅"))), "доступ: закрыт командой (OWNER задана)");
+  ok(await until(() => answers("976").some((t) => t.includes("Ответ: 42")), 30_000), "доступ закрыт: уже оплаченный ответ чужому чату доставлен", JSON.stringify(texts("976")));
+  ok(await until(async () => (await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text()).includes("доступ закрыт: задание чужого чата снято без решения")), "доступ закрыт: задание из очереди снято, запись в журнале");
+  ok(await until(async () => (await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text()).split("вторая проверка не состоялась: доступ закрыт").length === 3, 30_000), "доступ закрыт: обе проверки чужого чата сняты, запись в журнале");
+  ok(reqs("S_CLOSEDQ").length === 0 && answers("976").length === 1, "доступ закрыт: чужое задание из очереди не решалось, чату ничего не написано", JSON.stringify(texts("976")));
+  ok(reqs("S_CLSCHK").filter(isCheck).length === 0 && reqs("977a").filter(isJudge).length === 0 && !texts("977").some((t) => t.startsWith("⚠️") || t.startsWith("✅ Перепроверил")), "доступ закрыт: проверки чужого чата сняты без запросов и без сообщений ему", JSON.stringify([reqs("S_CLSCHK").filter(isCheck).length, reqs("977a").filter(isJudge).length]));
+  await photo("975", "S_SHUT");
+  await text("975", "ping");
+  await sleep(2000);
+  ok(texts("975").length === 1 && reqs("S_SHUT").length === 0, "доступ закрыт: чужому чату бот не отвечает и ничего не решает", JSON.stringify(texts("975")));
+  await text("111", "ping");
+  ok(await until(() => texts("111").at(-1).startsWith("pong") && texts("111").at(-1).includes("вторая проверка вкл")), "доступ закрыт: хозяин работает как обычно");
+  await text("111", "доступ открыть");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Доступ открыт ✅"))), "доступ: открыт командой");
+  await sleep(800);
+  await text("975", "ping");
+  ok(await until(() => texts("975").filter((t) => t.startsWith("pong")).length === 2) && texts("975").at(-1).includes("вторая проверка вкл"), "доступ открыт: чужой чат снова получает ответ, ping показывает общую проверку", JSON.stringify(texts("975").slice(-1)));
+  await text("111", "проверка выкл");
+  ok(await until(() => texts("111").filter((t) => t === "Вторая проверка выключена ✅ Во всех чатах.").length === 2), "вторая проверка выключена для всех чатов");
 
   // --- основная модель недоступна на этом ключе: бот сам переходит на запасную ---
   flags.noFable = true;

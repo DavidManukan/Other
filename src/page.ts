@@ -320,14 +320,17 @@ export const PAGINATE = `(() => {
       if (!m || cs.display === "none" || cs.visibility === "hidden" || (rect && backdrop(r))) continue;
       const stroke = cs.stroke !== "none" && parseFloat(cs.strokeWidth) > 0;
       if (rect && cs.fill !== "none") plates.push(r);
-      if (!rect && cs.fill === "rgb(0, 0, 0)" && typeof el.isPointInFill === "function") covers.push({ el, inv: m.inverse(), order, r });
-      // оси и сетка графика (stroke-width 1): числа делений стоят на них нарочно, двигать их с делений нельзя
-      if (stroke && !rect && parseFloat(cs.strokeWidth) <= 1) continue;
+      // Чёрная заливка считается, только если её задали явно: у кривой без fill="none" заливка чёрная сама собой,
+      // её никто не задумывал, и подпись, попавшая под такую кривую, двигать всё равно нужно
+      const named = el.hasAttribute("fill") || !!el.style.fill || (el.parentElement !== svg && el.parentElement.hasAttribute("fill"));
+      if (!rect && named && cs.fill === "rgb(0, 0, 0)" && typeof el.isPointInFill === "function") covers.push({ el, inv: m.inverse(), order, r });
+      const k = Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) || 1;
+      // оси и сетка графика (толщина 1 на холсте шириной 800): числа делений стоят на них нарочно, двигать их с делений нельзя
+      if (stroke && !rect && parseFloat(cs.strokeWidth) * k <= area.width / 800 * 1.05) continue;
       if (!stroke && cs.fill === "none") continue;
       let len = 0;
       try { len = el.getTotalLength(); } catch (e) {}
       if (!len) continue;
-      const k = Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) || 1;
       const hw = stroke ? parseFloat(cs.strokeWidth) * k / 2 : 0;
       const n = Math.min(3000, Math.max(1, Math.ceil(len * k / 3)));
       for (let i = 0; i <= n; i++) {

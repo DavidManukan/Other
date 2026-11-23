@@ -33,24 +33,39 @@ export interface AskOptions {
   spent?: (s: Spent) => void; // вызывается после каждого обращения к Claude, чем бы оно ни кончилось: по этим цифрам считается расход
 }
 
-// Что потрачено за одно обращение: токены по видам и цена в долларах (null: цена модели неизвестна)
+// Что потрачено за одно обращение: токены по видам и цена в долларах
 export interface Spent {
   model: string;
   in: number;
   out: number;
   read: number; // прочитано из кэша
   write: number; // записано в кэш
-  usd: number | null;
+  usd: number;
+  approx?: boolean; // цена или выход посчитаны примерно: модель с неизвестной ценой или поток оборвался до итога
 }
 // Цена за миллион токенов, доллары: вход, выход, чтение кэша, запись в кэш на 5 минут. Fast-режим вдвое дороже.
+// claude-opus-5 и claude-opus-4-8 сами не заказываем: на них Anthropic переводит запрос, если основная модель его отклонит.
 const PRICES: Record<string, [number, number, number, number]> = {
   "claude-fable-5-2": [8, 40, 0.2, 10],
   "claude-opus-5-5": [4, 20, 0.2, 5],
   "claude-sonnet-5-5": [2, 10, 0.1, 2.5],
+  "claude-opus-5": [5, 25, 0.5, 6.25],
+  "claude-opus-4-8": [5, 25, 0.5, 6.25],
 };
-export function price(model: string, u: { in: number; out: number; read: number; write: number }, fast: boolean): number | null {
-  const p = PRICES[Object.keys(PRICES).find((k) => model.startsWith(k)) ?? ""];
+type Usage = { in: number; out: number; read: number; write: number };
+// Сначала точное имя, потом самое длинное известное начало («claude-fable-5-2-20261001»): «claude-opus-5» не должен оценить «claude-opus-5-5»
+export function price(model: string, u: Usage, fast: boolean): number | null {
+  const key = model in PRICES ? model : Object.keys(PRICES).filter((k) => model.startsWith(k + "-")).sort((a, b) => b.length - a.length)[0];
+  const p = key ? PRICES[key] : undefined;
   return p ? ((u.in * p[0] + u.out * p[1] + u.read * p[2] + u.write * p[3]) / 1e6) * (fast ? 2 : 1) : null;
+}
+// Цена для дневного лимита. Оплаченный запрос не может стоить $0: модель с неизвестной ценой считаем по цене заказанной,
+// а если неизвестна и та, по самой дорогой из известных. Такая сумма помечается как примерная.
+export function cost(served: string, asked: string, u: Usage, fast: boolean): { usd: number; approx: boolean } {
+  const exact = price(served, u, fast);
+  if (exact !== null) return { usd: exact, approx: false };
+  const dearest = Math.max(...Object.keys(PRICES).map((k) => price(k, u, fast) ?? 0));
+  return { usd: price(asked, u, fast) ?? dearest, approx: true };
 }
 
 type StreamParams = Parameters<Anthropic["beta"]["messages"]["stream"]>[0];
@@ -228,7 +243,7 @@ export const allText = (content: Content): string => texts(content).join("\n\n")
 // 1. Итоговое слово (текст после последнего пересчёта) содержит «ВСЁ ВЕРНО» без «не» перед ним: решение остаётся,
 //    что бы ни стояло раньше. Модель часто пишет пересчёт со строкой «Ответ:» и только потом соглашается.
 // 2. Ответ оборван или модель отказалась: исправление из него не собрать, null (повторить, число попыток ограничено).
-// 3. В ответе есть целое задание (заголовок и строка «Ответ:»): это исправление. Заметка вроде «Пересчитаю №2. Ответ: 5»
+// 3. В ответе есть целое задание (заголовок и после него строка «Ответ:»): это исправление. Заметка вроде «Пересчитаю №2. Ответ: 5»
 //    заголовка не имеет и исправлением не считается.
 // 4. Иначе ответ не по форме: null.
 export function judgeReply(a: Pick<Answer, "text" | "tail" | "cut" | "refused">): { ok: true } | { fix: string } | null {
@@ -236,7 +251,11 @@ export function judgeReply(a: Pick<Answer, "text" | "tail" | "cut" | "refused">)
   const agreed = [...last.matchAll(/ВС[ЕЁ] ВЕРНО/g)].some((m) => !/(^|[^а-яё])не[\s,:—–-]*$/i.test(last.slice(0, m.index)));
   if (agreed) return { ok: true };
   if (a.cut || a.refused) return null;
-  const whole = a.text.split(/^[ \t]*@@@.*$/m).some((t) => HEAD.test(t) && /^[ \t]*Ответ:/m.test(t));
+  const whole = a.text.split(/^[ \t]*@@@.*$/m).some((t) => {
+    const rows = t.split("\n");
+    const head = rows.findIndex((r) => HEAD.test(r));
+    return head >= 0 && rows.findLastIndex((r) => /^[ \t]*Ответ:/.test(r)) > head;
+  });
   return whole ? { fix: a.text } : null;
 }
 
@@ -360,8 +379,13 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   // Расход считаем по ходу потока: если он оборвётся, уже потраченное всё равно попадёт в учёт
   const used = { in: 0, out: 0, read: 0, write: 0 };
   let served = model;
-  const count = (u: { input_tokens?: number | null; output_tokens?: number | null; cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null } | undefined) => {
+  // Точный выход приходит только в конце потока. Если поток оборвётся раньше, выход оцениваем по написанному
+  // (текст, размышления, код для песочницы): около 3 знаков русского текста на токен. Иначе лимит видел бы почти $0.
+  let streamed = 0;
+  let exact = false;
+  const count = (u: { input_tokens?: number | null; output_tokens?: number | null; cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null } | undefined, final = false) => {
     if (!u) return;
+    if (final) exact = true;
     used.in = Math.max(used.in, u.input_tokens ?? 0);
     used.out = Math.max(used.out, u.output_tokens ?? 0);
     used.read = Math.max(used.read, u.cache_read_input_tokens ?? 0);
@@ -372,7 +396,11 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
     for await (const ev of stream) {
       opened = true;
       if (ev.type === "message_start") (count(ev.message.usage), (served = ev.message.model || served));
-      else if (ev.type === "message_delta") count(ev.usage);
+      else if (ev.type === "message_delta") count(ev.usage, true);
+      if (ev.type === "content_block_delta") {
+        const d = ev.delta as { text?: string; thinking?: string; partial_json?: string };
+        streamed += (d.text ?? d.thinking ?? d.partial_json ?? "").length;
+      }
       if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") out += ev.delta.text;
       else if (ev.type === "content_block_start" && isTool(ev.content_block.type as string)) {
         out = ""; // всё, что было написано до проверки, это заметки, а не ответ
@@ -380,7 +408,7 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
       }
     }
     const msg = await stream.finalMessage();
-    count(msg.usage);
+    count(msg.usage, true);
     served = msg.model || served;
     return { text: "", tokens: { in: msg.usage.input_tokens, out: msg.usage.output_tokens }, msg };
   } catch (e) {
@@ -400,9 +428,13 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   } finally {
     clearTimeout(timer);
     o.stop?.removeEventListener("abort", interrupt);
+    const guess = exact ? 0 : Math.ceil(streamed / 3);
+    const estimated = guess > used.out;
+    if (estimated) used.out = guess;
     if (used.in + used.out + used.read + used.write > 0) {
       try {
-        o.spent?.({ model: served, ...used, usd: price(served, used, params.speed === "fast") });
+        const paid = cost(served, model, used, params.speed === "fast");
+        o.spent?.({ model: served, ...used, usd: paid.usd, ...(paid.approx || estimated ? { approx: true } : {}) });
       } catch (e) {
         console.log("учёт расхода:", String(e));
       }
