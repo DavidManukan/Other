@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "solver",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  // Ключи (ANTHROPIC_API_KEY, GREEN_URL, GREEN_ID, GREEN_TOKEN) сюда НЕ писать:
+  // они задаются в панели Cloudflare → Settings → Variables and Secrets.
+  "keep_vars": true,
+  "durable_objects": {
+    "bindings": [{ "name": "CHAT", "class_name": "Chat" }],
+    // Новый код объект берёт, когда уснёт. Пока идёт работа, он не спит: через час его переведут на новый код
+    // принудительно, и текущий кусок решения начнётся заново. Обновлять лучше, когда бот ничего не решает.
+    "code_update_strategy": { "mode": "deferred", "max_delay": 3600 }
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat"] }],
+  // Браузер Cloudflare: снимает страницу с решением, человеку приходит картинка «как в тетради»
+  "browser": { "binding": "BROWSER" },
+  "rules": [
+    { "type": "Data", "globs": ["**/*.ttf", "**/*.woff2"], "fallthrough": true },
+    { "type": "Text", "globs": ["**/*.css"], "fallthrough": true }
+  ],
+  "observability": { "enabled": true }
+}
