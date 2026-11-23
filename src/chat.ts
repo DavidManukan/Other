@@ -11,7 +11,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type Anthropic from "@anthropic-ai/sdk";
 import { type Cfg, type Effort, type Env, chatStub, config, hider, isEffort, logKey, lower } from "./config.ts";
-import { type Answer, type Spent, ask, Busy, Fatal, inputTokens, Stopped, tasks, Timeout } from "./claude.ts";
+import { type Answer, type Spent, ask, Busy, Fatal, inputTokens, judgeReply, Stopped, tasks, Timeout } from "./claude.ts";
 import { CHECK_PROMPT, judgeText } from "./prompt.ts";
 import { CAPTION_MAX, Green, GreenError, permanent, TooBig } from "./green.ts";
 import { renderPng } from "./render.ts";
@@ -49,8 +49,10 @@ const CHECK_TRIES = 3; // столько раз пробуем вторую пр
 const CHECK_TTL = 86_400_000; // вторую проверку ждём не дольше суток
 const GATE_TTL = 30_000; // столько чат помнит общие настройки (доступ, лимит), не спрашивая служебный объект
 const SPEND_DAYS = 40; // за столько дней хранится расход
-const FIX_TITLE = "⚠️ Исправление после перепроверки";
-const FIX_TURN = "(бот сам перепроверил своё решение и прислал исправление)";
+// Исправление приходит позже, часто уже после ответа на следующее фото, а номера заданий в разных работах повторяются:
+// в заголовке и в памяти чата стоит начало исправляемого ответа, чтобы было видно, к какой работе оно относится
+const fixTitle = (of?: string) => (of ? `⚠️ Исправление к ответу «${of}»` : "⚠️ Исправление после перепроверки");
+const fixTurn = (of?: string) => (of ? `(бот сам перепроверил свой ответ «${of}» и прислал к нему исправление)` : "(бот сам перепроверил своё решение и прислал исправление)");
 const CUT_NOTE = "(ответ получился слишком длинным и оборван: пришли оставшиеся задания отдельным фото)";
 const CONT = "Ответ оборвался. Продолжай со следующей строки после уже написанного: написанное не повторяй, незаконченный рисунок начни заново целиком.";
 export const STATUS = "__status"; // имя служебного объекта: журнал, страница проверки, хозяин бота
@@ -95,6 +97,7 @@ interface CheckInput {
   body: string;
   effort: Effort;
   at: number;
+  label?: string; // начало списка ответов («№1: 4 см²; №2: 5»): по нему человек узнаёт, к какой работе исправление
 }
 interface Check {
   ref: string;
@@ -146,6 +149,7 @@ interface Job {
   id: string;
   at: number;
   kind: "image" | "text" | "fix"; // fix: готовое исправление после второй проверки, его нужно только доставить
+  fixOf?: string; // у исправления: начало ответа, который оно исправляет
   text?: string;
   fwd?: boolean; // текст переслан из другого чата
   shots: Shot[]; // фото этой работы по порядку
@@ -278,9 +282,11 @@ export class Chat extends DurableObject<Env> {
 
   // Последнее задание в очереди, если это работа с фото, ответ на которую ещё не начал уходить: к ней можно добавлять.
   // Ответ мог быть уже готов (шлюз лежал, или страницы ещё снимаются): он выбрасывается, работа решается заново со всеми фото.
+  // Исправления после второй проверки встают в очередь сами, без участия человека: на то, к какой работе
+  // относится его следующее фото или уточнение, они не влияют.
   private async openJob(): Promise<{ key: string; job: Job; live: boolean } | null> {
     const all = await this.db.list<Job>({ prefix: "job:" });
-    const last = [...all].at(-1);
+    const last = [...all].reverse().find(([, j]) => j.kind !== "fix");
     if (!last) return null;
     const live = this.cur?.key === last[0];
     const job = live ? this.cur!.job : last[1];
@@ -735,14 +741,15 @@ export class Chat extends DurableObject<Env> {
     await this.flush(key, job, chatId, origin, stop);
     // Память чата и задание без вопроса пишем одной записью: после перезапуска пара не добавится второй раз
     const turn = job.turn;
-    const solved = (job.parts ?? []).some((p) => /^Ответ:/m.test(p));
+    const parts = job.parts ?? [];
+    const solved = parts.some((p) => /^Ответ:/m.test(p));
     job.turn = undefined;
     job.parts = undefined;
     if (turn && epoch === this.epoch && (job.body || job.svgs.length)) {
       await this.db.put({ hist: this.trimHistory([...(await this.history()), { role: "user", content: turn }, { role: "assistant", content: job.body || "[рисунок]" }]), [key]: job });
       // Ответ у человека. Теперь его независимо перепроверяет вторая модель: в фоне, следующие задания это не задерживает
       const done = job.done;
-      if (job.kind === "image" && solved && job.body && done && !done.cut && !done.refused && (await this.options()).check) await this.startCheck(job, turn, chatId);
+      if (job.kind === "image" && solved && job.body && done && !done.cut && !done.refused && (await this.options()).check) await this.startCheck(job, turn, parts, chatId);
     }
 
     // 4. Итог
@@ -775,7 +782,7 @@ export class Chat extends DurableObject<Env> {
     // Страницы нужны решению. Разговор без формул и служебный ответ («Не разобрал фото. Пересними ближе.») остаются текстом
     const solved = parts.some((p) => /^Ответ:/m.test(p)) || job.svgs.length > 0;
     const worth = solved && (job.kind !== "text" || job.svgs.length > 0 || parts.some((p) => /\$[^$\n]+\$/.test(p)));
-    const title = job.kind === "fix" ? FIX_TITLE : undefined; // исправление после второй проверки подписано так, чтобы его не спутали с новым решением
+    const title = job.kind === "fix" ? fixTitle(job.fixOf) : undefined; // исправление после второй проверки подписано так, чтобы его не спутали с новым решением
     let shots: Uint8Array[] | null = null;
     if (pages && worth && parts.length && job.shot < 2 && (this.env.BROWSER || this.env.SHOT) && Date.now() >= ((await this.db.get<number>("nobrowser")) ?? 0)) {
       job.shot++; // попытка засчитывается заранее: если снимок уронит объект, во второй раз не пробуем
@@ -1089,10 +1096,12 @@ export class Chat extends DurableObject<Env> {
 
   // ---------- вторая проверка: сторона чата ----------
   // Готовый ответ уже у человека. Кладём рядом то, что нужно проверить, и будим объект проверок этого чата.
-  private async startCheck(job: Job, turn: Block[], chatId: string) {
+  private async startCheck(job: Job, turn: Block[], parts: string[], chatId: string) {
     try {
       const ref = imageId();
-      await this.db.put<CheckInput>(`chkin:${ref}`, { turn, body: job.body ?? "", effort: job.effort, at: Date.now() });
+      const list = card(parts.map(plainText)).split("\n").slice(1, 4).join("; ");
+      const label = list.length > 80 ? `${list.slice(0, 79).trimEnd()}…` : list;
+      await this.db.put<CheckInput>(`chkin:${ref}`, { turn, body: job.body ?? "", effort: job.effort, at: Date.now(), label });
       await chatStub(this.env, `${chatId}#check`).enqueueCheck(ref, chatId);
     } catch (e) {
       console.log("check:", this.hide(e)); // проверка это дополнение: её сбой ответу не мешает
@@ -1139,8 +1148,8 @@ export class Chat extends DurableObject<Env> {
       if (parts.length) {
         const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
         const job: Job = {
-          kind: "fix", id: `fix${ref}`, at: Date.now(), shots: [], notes: [], quotes: [], fetches: 0, phase: "solve", step: 0, tries: 0, effort: inp.effort, acc: "",
-          body: parts.join("\n\n"), parts, turn: [{ type: "text", text: FIX_TURN }], done: { cut: false, refused: false, empty: false },
+          kind: "fix", fixOf: inp.label, id: `fix${ref}`, at: Date.now(), shots: [], notes: [], quotes: [], fetches: 0, phase: "solve", step: 0, tries: 0, effort: inp.effort, acc: "",
+          body: parts.join("\n\n"), parts, turn: [{ type: "text", text: fixTurn(inp.label) }], done: { cut: false, refused: false, empty: false },
           sent: 0, outbox: [], shot: 0, pages: 0, down: 0, svgs: [...new Set(svgs)].slice(0, MAX_DRAWINGS), drawn: 0, msgs: 0, tokens: 0, checks: 0,
         };
         // одной записью: исправление в очереди и отметка, что проверка закрыта (повторный вызов не поставит его второй раз)
@@ -1206,11 +1215,23 @@ export class Chat extends DurableObject<Env> {
             messages: [{ role: "user", content: [...input.question, { type: "text", text: `Решение, которое нужно проверить:\n\n${input.body}` }] }],
             effort: this.c.effort, fast: false, until, stop: stop.signal, system: CHECK_PROMPT, model: this.c.checkModel, spent,
           });
-          const v = verdict(a.text);
-          if (!v) throw new Busy("проверяющая модель ответила не по форме");
+          // вердикт ищем во всём ходе: проверяющий пересчитывает кодом, и итоговая строка стоит после заметок со своими «Ответ:»
+          const all = a.all ?? a.text;
+          const v = verdict(all);
+          if (!v) {
+            // вердикт написан, но без замечаний: оплаченный ответ получен, повтор дал бы то же самое
+            if (/ВЕРДИКТ:\s*(ВЕРНО|ОШИБКА)/i.test(all)) return await close({ failed: "проверяющая модель не назвала ошибки" });
+            throw new Busy("проверяющая модель ответила не по форме");
+          }
           if (v.ok) return await close({ ok: true });
           q.phase = "judge";
           q.issues = v.issues.slice(0, 4000);
+          // Проверяющий занял большую часть куска: основной модели нужен свой полный срок, иначе её оплаченный запрос
+          // оборвётся по времени. Следующий будильник начнёт её попытки с нуля, так что их снова не больше CHECK_TRIES.
+          if (until - Date.now() < (SEGMENT - SEGMENT_TAIL) / 2 / this.k) {
+            q.tries = 0;
+            return void (await this.db.put(key, q));
+          }
           q.tries = 1;
           await this.db.put(key, q);
         }
@@ -1218,10 +1239,9 @@ export class Chat extends DurableObject<Env> {
           messages: [{ role: "user", content: input.question }, { role: "assistant", content: input.body }, { role: "user", content: judgeText(q.issues ?? "") }],
           effort: input.effort, fast: false, until, stop: stop.signal, spent,
         });
-        const fixed = /^Ответ:/m.test(a.text);
-        if (/^\s*ВС[ЕЁ] ВЕРНО/i.test(a.text) && !fixed) return await close({ ok: true });
-        if (a.refused || !fixed || (a.cut && !/Ответ:[^\n]*\n?\s*$/.test(a.text.trimEnd() + "\n"))) throw new Busy("основная модель не дописала разбор замечаний");
-        return await close({ fix: a.text });
+        const r = judgeReply(a);
+        if (!r) throw new Busy("основная модель не дописала разбор замечаний");
+        return await close(r);
       } finally {
         await this.bill(null, bills);
       }

@@ -504,7 +504,7 @@ try {
   const isCheck = (b) => Array.isArray(b.system) && b.system[0].text.startsWith("Ты проверяешь готовое решение");
   const isJudge = (b) => lastText(b).startsWith("Независимая перепроверка");
   const confirms = () => texts("111").filter((t) => t === "✅ Перепроверил решение: всё сходится.").length;
-  const fixes = () => texts("111").filter((t) => t.startsWith("⚠️ Исправление после перепроверки"));
+  const fixes = () => texts("111").filter((t) => t.startsWith("⚠️ Исправление"));
   await text("111", "проверка вкл");
   ok(await until(() => texts("111").some((t) => t.startsWith("Вторая проверка включена ✅"))), "вторая проверка: включена командой");
   await photo("111", "S_CHKOK");
@@ -516,7 +516,8 @@ try {
   // проверяющий нашёл ошибку, основная модель согласилась: приходит исправление
   await photo("111", "S_CHKFIX");
   ok(await until(() => fixes().length === 1, 30_000), "вторая проверка нашла ошибку: пришло исправление", JSON.stringify(texts("111").slice(-3)));
-  ok(fixes()[0] === `⚠️ Исправление после перепроверки\n№2: 7\n${RULE}\n№2\nПересчёт: 3 + 4 = 7\nОтвет: 7`, "исправление: заголовок, ответ и полное решение задания, без разметки", fixes()[0]);
+  // в заголовке начало исправляемого ответа: исправление часто приходит после ответа на следующее фото
+  ok(fixes()[0] === `⚠️ Исправление к ответу «№1: 4 см²; №2: 5»\n№2: 7\n${RULE}\n№2\nПересчёт: 3 + 4 = 7\nОтвет: 7`, "исправление: заголовок с исправляемым ответом, ответ и полное решение задания, без разметки", fixes()[0]);
   const judge = reqs("S_CHKFIX").filter(isJudge);
   ok(judge.length === 1 && judge[0].model === "claude-fable-5-2" && judge[0].messages.length === 3 && judge[0].messages[1].role === "assistant" && imgs(judge[0].messages[0]) === 1 && lastText(judge[0]).includes("№2: в решении 5, а получается 7"), "спорное место решает основная модель: видит фото, своё решение и замечание", JSON.stringify(judge.map((b) => [b.model, b.messages.length])));
   await sleep(1200);
@@ -524,7 +525,9 @@ try {
   const bFix = claude.length;
   await text("111", "а почему во втором семь? S_AFTERFIX");
   ok(await until(() => claude.slice(bFix).some((b) => JSON.stringify(b.messages).includes("S_AFTERFIX"))), "вопрос после исправления ушёл в Claude");
-  ok(JSON.stringify(claude.slice(bFix).find((b) => JSON.stringify(b.messages).includes("S_AFTERFIX")).messages).includes("Пересчёт: $3 + 4 = 7$"), "исправление запомнено: следующий вопрос его видит");
+  const afterFix = JSON.stringify(claude.slice(bFix).find((b) => JSON.stringify(b.messages).includes("S_AFTERFIX")).messages);
+  ok(afterFix.includes("Пересчёт: $3 + 4 = 7$"), "исправление запомнено: следующий вопрос его видит");
+  ok(afterFix.includes("(бот сам перепроверил свой ответ «№1: 4 см²; №2: 5» и прислал к нему исправление)"), "в памяти чата видно, к какому ответу исправление", afterFix.slice(-600));
   ok(await until(() => answers("111").at(-1).includes("Ответ: 5") || drawings("111").length > 0), "ответ на вопрос после исправления пришёл");
   // проверяющий ошибся, основная модель отстояла решение
   await photo("111", "S_CHKARG");
@@ -542,12 +545,45 @@ try {
   await photo("111", "S_PAR следующее");
   ok(await until(() => reqs("S_PAR").filter((b) => !isCheck(b) && !isJudge(b)).length === 1, 3000), "вторая проверка не задерживает следующее задание");
   ok(await until(() => fixes().length === 2 && confirms() === 3, 40_000), "обе проверки дошли до конца: исправление первой работы и подтверждение второй", JSON.stringify(texts("111").slice(-4).map((t) => t.slice(0, 50))));
-  // «стоп» отменяет начатую проверку
-  await photo("111", "S_CHKSLOW стоп S_STOPCHK");
+  // «стоп» отменяет начатую проверку. Тег S_CHKSLOW стоит последним: по нему заглушка выбирает медленную проверку,
+  // которая через 4 с найдёт ошибку. Без отмены за ней пошли бы запрос основной модели и исправление.
+  await photo("111", "S_STOPCHK стоп S_CHKSLOW");
   ok(await until(() => reqs("S_STOPCHK").filter(isCheck).length === 1, 30_000), "стоп: проверка началась");
+  const c0 = confirms(), f0 = fixes().length;
+  ok(f0 === 2 && reqs("S_STOPCHK").filter(isJudge).length === 0, "стоп: проверка ещё идёт, когда приходит «стоп»");
   await text("111", "стоп");
   await sleep(7000);
-  ok(fixes().length === 2 && reqs("S_STOPCHK").filter(isJudge).length === 0, "стоп во время второй проверки: исправление не приходит", JSON.stringify(texts("111").slice(-3).map((t) => t.slice(0, 50))));
+  ok(fixes().length === f0 && confirms() === c0 && reqs("S_STOPCHK").filter(isJudge).length === 0, "стоп во время второй проверки: ни исправления, ни подтверждения, ни запроса основной модели", JSON.stringify(texts("111").slice(-3).map((t) => t.slice(0, 50))));
+  // проверяющий пишет своё «Ответ:» до пересчёта кодом, вердикт после; основная модель тоже пересчитывает и соглашается другими словами
+  const c2 = confirms(), f2 = fixes().length;
+  await photo("111", "S_CHKNOTE");
+  ok(await until(() => confirms() === c2 + 1, 30_000), "вердикт после пересчёта кодом прочитан, согласие основной модели понято", JSON.stringify(texts("111").slice(-3)));
+  await sleep(1500);
+  ok(reqs("S_CHKNOTE").filter(isCheck).length === 1 && reqs("S_CHKNOTE").filter(isJudge).length === 1 && fixes().length === f2, "один запрос проверяющего, один основной модели, исправления нет", JSON.stringify([reqs("S_CHKNOTE").filter(isCheck).length, reqs("S_CHKNOTE").filter(isJudge).length, fixes().length]));
+  // ответ основной модели оборван на строке «Ответ:»: его не шлём, повторяем и шлём дописанный
+  await photo("111", "S_CHKCUT");
+  ok(await until(() => fixes().length === f2 + 1, 30_000), "оборванное исправление: пришло дописанное", JSON.stringify(texts("111").slice(-3)));
+  await sleep(1500);
+  ok(fixes().length === f2 + 1 && fixes().at(-1).includes("Ответ: x = 125") && !fixes().some((t) => /x = 12$/m.test(t)) && reqs("S_CHKCUT").filter(isJudge).length === 2, "оборванное исправление не отправлено", JSON.stringify(fixes().at(-1)));
+  // проверяющий занял больше половины куска: основная модель получает свежий срок и успевает с первого раза
+  await photo("111", "S_CHKLONG");
+  ok(await until(() => fixes().length === f2 + 2, 40_000), "долгая проверка: исправление пришло", JSON.stringify(texts("111").slice(-3)));
+  ok(reqs("S_CHKLONG").filter(isCheck).length === 1 && reqs("S_CHKLONG").filter(isJudge).length === 1, "долгая проверка: основная модель спрошена один раз, её запрос не оборван сроком", String(reqs("S_CHKLONG").filter(isJudge).length));
+  // исправление встало в очередь, пока решается следующая работа: второе фото к этой работе всё равно добавляется к ней
+  await photo("111", "S_FIXQ один");
+  ok(await until(() => reqs("S_FIXQ").filter(isCheck).length === 1, 30_000), "очередь: проверка первой работы началась");
+  await photo("111", "S_SLOWB два");
+  ok(await until(() => reqs("S_SLOWB").filter((b) => !isCheck(b) && !isJudge(b)).length === 1, 5000), "очередь: вторая работа решается");
+  ok(await until(() => reqs("S_FIXQ").filter(isJudge).length === 1, 10_000), "очередь: проверка первой работы нашла ошибку");
+  await sleep(800); // исправление записано в очередь чата
+  const f3 = fixes().length;
+  await photo("111", "вторая страница");
+  ok(await until(() => texts("111").includes("➕ Добавил к прошлому: теперь 2 фото. Решение пришлю одним ответом."), 5000), "очередь: второе фото добавлено к работе, а не стало отдельной", JSON.stringify(texts("111").slice(-3)));
+  ok(await until(() => fixes().length === f3 + 1, 40_000), "очередь: исправление первой работы пришло", JSON.stringify(texts("111").slice(-3)));
+  const mainB = claude.filter((b) => !isCheck(b) && !isJudge(b) && JSON.stringify(b.messages).includes("вторая страница"));
+  ok(mainB.length === 1 && imgs(mainB[0].messages.at(-1)) === 2 && JSON.stringify(mainB[0].messages.at(-1)).includes("S_SLOWB"), "очередь: вторая работа решена один раз, с обоими фото", JSON.stringify(mainB.map((b) => imgs(b.messages.at(-1)))));
+  const seqQ = texts("111");
+  ok(seqQ.findLastIndex((t) => t.includes("Ответ: 42")) < seqQ.findLastIndex((t) => t.startsWith("⚠️ Исправление")), "очередь: исправление пришло после ответа на вторую работу");
   await text("111", "проверка выкл");
   ok(await until(() => texts("111").includes("Вторая проверка выключена ✅")), "вторая проверка: выключена командой");
   await photo("111", "S_NOCHK");

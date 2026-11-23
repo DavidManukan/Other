@@ -108,10 +108,20 @@ function anthropic(req, res, body) {
     if (scenario === "S_CHKFIX" || scenario === "S_CHKARG") return send("ВЕРДИКТ: ОШИБКА\n№2: в решении 5, а получается 7");
     if (scenario === "S_CHKBAD") return send("Мне кажется, тут всё хорошо, но я не уверена.");
     if (scenario === "S_CHKSLOW") return send("ВЕРДИКТ: ОШИБКА\n№1: ответ другой", { think: 4000 });
+    if (scenario === "S_FIXQ") return send("ВЕРДИКТ: ОШИБКА\n№2: в решении 5, а получается 7", { think: 3000 });
+    // проверяющий занял больше половины куска: основной модели нужен свой срок
+    if (scenario === "S_CHKLONG") return send("ВЕРДИКТ: ОШИБКА\n№2: в решении 5, а получается 7", { think: 7000 });
+    // проверяющий сам решает со строкой «Ответ:», пересчитывает кодом и только потом пишет вердикт
+    if (scenario === "S_CHKNOTE" || scenario === "S_CHKCUT") return send("Решу №2 сам.\nОтвет: 7\nПроверю кодом.", { blocks: CHECK, after: "ВЕРДИКТ: ОШИБКА\n№2: в решении 5, а получается 7" });
     return send("ВЕРДИКТ: ВЕРНО");
   }
   if (text.startsWith("Независимая перепроверка")) {
     if (scenario === "S_CHKARG") return send("ВСЁ ВЕРНО");
+    // пересчёт со строкой «Ответ:», затем согласие другими словами: это не исправление
+    if (scenario === "S_CHKNOTE") return send("Пересчитаю №2.\nОтвет: 5", { blocks: CHECK, after: "Замечание ошибочно: ВСЁ ВЕРНО" });
+    // первый ответ оборван на строке «Ответ:», второй дописан
+    if (scenario === "S_CHKCUT") return hit("judgecut") === 1 ? send("№2\nПересчёт: 3 + 4\nОтвет: x = 12", { stop: "max_tokens" }) : send("№2\nПересчёт: 3 + 4\nОтвет: x = 125");
+    if (scenario === "S_CHKLONG") return send("№2\nПересчёт: $3 + 4 = 7$\nОтвет: $7$", { think: 6000 });
     return send("№2\nПересчёт: $3 + 4 = 7$\nОтвет: $7$");
   }
   if (scenario === "S_BUSY" && n <= 3) return err(529, "overloaded_error", "Overloaded", { "x-should-retry": "false" });
@@ -133,6 +143,7 @@ function anthropic(req, res, body) {
   if (scenario === "S_CUT" && text !== CONT) return send("№1\nx^2 = 16\nОтвет: 4\n@@@\n№2\nначало решения, которое не помести", { stop: "max_tokens" });
   if (scenario === "S_CUT") return send("начало решения, которое не поместилось в первый кусок.\nОтвет: 7 см2");
   if (scenario === "S_WAIT") return send("№1\nОтвет: 42", { think: 2500 });
+  if (scenario === "S_SLOWB") return send("№1\nОтвет: 42", { think: 8000 });
   if (scenario === "S_HELLO") return send("№1\nОтвет: 42", { think: 4500 });
   if (scenario === "S_LONG" || (scenario === "S_CRASH" && n === 1)) return send("№1\nОтвет: 1\n@@@\n" + "очень длинное решение ".repeat(400), { gap: 40 });
   if (scenario === "S_CRASH") return send("№1\nОтвет: 9");

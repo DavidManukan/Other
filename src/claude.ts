@@ -3,6 +3,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Cfg, Effort } from "./config.ts";
 import { PROMPT } from "./prompt.ts";
+import { HEAD } from "./text.ts";
 import { left } from "./util.ts";
 
 export class Timeout extends Error {} // время куска вышло, а модель ещё ничего не написала
@@ -222,6 +223,22 @@ export function answerText(content: Content, cut = false): string {
 export const tailText = (content: Content): string => segments(content).at(-1) ?? "";
 // Весь текст хода: если после проверок модель ничего не написала, ответ мог остаться перед ними
 export const allText = (content: Content): string => texts(content).join("\n\n");
+
+// Что решила основная модель по замечаниям. Порядок важен.
+// 1. Итоговое слово (текст после последнего пересчёта) содержит «ВСЁ ВЕРНО» без «не» перед ним: решение остаётся,
+//    что бы ни стояло раньше. Модель часто пишет пересчёт со строкой «Ответ:» и только потом соглашается.
+// 2. Ответ оборван или модель отказалась: исправление из него не собрать, null (повторить, число попыток ограничено).
+// 3. В ответе есть целое задание (заголовок и строка «Ответ:»): это исправление. Заметка вроде «Пересчитаю №2. Ответ: 5»
+//    заголовка не имеет и исправлением не считается.
+// 4. Иначе ответ не по форме: null.
+export function judgeReply(a: Pick<Answer, "text" | "tail" | "cut" | "refused">): { ok: true } | { fix: string } | null {
+  const last = a.tail ?? a.text;
+  const agreed = [...last.matchAll(/ВС[ЕЁ] ВЕРНО/g)].some((m) => !/(^|[^а-яё])не[\s,:—–-]*$/i.test(last.slice(0, m.index)));
+  if (agreed) return { ok: true };
+  if (a.cut || a.refused) return null;
+  const whole = a.text.split(/^[ \t]*@@@.*$/m).some((t) => HEAD.test(t) && /^[ \t]*Ответ:/m.test(t));
+  return whole ? { fix: a.text } : null;
+}
 
 // Один ход модели. Пересчёт в песочнице идёт на стороне Anthropic; если он затянулся, ход приходит
 // с пометкой pause_turn, и его нужно продолжить, вернув модели её же сообщение без изменений.

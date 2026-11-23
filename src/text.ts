@@ -174,10 +174,11 @@ export function seam(text: string): string {
   return nl > 0 ? text.slice(0, nl).trimEnd() : "";
 }
 
-// Ответ проверяющей модели: «ВЕРДИКТ: ВЕРНО» или «ВЕРДИКТ: ОШИБКА» и список замечаний. null: ответ не по форме
+// Ответ проверяющей модели: «ВЕРДИКТ: ВЕРНО» или «ВЕРДИКТ: ОШИБКА» и список замечаний. null: ответ не по форме.
+// Считается последний вердикт хода: строка «ВЕРДИКТ:» в ранней заметке («напишу ВЕРДИКТ: ВЕРНО, если…») итогом не является.
 export function verdict(text: string): { ok: true } | { ok: false; issues: string } | null {
-  const m = /ВЕРДИКТ:\s*(ВЕРНО|ОШИБКА)/i.exec(text);
-  if (!m) return null;
+  const m = [...text.matchAll(/ВЕРДИКТ:\s*(ВЕРНО|ОШИБКА)/gi)].at(-1);
+  if (!m || m.index === undefined) return null;
   if (m[1].toUpperCase() === "ВЕРНО") return { ok: true };
   const issues = text.slice(m.index + m[0].length).trim();
   return issues ? { ok: false, issues } : null;

@@ -84,7 +84,8 @@ test("формулы, записанные не по правилам, всё р
   assert.equal(plain(CROOKED["двойные знаки и система в несколько строк"]), "№2\nсистема: x + y = 5; x − y = 1\nСкладываем: 2x = 6, x = 3.\nОтвет: (3; 2).");
   assert.equal(plain(CROOKED["команды без знаков $"]), "№3\nПо формуле x = 1/2 получаем √16 = 4, значит α = 30°.\nПлощадь S(ABC) = 1/2 · a · h = 12 см².\nОтвет: 12 см².");
   assert.equal(plain(CROOKED["формула с переносом строки"]), "№4\nсистема: x > 1; x < 5\nОтвет: x ∈ (1; 5)");
-  assert.equal(plain(CROOKED["знак $ без пары"]), "№5\nФормула оборвана: x = 5 и ещё одна y = a/b\nОтвет: 5.");
+  // одинокий знак $ строки не склеивает: формулы, которая переходила бы через перенос, тут нет
+  assert.equal(plain(CROOKED["знак $ без пары"]), "№5\nФормула оборвана: x = 5\nи ещё одна y = a/b\nОтвет: 5.");
   assert.equal(plain(CROOKED["окружение без знаков $"]), "№9\na = b + c; d = e\nОтвет: готово, да.");
   assert.equal(plain(CROOKED["физика без знаков $"]), "№12\nДано:\nm = 2 кг\nНайти: a\nРешение:\nF = ma ⇒ a = F/m = 10/2 = 5 м/с²\nОтвет: 5 м/с².");
   // на странице такие формулы набраны по-настоящему, а не показаны текстом
@@ -137,4 +138,91 @@ test("редкие команды в формулах переводятся в 
     [String.raw`{\rm d}x`]: "dx",
   };
   for (const [a, b] of Object.entries(cases)) assert.equal(texToPlain(a), b, a);
+});
+
+const plainOf = (raw: string) => parts(splitAnswer(raw).text).map(plainText).join("\n");
+const pageOf = (raw: string) => pageHtml(parts(splitAnswer(raw).text), [], "", "");
+
+test("команды, которых нет в списках, не показываются ни командой, ни голым именем", () => {
+  const cases: Record<string, string> = {
+    [String.raw`Решение: \square ABCD`]: "Решение: □ ABCD",
+    [String.raw`Доказано. \blacksquare`]: "Доказано. ■",
+    [String.raw`$\nexists x$, $\vdots$, $\iint f$`]: "∄ x, ⋮, ∬ f",
+    [String.raw`$A \Longleftarrow B$, $x \nleq 3$, $a \gets b$`]: "A ⇐ B, x ≰ 3, a ← b",
+    [String.raw`$\mathring{A}$, $\emph{x}$, $\overleftrightarrow{AB}$, $\overparen{AB} = 60^\circ$`]: "A, x, AB, AB = 60°",
+    [String.raw`$\varPhi$, $\aleph$, $\upsilon$, $\checkmark$, $\Box$`]: "Φ, ℵ, υ, ✓, □",
+    [String.raw`Угол 30\textdegree, \multicolumn{2}{c}{итого}`]: "Угол 30°, итого",
+    [String.raw`$\foo{x} + 1$ и \bar{x} \foo{y}`]: "x + 1 и x̅ y",
+    [String.raw`$\abs{x} = \norm{v}$`]: "|x| = ‖v‖",
+  };
+  for (const [raw, want] of Object.entries(cases)) {
+    const out = plainOf(raw);
+    assert.equal(out, want, raw);
+    assert.equal(texLeak(out), null, raw);
+    assert.equal(texLeak(seen(pageOf(raw))), null, raw);
+  }
+  // проверка замечает и команду, которой нет в списках: так тесты увидят пробел в списках
+  assert.notEqual(texLeak(String.raw`Слово \foo{x}`), null);
+  assert.notEqual(texLeak(String.raw`Решение: \square`), null);
+  assert.notEqual(texLeak(String.raw`Норма \|a\|`), null);
+  assert.equal(texLeak(String.raw`символ \n и регулярное \d{3}`), null);
+});
+
+test("формула внутри \\text{…} формулы не оставляет лишней скобки", () => {
+  assert.equal(plainOf(String.raw`Ответ: $y = 2 \text{ при $x = 1$}$`), "Ответ: y = 2 при x = 1");
+  assert.equal(plainOf(String.raw`Решение: $S = a \cdot b \text{ (где $a$ и $b$ — стороны)}$`), "Решение: S = a · b (где a и b — стороны)");
+  assert.ok(!/[{}]/.test(seen(pageOf(String.raw`Ответ: $y = 2 \text{ при $x = 1$}$`))));
+});
+
+test("норма \\|a\\| без знаков $ становится ‖a‖", () => {
+  const raw = String.raw`Норма \|a\| = 5, а также \|b\|.` + "\n" + String.raw`Ответ: \|a\| = 5`;
+  assert.equal(plainOf(raw), "Норма ‖a‖ = 5, а также ‖b‖.\nОтвет: ‖a‖ = 5");
+  assert.equal(texLeak(seen(pageOf(raw))), null);
+});
+
+test("одинокий знак $ не склеивает строки и не превращает текст в формулу", () => {
+  const regex = "Шаблон `^\\d+$` проверяет цифры.\nДлина строки равна 5.\nШаблон `^[a-z]+$` проверяет буквы.";
+  assert.equal(splitAnswer(regex).text, regex);
+  assert.equal(plainOf(regex), regex);
+  assert.ok(!pageOf(regex).includes('class="katex"'));
+  assert.equal(splitAnswer("Шаблоны `^\\d+$` и `^[a-z]+$` разные.").text, "Шаблоны `^\\d+$` и `^[a-z]+$` разные.");
+  assert.equal(splitAnswer("Курс доллара: 1$ = 90 рублей.\nЗа 3$ заплатим 270 рублей.").text.split("\n").length, 2);
+  // формула, которая и правда переходит на другую строку, склеивается по-прежнему
+  assert.equal(normalizeMath(String.raw`Решаем: $x^2 +` + "\n" + String.raw`2x = \text{ответ}$ дальше`), String.raw`Решаем: $x^2 + 2x = \text{ответ}$ дальше`);
+});
+
+test("путь к файлу Windows остаётся как есть, даже если имя папки совпадает с командой LaTeX", () => {
+  for (const raw of [String.raw`Файл D:\Projects\bot\main.py`, String.raw`Логи лежат в C:\app\log\error.txt`, String.raw`Откройте C:\data\in\input.txt и D:\out\to\result.txt`, String.raw`Путь C:\Users\lim\temp\frac.txt.`]) {
+    assert.equal(splitAnswer(raw).text, raw);
+    assert.equal(plainOf(raw), raw);
+    assert.equal(texLeak(raw), null);
+    assert.ok(seen(pageOf(raw)).includes(raw), raw);
+  }
+  // формула без пробелов после двоеточия путём не считается
+  assert.equal(plainOf(String.raw`$f:\mathbb{R}\to\mathbb{R}$`), "f:ℝ→ℝ");
+});
+
+test("обратная черта в обычном тексте и код в `…` не меняются ни на байт", () => {
+  for (const raw of [
+    String.raw`В Windows путь пишут через \, в Linux через /.`,
+    String.raw`Обратную черту пишут как '\\'`,
+    String.raw`Команда ` + "`" + String.raw`cd ..\\..` + "`",
+    "Экранирование: `\\_` — подчёркивание, `\\{` — скобка",
+    String.raw`Путь C:\_backup\data.txt`,
+    "Шаблон `\\(\\d{3}\\) \\d{3}-\\d{2}` находит номер.",
+    "Шаблон `\\[\\d+\\]` находит число.",
+  ]) {
+    assert.equal(splitAnswer(raw).text, raw, raw);
+    assert.equal(plainOf(raw), raw, raw);
+  }
+  assert.ok(seen(pageOf("Шаблон `\\(\\d{3}\\) \\d{3}-\\d{2}` находит номер.")).includes("`\\(\\d{3}\\) \\d{3}-\\d{2}`"));
+  // формулы рядом с кодом разбираются как обычно
+  assert.equal(plainOf("Пусть \\(x^2\\) и код `a` ok \\frac{1}{2}"), "Пусть x² и код `a` ok 1/2");
+});
+
+test("экранированный знак доллара в формуле остаётся знаком доллара", () => {
+  assert.equal(plainOf(String.raw`Цена $\$5$ за штуку.`), "Цена $5 за штуку.");
+  assert.equal(plainOf(String.raw`$100\%$ и $\$5$`), "100% и $5");
+  assert.equal(plainOf(String.raw`Итого $x = 5\$$.`), "Итого x = 5$.");
+  assert.equal(plainOf(String.raw`Цена \$5 за штуку.`), "Цена $5 за штуку.");
 });
