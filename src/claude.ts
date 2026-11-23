@@ -17,6 +17,8 @@ export interface Answer {
   tokens: { in: number; out: number };
   model: string; // модель, которая реально ответила
   checks: number; // сколько раз модель запускала пересчёт кодом
+  all?: string; // весь текст хода, включая заметки между проверками: вердикт проверяющего может стоять в любом его месте
+  tail?: string; // текст после последнего обращения к песочнице: итоговое слово модели («ВСЁ ВЕРНО»), даже если решение стояло раньше
 }
 
 export interface AskOptions {
@@ -196,21 +198,28 @@ const has = (content: Content, type: string) => content.some((b) => (b.type as s
 const isTool = (type: string) => type === "server_tool_use" || type.endsWith("_tool_result");
 const texts = (content: Content) => content.flatMap((b) => (b.type === "text" && b.text.trim() ? [b.text] : []));
 const MARK = /^[ \t]*(Ответ:|@@@)/m; // по этим строкам видно, что кусок текста это решение, а не заметка
+// Текст хода, разрезанный обращениями к песочнице
+function segments(content: Content): string[] {
+  const out: string[] = [""];
+  for (const b of content) {
+    if (isTool(b.type as string)) out.push("");
+    else if (b.type === "text") out[out.length - 1] += b.text;
+  }
+  return out;
+}
 // Готовый ответ: то, что модель написала после последнего обращения к песочнице. Заметки между проверками
 // («сейчас пересчитаю», «проверка подтвердила») читателю не нужны. У Fable 5.2 они уходят в размышления,
 // а запасные модели пишут их обычным текстом. Если решение стоит до проверки, а после неё только заметка, берём решение.
 // Блок fallback (ход подхватила запасная модель) текст не разрывает: она продолжает с того же места.
 // cut: ход оборван. Тогда недописанный текст после проверки это и есть ответ (модель переписывала решение), старое решение до проверки не берём.
 export function answerText(content: Content, cut = false): string {
-  const segments: string[] = [""];
-  for (const b of content) {
-    if (isTool(b.type as string)) segments.push("");
-    else if (b.type === "text") segments[segments.length - 1] += b.text;
-  }
-  const last = segments[segments.length - 1];
+  const segs = segments(content);
+  const last = segs[segs.length - 1];
   if (MARK.test(last) || (cut && last.trim())) return last;
-  return [...segments].reverse().find((s) => MARK.test(s)) ?? last;
+  return [...segs].reverse().find((s) => MARK.test(s)) ?? last;
 }
+// Последнее слово модели: текст после последнего обращения к песочнице
+export const tailText = (content: Content): string => segments(content).at(-1) ?? "";
 // Весь текст хода: если после проверок модель ничего не написала, ответ мог остаться перед ними
 export const allText = (content: Content): string => texts(content).join("\n\n");
 
@@ -238,13 +247,17 @@ async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
       }
       // срок вышел или Claude отвалился уже после того, как часть ответа написана: её не теряем
       const sofar = answerText(blocks);
-      if ((e instanceof Timeout || e instanceof Busy) && sofar.trim()) return { text: sofar, cut: true, refused: false, tokens, model, checks };
+      if ((e instanceof Timeout || e instanceof Busy) && sofar.trim()) return { text: sofar, cut: true, refused: false, tokens, model, checks, all: allText(blocks), tail: tailText(blocks) };
       throw e;
     }
     tokens.in += r.tokens.in;
     tokens.out += r.tokens.out;
     // поток оборвался на полуслове: берём написанное после последней проверки
-    if (!r.msg) return { text: r.fresh ? r.text : answerText([...blocks, { type: "text", text: r.text } as Content[number]], true), cut: true, refused: false, tokens, model, checks };
+    if (!r.msg) {
+      const got = [...blocks, { type: "text", text: r.text } as Content[number]];
+      // в оборванном потоке была проверка: его текст до неё неизвестен, известен только хвост после неё
+      return { text: r.fresh ? r.text : answerText(got, true), cut: true, refused: false, tokens, model, checks, all: allText(got), tail: r.fresh ? r.text : tailText(got) };
+    }
     const msg = r.msg;
     blocks.push(...msg.content);
     checks += msg.content.filter((b) => b.type === "server_tool_use").length;
@@ -258,6 +271,8 @@ async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
       tokens,
       model: msg.model,
       checks,
+      all: allText(blocks),
+      tail: tailText(blocks),
     };
     // после перехода на запасную модель сообщение нельзя вернуть как есть: отдаём то, что получилось
     if (has(msg.content, "fallback") || round >= 8) return done;

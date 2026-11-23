@@ -18,6 +18,27 @@ const SYM: Record<string, string> = {
   lvert: "|", rvert: "|", lVert: "‖", rVert: "‖", Vert: "‖", lfloor: "⌊", rfloor: "⌋", lceil: "⌈", rceil: "⌉",
   varkappa: "ϰ", varrho: "ρ", varsigma: "ς", Pi: "Π", Xi: "Ξ", Upsilon: "Υ", supset: "⊃", supseteq: "⊇", nsubseteq: "⊈",
   otimes: "⊗", leqq: "≤", geqq: "≥", rightleftharpoons: "⇄", leftrightarrows: "⇄", triangleq: "≜", bot: "⊥", top: "⊤",
+  square: "□", Box: "□", qed: "□", blacksquare: "■", nexists: "∄", vdots: "⋮", ddots: "⋱", iint: "∬", iiint: "∭", oiint: "∯",
+  Longleftarrow: "⇐", longleftarrow: "←", longleftrightarrow: "↔", longmapsto: "↦", gets: "←", impliedby: "⇐", Uparrow: "⇑", Downarrow: "⇓",
+  updownarrow: "↕", nearrow: "↗", searrow: "↘", nwarrow: "↖", swarrow: "↙", leadsto: "⇝", rightsquigarrow: "⇝", hookrightarrow: "↪", hookleftarrow: "↩",
+  nrightarrow: "↛", nleftarrow: "↚", nRightarrow: "⇏", nLeftarrow: "⇍", nLeftrightarrow: "⇎", rightleftarrows: "⇄", leftrightharpoons: "⇋",
+  rarr: "→", larr: "←", harr: "↔", Rarr: "⇒", Larr: "⇐", rArr: "⇒", lArr: "⇐", hArr: "⇔", uarr: "↑", darr: "↓",
+  nleq: "≰", nleqslant: "≰", ngeq: "≱", ngeqslant: "≱", nless: "≮", ngtr: "≯", lneq: "≨", gneq: "≩", lneqq: "≨", gneqq: "≩",
+  lesssim: "≲", gtrsim: "≳", lessgtr: "≶", gtrless: "≷", prec: "≺", succ: "≻", preceq: "⪯", succeq: "⪰", asymp: "≍", doteq: "≐",
+  approxeq: "≊", thicksim: "∼", thickapprox: "≈", nsim: "≁", ncong: "≇", coloneqq: "≔", eqqcolon: "≕", varpropto: "∝",
+  subsetneq: "⊊", supsetneq: "⊋", subsetneqq: "⊊", supsetneqq: "⊋", nsupseteq: "⊉", notni: "∌", owns: "∋", sqsubseteq: "⊑", sqsupseteq: "⊒",
+  odot: "⊙", ominus: "⊖", oslash: "⊘", dagger: "†", ddagger: "‡", dag: "†", ddag: "‡", uplus: "⊎", sqcup: "⊔", sqcap: "⊓", amalg: "⨿",
+  bigcup: "⋃", bigcap: "⋂", bigoplus: "⨁", bigotimes: "⨂", bigodot: "⨀", bigvee: "⋁", bigwedge: "⋀", coprod: "∐", ltimes: "⋉", rtimes: "⋊",
+  vdash: "⊢", dashv: "⊣", models: "⊨", vDash: "⊨", complement: "∁", aleph: "ℵ", beth: "ℶ", Re: "ℜ", Im: "ℑ", wp: "℘", hslash: "ℏ", imath: "ı", jmath: "ȷ",
+  measuredangle: "∡", sphericalangle: "∢", vartriangle: "△", triangledown: "▽", bigtriangleup: "△", bigtriangledown: "▽", blacktriangle: "▲",
+  diamond: "⋄", Diamond: "◊", lozenge: "◊", bigstar: "★", checkmark: "✓", surd: "√", backprime: "‵", cdotp: "·", centerdot: "·", ldotp: ".",
+  dotsc: "…", dotso: "…", dotsb: "⋯", dotsm: "⋯", dotsi: "⋯", mathellipsis: "…", textdegree: "°", copyright: "©", textcopyright: "©",
+  textregistered: "®", circledR: "®", pounds: "£", yen: "¥", textbackslash: "\\", textless: "<", textgreater: ">", textbar: "|", textasciitilde: "~",
+  textunderscore: "_", textendash: "–", textemdash: "—", textellipsis: "…", textbullet: "•", And: "&", AA: "Å", angstrom: "Å",
+  lbrack: "[", rbrack: "]", lparen: "(", rparen: ")", lgroup: "(", rgroup: ")", llbracket: "⟦", rrbracket: "⟧", lang: "⟨", rang: "⟩",
+  upsilon: "υ", iota: "ι", omicron: "ο", varpi: "ϖ", Alpha: "Α", Beta: "Β", Epsilon: "Ε", Zeta: "Ζ", Eta: "Η", Iota: "Ι", Kappa: "Κ", Mu: "Μ", Nu: "Ν",
+  Omicron: "Ο", Rho: "Ρ", Tau: "Τ", Chi: "Χ", varGamma: "Γ", varDelta: "Δ", varTheta: "Θ", varLambda: "Λ", varXi: "Ξ", varPi: "Π", varSigma: "Σ",
+  varUpsilon: "Υ", varPhi: "Φ", varPsi: "Ψ", varOmega: "Ω", flat: "♭", natural: "♮", sharp: "♯", clubsuit: "♣", diamondsuit: "♢", heartsuit: "♡", spadesuit: "♠",
 };
 const BB: Record<string, string> = { N: "ℕ", Z: "ℤ", Q: "ℚ", R: "ℝ", C: "ℂ" };
 const SUP: Record<string, string> = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻", "−": "⁻", "=": "⁼", "(": "⁽", ")": "⁾", n: "ⁿ", i: "ⁱ", x: "ˣ", y: "ʸ", a: "ᵃ", b: "ᵇ", c: "ᶜ", d: "ᵈ", e: "ᵉ", k: "ᵏ", m: "ᵐ", p: "ᵖ", t: "ᵗ" };
@@ -28,12 +49,19 @@ const WRAP = new Set([
   "boldsymbol", "bm", "displaystyle", "textstyle", "scriptstyle", "scriptscriptstyle", "mathstrut", "underline", "widehat", "widetilde", "hat", "tilde",
   "boxed", "fbox", "mathcal", "mathfrak", "mathscr", "limits", "nolimits", "cancel", "bcancel", "xcancel", "underbrace", "overbrace", "dot", "ddot", "check",
   "breve", "acute", "grave", "smash", "mathop", "mathrel", "mathbin", "mathord", "mathopen", "mathclose", "mathpunct", "mathinner", "rm", "bf", "it", "sf", "tt",
+  "emph", "mathring", "overleftrightarrow", "overparen", "underparen", "textup", "textsl", "textsc", "textmd", "mathnormal", "pmb", "bold", "sout",
+  "underbar", "utilde", "widecheck", "dddot", "ddddot", "overgroup", "undergroup", "underleftarrow", "underrightarrow", "underleftrightarrow",
+  "mathclap", "mathllap", "mathrlap", "clap", "llap", "rlap", "substack", "ensuremath", "intertext", "url", "textcircled",
 ]);
-const TWO = new Set(["overset", "underset", "stackrel", "textcolor", "colorbox", "href"]); // два аргумента, в текст идёт второй
-const GONE = new Set(["phantom", "hphantom", "vphantom", "color", "label", "ref", "hspace", "vspace", "kern", "mkern", "mskip", "hskip", "rule"]); // аргумент пропадает вместе с командой
+const TWO = new Set(["overset", "underset", "stackrel", "textcolor", "colorbox", "href", "raisebox"]); // два аргумента, в текст идёт второй
+const THREE = new Set(["multicolumn", "multirow", "fcolorbox"]); // три аргумента, в текст идёт третий
+// стрелки с подписью: \xrightarrow{t}
+const XARR: Record<string, string> = { xrightarrow: "→", xleftarrow: "←", xRightarrow: "⇒", xLeftarrow: "⇐", xleftrightarrow: "↔", xLeftrightarrow: "⇔", xmapsto: "↦", xrightleftharpoons: "⇄", xhookrightarrow: "↪", xlongequal: "=" };
+const GONE = new Set(["phantom", "hphantom", "vphantom", "color", "label", "ref", "hspace", "vspace", "kern", "mkern", "mskip", "hskip", "rule", "cline"]); // аргумент пропадает вместе с командой
 const FUNCS = new Set([
   "sin", "cos", "tan", "cot", "tg", "ctg", "sec", "csc", "cosec", "arcsin", "arccos", "arctan", "arctg", "arcctg", "sinh", "cosh", "tanh", "coth", "sh", "ch", "th", "cth",
   "ln", "lg", "log", "exp", "lim", "max", "min", "sup", "inf", "det", "dim", "deg", "gcd", "ker", "arg", "Pr", "hom",
+  "cotg", "liminf", "limsup", "argmax", "argmin", "sgn",
 ]);
 const NOT: Record<string, string> = { "=": "≠", "∈": "∉", "⊂": "⊄", "⊆": "⊈", "≡": "≢", "<": "≮", ">": "≯", "|": "∤", "∥": "∦" };
 const GLUE = /[\p{L}\p{N})′⁰¹²³⁴-⁹ⁿˣ₀-₉]$/u; // после такого знака имя функции нужно отделить пробелом: «2 sin x cos x»
@@ -52,12 +80,13 @@ const DROP = new Set([
   "left", "right", "middle", "big", "Big", "bigg", "Bigg", "bigl", "bigr", "bigm", "Bigl", "Bigr", "Bigm", "biggl", "biggr", "Biggl", "Biggr", "displaystyle", "textstyle", "limits", "nolimits",
   "nonumber", "notag", "hline", "mathstrut", "strut", "small", "large", "Large", "LARGE", "normalsize", "tiny", "huge", "Huge", "footnotesize", "scriptsize", "centering", "noindent", "allowbreak", "nobreak",
   "newline", "par", "hfill", "medskip", "smallskip", "bigskip", "thinspace", "enspace", "negthinspace", "nobreakspace", "space",
+  "medspace", "thickspace", "negmedspace", "negthickspace", "enskip", "hfil", "vfill", "vfil", "hdashline", "vline", "cr", "relax", "protect", "displaylimits",
 ]);
 // Все команды, которые понимает этот разбор. Слово после «\», которого здесь нет, командой LaTeX не считаем:
 // путь к файлу C:\Users или «\n» в рассказе о программе остаются как были.
-const STRUCT = ["frac", "dfrac", "tfrac", "cfrac", "sqrt", "mathbb", "vec", "overrightarrow", "overleftarrow", "ce", "pu", "overline", "bar", "binom", "dbinom", "tbinom", "pmod", "bmod", "mod", "not", "operatorname", "begin", "end", "tag", "xrightarrow", "xleftarrow"];
+const STRUCT = ["frac", "dfrac", "tfrac", "cfrac", "sqrt", "mathbb", "vec", "overrightarrow", "overleftarrow", "ce", "pu", "overline", "bar", "binom", "dbinom", "tbinom", "pmod", "bmod", "mod", "not", "operatorname", "begin", "end", "tag", "abs", "norm", "Bbb", ...Object.keys(XARR)];
 const BIG = new Set(["lim", "sum", "prod", "int", "max", "min", "sup", "inf"]);
-const KNOWN = new Set<string>([...Object.keys(SYM), ...WRAP, ...TWO, ...GONE, ...FUNCS, ...DROP, ...STRUCT]);
+const KNOWN = new Set<string>([...Object.keys(SYM), ...WRAP, ...TWO, ...THREE, ...GONE, ...FUNCS, ...DROP, ...STRUCT]);
 
 const map = (s: string, m: Record<string, string>) => [...s].every((c) => c in m) ? [...s].map((c) => m[c]).join("") : null;
 const simple = (s: string) => /^[\p{L}\p{N}.,°′√∞π⁰¹²³⁴-⁹₀-₉ₐₑₒₓₙₘₖₜᵢⱼⁿ]*$/u.test(s) || /^\([^()]*\)$/.test(s) || /^√\([^()]*\)$/.test(s) || /^\p{L}+\([^()]*\)$/u.test(s);
@@ -147,12 +176,15 @@ function conv(s: string): string {
         out += (/\d$/.test(out) && /^\d/.test(f) ? " " : "") + (fn || factorNext(s.slice(i)) ? `(${f})` : f);
       }
       else if (name === "sqrt") { const n = optional(), x = group(); out += (n === null || n === "2" ? "√" : n === "3" ? "∛" : n === "4" ? "∜" : (map(n, SUP) ?? `(${n})`) + "√") + (/^[\p{L}\p{N},]+$/u.test(x) ? x + (afterRoot(s.slice(i)) ? "·" : "") : `(${x})`); }
-      else if (name === "mathbb") { const x = group(); out += BB[x] ?? x; }
+      else if (name === "mathbb" || name === "Bbb") { const x = group(); out += BB[x] ?? x; }
       else if (name === "vec" || name === "overrightarrow" || name === "overleftarrow") out += group() + "⃗";
       else if (TWO.has(name)) { group(); out += group(); }
+      else if (THREE.has(name)) { optional(); group(); group(); out += group(); }
+      else if (name === "abs") out += `|${group()}|`;
+      else if (name === "norm") out += `‖${group()}‖`;
       else if (GONE.has(name)) { if (s[i] === "{") group(); }
       else if (name === "tag") out += ` (${group()})`;
-      else if (name === "xrightarrow" || name === "xleftarrow") { optional(); const over = group(); out += over ? ` —(${over})${name === "xrightarrow" ? "→" : "←"} ` : name === "xrightarrow" ? " → " : " ← "; }
+      else if (name in XARR) { optional(); const over = group(); out += over ? ` —(${over})${XARR[name]} ` : ` ${XARR[name]} `; }
       else if (name === "|") out += "‖";
       else if (name === "ce" || name === "pu") { const from = i; group(); out += chem(s.slice(from, i).trim().replace(/^\{|\}$/g, "")); }
       else if (name === "overline" || name === "bar") { const x = group(); out += /^\d+$/.test(x) ? `(${x})` : [...x].map((ch) => ch + "\u0305").join(""); } // 0,(3): период дроби
@@ -177,7 +209,10 @@ function conv(s: string): string {
       else if (DROP.has(name)) out += "";
       else if (WRAP.has(name)) out += group();
       else if (name in SYM) out += SYM[name];
-      else out += (/^[A-Za-z]{2,}$/.test(name) && GLUE.test(out) ? " " : "") + name; // sin, cos, tg, log, \%, \{ …
+      else if (FUNCS.has(name)) out += (GLUE.test(out) ? " " : "") + name; // sin, cos, tg, log
+      else if (!/^[A-Za-z]+$/.test(name)) out += name; // \%, \{, \$ …
+      // команда, которой нет в списках: её имя человеку ничего не скажет, а аргумент (\emph{важно}) остаётся
+      else if (/^ *\{/.test(s.slice(i))) out += group();
       continue;
     }
     last = c === " " ? last : c === "^" || c === "_" ? last : "";
@@ -210,21 +245,25 @@ export function texToPlain(tex: string): string {
 }
 
 // Делит строку на обычный текст и формулы: $…$ и $$…$$. Непарный знак $ остаётся текстом.
+// Код в `…` и путь к файлу формулой не бывают: знак $ в них (`^\d+$`) ни с чем не спаривается.
 export function mathSpans(text: string): { math: boolean; body: string }[] {
   const out: { math: boolean; body: string }[] = [];
   const re = /\$\$([^$]+?)\$\$|\$(?!\s)((?:\\.|[^$\\\n])+?)(?<!\s)\$/g;
-  let at = 0;
-  for (let m = re.exec(text); m; m = re.exec(text)) {
-    if (m.index > at) out.push({ math: false, body: text.slice(at, m.index) });
-    out.push({ math: true, body: (m[1] ?? m[2]).trim() });
-    at = m.index + m[0].length;
+  for (const [part, lit] of pieces(text)) {
+    if (lit) { out.push({ math: false, body: part }); continue; }
+    let at = 0;
+    for (let m = re.exec(part); m; m = re.exec(part)) {
+      if (m.index > at) out.push({ math: false, body: part.slice(at, m.index) });
+      out.push({ math: true, body: (m[1] ?? m[2]).trim() });
+      at = m.index + m[0].length;
+    }
+    if (at < part.length) out.push({ math: false, body: part.slice(at) });
   }
-  if (at < text.length) out.push({ math: false, body: text.slice(at) });
   return out;
 }
 
-// Текст с формулами -> текст без LaTeX
-export const plainMath = (text: string): string => mathSpans(text).map((s) => (s.math ? texToPlain(s.body) : s.body)).join("");
+// Текст с формулами -> текст без LaTeX. Знак доллара из формулы ($\$5$) снова экранируем, иначе stripTex принял бы его за мусор
+export const plainMath = (text: string): string => mathSpans(text).map((s) => (s.math ? texToPlain(s.body).replace(/\$/g, "\\$") : s.body)).join("");
 
 // ---------- заслон от сырой разметки ----------
 // Человек не должен увидеть ни «$», ни «\frac{…}», как бы модель ни записала формулу.
@@ -232,10 +271,27 @@ export const plainMath = (text: string): string => mathSpans(text).map((s) => (s
 
 const isCommand = (name: string) => KNOWN.has(name);
 const MARKUP = /[\\$]|[\^_]\{/; // без этих знаков разметки LaTeX в тексте быть не может
+// \имя{…} с именем из двух букв и больше это LaTeX, даже если команды нет в списках; \d{3} из регулярного выражения нет
 const hot = (t: string): boolean => {
-  for (const m of t.matchAll(/\\([A-Za-z]+)|[\^_]\{/g)) if (m[1] === undefined || isCommand(m[1])) return true;
+  for (const m of t.matchAll(/\\([A-Za-z]+)(\{)?|\\\||[\^_]\{/g)) if (m[1] === undefined || isCommand(m[1]) || (m[2] && m[1].length > 1)) return true;
   return false;
 };
+// Путь к файлу (C:\data\in\input.txt) и код в `…` разметкой не считаем и не трогаем: в них обратная черта, $ и скобки значат своё.
+// Код в `…` всё же разбираем, если в нём команда LaTeX или целая формула `$…$`: так модель иногда пишет формулы.
+const SAFE = /`[^`\n]+`|(?<![A-Za-z0-9\\])[A-Za-z]:\\[^\s$`]*/g;
+const literal = (s: string) => s[0] !== "`" || (!hot(s) && !/^`\s*\$[^$]+\$\s*`$/.test(s));
+function pieces(text: string): [string, boolean][] {
+  const out: [string, boolean][] = [];
+  let at = 0;
+  for (const m of text.matchAll(SAFE)) {
+    if (!literal(m[0])) continue;
+    out.push([text.slice(at, m.index), false], [m[0], true]);
+    at = m.index! + m[0].length;
+  }
+  out.push([text.slice(at), false]);
+  return out;
+}
+const keep = (text: string, fn: (t: string) => string) => pieces(text).map(([s, lit]) => (lit ? s : fn(s))).join("");
 // Слово похоже на часть формулы: в нём нет русских букв и нет длинного слова латиницей (кроме команд и имён функций)
 function mathy(tok: string): boolean {
   const rest = tok.replace(/\\(?:text|mathrm|textbf|textit|operatorname)\*?\s*\{[^{}]*\}/g, "").replace(/\\[A-Za-z]+\*?/g, "");
@@ -281,7 +337,7 @@ function bare(seg: string, fn: (core: string) => string): string {
     const count = (c: string) => core.split(c).length - 1;
     if (core.startsWith("(") && count("(") > count(")")) { head += "("; core = core.slice(1).trimStart(); }
     if (core.endsWith(")") && count(")") > count("(")) { tail = ")" + tail; core = core.slice(0, -1).trimEnd(); }
-    out += head + (core ? fn(core.replace(/\$/g, "")) : "") + tail;
+    out += head + (core ? fn(core.replace(/(?<!\\)\$/g, "")) : "") + tail;
   }
   return out;
 }
@@ -292,36 +348,52 @@ const dollars = (line: string) => line.replace(/\\\$/g, "").split("$").length - 
 // Запись формул к одному виду: «$…$» в одной строке. Модель может написать и \( … \), и \[ … \], и $$ … $$,
 // и систему в несколько строк, и команду вовсе без знаков $. Код программ сюда не попадает.
 export function normalizeMath(text: string): string {
+  return MARKUP.test(text) ? keep(text, normalize) : text;
+}
+// Склеить можно только то, что похоже на формулу: русские слова вне \text{…} и код в `…` формулой не бывают
+const formulaLike = (body: string) => !/[А-Яа-яЁё`]/.test(body.replace(/\\(?:text|textrm|textbf|textit|mbox|mathrm|operatorname)\*?\s*\{[^{}]*\}/g, ""));
+function normalize(text: string): string {
   if (!MARKUP.test(text)) return text;
   const wrap = (_m: string, body: string) => (flat(body) ? `$${flat(body)}$` : "");
   const t = text
     .replace(/\\begin\{([a-zA-Z]+\*?)\}[\s\S]*?\\end\{\1\}/g, flat) // окружение в несколько строк собираем в одну
     .replace(/(?<!\\)\\\[([\s\S]+?)(?<!\\)\\\]/g, wrap)
     .replace(/(?<!\\)\\\(([\s\S]+?)(?<!\\)\\\)/g, wrap)
-    .replace(/\$\$([\s\S]*?)\$\$/g, wrap);
-  // формула, начатая на одной строке и законченная на другой: строки склеиваем
+    .replace(/\$\$([\s\S]*?)\$\$/g, wrap)
+    // $x$ внутри \text{…} формулы: такие знаки $ сбили бы пары, и в тексте осталась бы лишняя «}»
+    .replace(/\\(text|textrm|textbf|textit|mbox|mathrm)\s*\{([^{}\n]*)\}/g, (m, c: string, b: string) => (b.includes("$") ? `\\${c}{${b.replace(/(?<!\\)\$/g, "")}}` : m));
+  // формула, начатая на одной строке и законченная на другой: строки склеиваем.
+  // Одинокий знак $ (цена «3$») строки не склеивает: нужна формула, которая переходит через перенос
   const lines = t.split("\n");
   const inside = (l: string | undefined) => l !== undefined && l.trim() !== "" && !/^\s*@@@/.test(l);
   for (let i = 0; i < lines.length; i++) {
     if (dollars(lines[i]) % 2 === 0) continue;
     let j = i + 1;
     while (j <= i + 8 && inside(lines[j]) && dollars(lines[j]) % 2 === 0) j++;
-    if (j <= i + 8 && inside(lines[j])) lines.splice(i, j - i + 1, lines.slice(i, j + 1).map((l, k) => (k ? l.trim() : l.trimEnd())).join(" "));
+    if (j > i + 8 || !inside(lines[j])) continue;
+    const rows = lines.slice(i, j + 1).map((l, k) => (k ? l.trim() : l.trimEnd()));
+    const across = mathSpans(rows.join(" \u0001 ")).filter((s) => s.math && s.body.includes("\u0001"));
+    if (across.length && across.every((s) => formulaLike(s.body))) lines.splice(i, j - i + 1, rows.join(" "));
   }
   return lines.map((line) => mathSpans(line).map((s) => (s.math ? `$${s.body}$` : bare(s.body, (core) => `$${core}$`))).join("")).join("\n");
 }
 
 // Последняя чистка текста, который уходит человеку: всё, что осталось от LaTeX, переводится в обычные знаки или убирается.
 export function stripTex(text: string): string {
-  if (!MARKUP.test(text)) return text;
+  return MARKUP.test(text) ? keep(text, strip) : text;
+}
+function strip(text: string): string {
   return text.split("\n").map((line) => {
     if (!MARKUP.test(line)) return line;
-    return bare(line, texToPlain)
-      .replace(/\\\$/g, "") // \$ это настоящий знак доллара
+    const l = line.replace(/\\\$/g, ""); // \$ это настоящий знак доллара
+    // строка без формул (рассказ про обратную черту в Windows): меняем только \% \& \#, остальное как было
+    if (!hot(l) && !/\$|\\[()[\]|]/.test(l)) return l.replace(/\\([%&#])/g, "$1").replace(//g, "$");
+    return bare(l, texToPlain)
       .replace(/\\([A-Za-z]+)\*?/g, (m, n: string) => (!isCommand(n) ? m : n in SYM ? SYM[n] : FUNCS.has(n) ? n : ""))
       .replace(/\\\\(?![A-Za-zА-Яа-яЁё])/g, " ")
       .replace(/\\([,;:!> ])/g, " ")
       .replace(/\\([%&#_{}])/g, "$1")
+      .replace(/\\\|/g, "‖")
       .replace(/\\[()[\]]/g, "")
       .replace(/([\^_])\{([^{}\n]*)\}/g, "$1($2)")
       .replace(/\$/g, "") // знак $ без пары: формулы тут нет, а знак остался бы мусором
@@ -330,11 +402,13 @@ export function stripTex(text: string): string {
   }).join("\n");
 }
 
-// Проверка для тестов: первый кусок сырой разметки LaTeX в тексте, готовом к отправке. Код программ не смотрим.
+// Проверка для тестов: первый кусок сырой разметки LaTeX в тексте, готовом к отправке. Код программ и пути к файлам не смотрим.
+// \имя{…} считается разметкой, даже если такой команды нет в списках: так тесты заметят пробел в списках.
 export function texLeak(text: string): string | null {
-  for (const piece of text.split(/```[\s\S]*?```/)) {
-    for (const m of piece.matchAll(/\\([A-Za-z]+)|\\[()[\]\\]|\$|[\^_]\{/g)) {
-      if (m[1] !== undefined && !isCommand(m[1])) continue;
+  for (const block of text.split(/```[\s\S]*?```/)) {
+    const piece = keep(block, (s) => s).replace(SAFE, (m) => (literal(m) ? " " : m));
+    for (const m of piece.matchAll(/\\([A-Za-z]+)(\{)?|\\[()[\]\\|{}%&#_]|\$|[\^_]\{/g)) {
+      if (m[1] !== undefined && !isCommand(m[1]) && !(m[2] && m[1].length > 1)) continue;
       return piece.slice(Math.max(0, m.index! - 12), m.index! + 24);
     }
   }
