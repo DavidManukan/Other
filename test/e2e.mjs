@@ -180,6 +180,26 @@ try {
   ok(await until(() => texts("889").includes("⚠️ Неверный ключ Claude. Проверь ANTHROPIC_API_KEY.")), "неверный ключ: понятное сообщение", JSON.stringify(texts("889")));
   ok(await quiet("889"), "неверный ключ: без повторов");
 
+  // --- поток оборвался, пока модель думала (перегрузка в потоке или разрыв связи): повтор, а не отказ ---
+  for (const [chat, sc] of [["890", "S_SSEERR"], ["891", "S_EARLYDROP"]]) {
+    await photo(chat, sc);
+    ok(await until(() => texts(chat).some((t) => t.includes("Ответ: 5")), 30_000), `${sc}: бот сам повторил и решил`, JSON.stringify(texts(chat)));
+    ok(texts(chat)[0] === "⏳ Claude занят, пробую ещё раз…" && !texts(chat).some((t) => t.startsWith("⚠️")), `${sc}: без сообщения об ошибке`, JSON.stringify(texts(chat)));
+  }
+
+  // --- лимит трат, заданный в консоли Claude: одна попытка и понятный текст ---
+  await photo("892", "S_SPEND");
+  ok(await until(() => texts("892").includes("⚠️ Claude: достигнут лимит трат, который задан в консоли (platform.claude.com → Limits).")), "лимит трат: понятное сообщение", JSON.stringify(texts("892")));
+  ok(claude.filter((b) => JSON.stringify(b.messages).includes("S_SPEND")).length === 1, "лимит трат: без лишних запросов");
+  const b9 = claude.length;
+  await text("893", "проверка после лимита");
+  ok(await until(() => claude.length > b9) && claude[b9].output_config?.effort === "high", "лимит трат: настройки запроса не испорчены");
+
+  // --- фильтр остановил модель посреди ответа: готовое доставлено, обрывок нет, есть подсказка ---
+  await photo("894", "S_REFMID");
+  ok(await until(() => texts("894").some((t) => t.startsWith("(модель остановилась"))), "отказ посреди ответа: есть подсказка", JSON.stringify(texts("894")));
+  ok(texts("894").length === 2 && texts("894")[0].includes("Ответ: 5") && !texts("894").join("").includes("начало"), "отказ посреди ответа: обрывок не отправлен", JSON.stringify(texts("894")));
+
   // --- долгое молчание: один раз «решаю» ---
   await photo("901", "S_HELLO");
   ok(await until(() => texts("901").some((t) => t.includes("Ответ: 42"))), "долгая задача решена");

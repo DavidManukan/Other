@@ -72,6 +72,16 @@ function anthropic(req, res, body) {
     const m = message("", { think: 600_000 });
     return sse(res, m.ev);
   }
+  if (scenario === "S_SPEND") return err(400, "invalid_request_error", "You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.");
+  if ((scenario === "S_SSEERR" || scenario === "S_EARLYDROP") && n === 1) {
+    // модель ещё думает, а поток обрывается: ошибкой перегрузки или просто разрывом связи
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    for (const ev of message("").ev.slice(0, 2)) res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+    if (scenario === "S_EARLYDROP") return setTimeout(() => res.destroy(), 150);
+    res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}\n\n`);
+    return res.end();
+  }
+  if (scenario === "S_REFMID") return sse(res, message("№1\nОтвет: 5\n@@@\n№2\nначало", { stop: "refusal" }).ev);
   if (scenario === "S_REFUSE") return sse(res, message("", { stop: "refusal" }).ev);
   if (scenario === "S_CUT" && text !== "дальше") return sse(res, message("№1\nx^2 = 16\nОтвет: 4\n@@@\n№2\nначало решения, которое не помести", { stop: "max_tokens" }).ev);
   if (scenario === "S_CUT") return sse(res, message("лось в первый кусок.\nОтвет: 7 см2").ev);

@@ -19,11 +19,14 @@ class Undelivered {
 export class Splitter {
   private pending = "";
   private static SPLIT = /(?:^|\n)[ \t]*@@@[^\n]*\n/;
+  private marked = false; // в накопленном тексте есть @@@ (значит, разделитель может завершиться переводом строки)
   push(delta: string): string[] {
-    // ищем разделитель только в свежем куске (и на стыке с прошлым), а не во всём накопленном тексте
-    const from = Math.max(0, this.pending.length - 3);
+    // Регулярное выражение по всему накопленному тексту дорогое, поэтому запускаем его, только когда
+    // разделитель действительно мог появиться: @@@ уже встречалось и пришёл перевод строки.
+    const from = Math.max(0, this.pending.length - 2);
     this.pending += delta;
-    if (this.pending.indexOf("@@@", from) < 0) return [];
+    this.marked ||= this.pending.indexOf("@@@", from) >= 0;
+    if (!this.marked || !delta.includes("\n")) return [];
     const out: string[] = [];
     let m: RegExpMatchArray | null;
     while ((m = this.pending.match(Splitter.SPLIT))) {
@@ -31,10 +34,11 @@ export class Splitter {
       this.pending = this.pending.slice(m.index! + m[0].length);
       if (chunk.trim()) out.push(chunk);
     }
+    this.marked = this.pending.includes("@@@");
     return out;
   }
   rest(): string {
-    return this.pending.replace(/(?:^|\n)[ \t]*@@@[ \t]*$/, "").trim();
+    return this.pending.replace(/(?:^|\n)[ \t]*@@@[^\n]*$/, "").trim(); // хвостовой разделитель без перевода строки
   }
 }
 
@@ -73,7 +77,7 @@ export function claudeProblem(c: Cfg, e: unknown): Error {
     return new Fatal("На балансе Claude кончились деньги (platform.claude.com → Billing).");
   }
   if (e instanceof Anthropic.RateLimitError) {
-    if (e.errorCode === "enforced_spend_limit_reached" || !e.headers?.get("retry-after")) {
+    if (e.errorCode === "enforced_spend_limit_reached" || e.errorCode === "contract_spend_limit_reached") {
       return new Fatal("Claude: достигнут месячный лимит трат (platform.claude.com → Limits).");
     }
     return new Busy("Claude занят");
@@ -84,14 +88,24 @@ export function claudeProblem(c: Cfg, e: unknown): Error {
   }
   if (e instanceof Anthropic.APIConnectionError) return new Busy("нет связи с Claude");
   if (e instanceof Anthropic.APIError) {
-    if (typeof e.status === "number" && e.status >= 500) return new Busy("Claude занят");
+    // ошибка без кода ответа приходит прямо в потоке (обычно перегрузка): стоит повторить
+    if (typeof e.status !== "number" || e.status >= 500) return new Busy("Claude занят");
     const msg = String(e.apiMessage ?? e.message ?? "");
-    // Старые ключи получают нехватку денег как обычную ошибку 400, типа у неё нет
-    if (/credit balance/i.test(msg)) return new Fatal("На балансе Claude кончились деньги (platform.claude.com → Billing).");
-    return new Fatal(`Ошибка Claude ${e.status ?? ""}: ${msg.slice(0, 120)}`);
+    // Нехватка денег и лимит трат, заданный в консоли, приходят обычной ошибкой 400, своего типа у них нет
+    if (CREDIT.test(msg)) return new Fatal("На балансе Claude кончились деньги (platform.claude.com → Billing).");
+    if (SPEND.test(msg)) return new Fatal("Claude: достигнут лимит трат, который задан в консоли (platform.claude.com → Limits).");
+    return new Fatal(`Ошибка Claude ${e.status}: ${msg.slice(0, 120)}`);
   }
   return e instanceof Error ? e : new Error(String(e));
 }
+
+const CREDIT = /credit balance/i;
+const SPEND = /specified (workspace )?API usage limits/i;
+// Ошибка 400, которая точно не про необязательные параметры: перебирать их незачем
+const notAboutParams = (e: InstanceType<typeof Anthropic.BadRequestError>) => {
+  const msg = String(e.apiMessage ?? e.message ?? "");
+  return CREDIT.test(msg) || SPEND.test(msg);
+};
 
 export function client(c: Cfg): Anthropic {
   return new Anthropic({ apiKey: c.claudeKey, baseURL: c.claudeBase, maxRetries: 2 });
@@ -99,20 +113,23 @@ export function client(c: Cfg): Anthropic {
 
 export async function ask(c: Cfg, o: AskOptions): Promise<Answer> {
   const removed: Feature[] = [];
+  // Параметр считаем лишним, только если без него запрос прошёл. При любой другой концовке возвращаем как было.
+  const restore = () => {
+    const off = disabled.get(c.model);
+    for (const f of removed) off?.delete(f);
+  };
   for (;;) {
     try {
       return await attempt(c, o);
     } catch (e) {
-      if (!(e instanceof Anthropic.BadRequestError)) throw claudeProblem(c, e);
-      // Возможно, модель не знает один из необязательных параметров: убираем по одному и пробуем снова
       const off = disabled.get(c.model) ?? new Set<Feature>();
-      const next = ORDER.find((f) => !off.has(f) && (f !== "speed" || o.fast));
+      // Возможно, модель не знает один из необязательных параметров: убираем по одному и пробуем снова
+      const next = e instanceof Anthropic.BadRequestError && !notAboutParams(e) ? ORDER.find((f) => !off.has(f) && (f !== "speed" || o.fast)) : undefined;
       if (!next) {
-        // дело было не в параметрах: возвращаем всё как было и показываем настоящую ошибку
-        for (const f of removed) off.delete(f);
+        restore();
         throw claudeProblem(c, e);
       }
-      console.log(`Claude 400, пробую без ${next}:`, String(e.apiMessage ?? e.message).slice(0, 200));
+      console.log(`Claude 400, пробую без ${next}:`, String((e as Error).message).slice(0, 200));
       off.add(next);
       disabled.set(c.model, off);
       removed.push(next);
@@ -147,9 +164,11 @@ async function attempt(c: Cfg, o: AskOptions): Promise<Answer> {
 
   const split = new Splitter();
   let wrote = false; // модель написала хоть что-то, кроме пробелов
+  let opened = false; // поток открылся: запрос принят, дальше возможны только сбои связи и перегрузка
   try {
     const stream = client(c).beta.messages.stream(params, { signal: ctrl.signal });
     for await (const ev of stream) {
+      opened = true;
       if (ev.type !== "content_block_delta" || ev.delta.type !== "text_delta") continue;
       wrote ||= /\S/.test(ev.delta.text);
       for (const chunk of split.push(ev.delta.text)) {
@@ -178,6 +197,8 @@ async function attempt(c: Cfg, o: AskOptions): Promise<Answer> {
       return { rest: split.rest(), cut: true, refused: false, empty: false, tokens: { in: 0, out: 0 }, model: c.model };
     }
     if (ctrl.signal.aborted) throw new Timeout("время вышло");
+    // Модель ещё думала, а связь оборвалась или пришла ошибка в потоке: это не приговор, повторяем позже
+    if (opened && !(e instanceof Anthropic.APIError && typeof e.status === "number")) throw new Busy("связь с Claude оборвалась");
     throw e;
   } finally {
     clearTimeout(timer);

@@ -1,7 +1,8 @@
 // Модульные проверки чистых функций. Запуск: npm test
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Splitter } from "../src/claude.ts";
+import Anthropic from "@anthropic-ai/sdk";
+import { Busy, Fatal, Splitter, claudeProblem } from "../src/claude.ts";
 import { config, hider, hookKey, lower } from "../src/config.ts";
 import { fixSvg } from "../src/svg.ts";
 import { prettyMath, splitAnswer } from "../src/text.ts";
@@ -64,6 +65,41 @@ test("поток: посимвольная подача даёт тот же р�
   const b = [...[...text].flatMap((ch) => byChar.push(ch)), byChar.rest()];
   assert.deepEqual(a, ["№1\nx = 2", "№2\ny = 3", "№3\nz = 4"]);
   assert.deepEqual(b, a);
+});
+
+test("поток: разделитель с припиской режется, даже если его строка пришла по частям", () => {
+  const s = new Splitter();
+  const out = [...s.push("№1\nОтвет: 5\n@@@"), ...s.push("\n№2\nОтвет: 7\n@@@ Рис"), ...s.push("унки\n<svg>x</svg>")];
+  assert.deepEqual(out, ["№1\nОтвет: 5", "№2\nОтвет: 7"]);
+  assert.equal(s.rest(), "<svg>x</svg>");
+  // пробел после @@@ и посимвольная подача
+  const t = new Splitter();
+  const chunks = [..."№1\nОтвет: 5\n@@@ \n№2\nОтвет: 7"].flatMap((ch) => t.push(ch));
+  assert.deepEqual([...chunks, t.rest()], ["№1\nОтвет: 5", "№2\nОтвет: 7"]);
+  // хвостовой разделитель с припиской, после которого ничего не пришло
+  const u = new Splitter();
+  assert.deepEqual(u.push("№1\nОтвет: 1\n@@@ Рисунки"), []);
+  assert.equal(u.rest(), "№1\nОтвет: 1");
+});
+
+test("ошибки Claude: что повторять, а что сразу показывать", () => {
+  const c = config({ MODEL: "claude-opus-5-5" } as any);
+  const api = (status: number | undefined, type: string, message: string, headers: Record<string, string> = {}, details?: unknown) =>
+    Anthropic.APIError.generate(status, { type: "error", error: { type, message, details } }, undefined, new Headers(headers));
+  assert.ok(claudeProblem(c, api(529, "overloaded_error", "Overloaded")) instanceof Busy);
+  assert.ok(claudeProblem(c, api(500, "api_error", "boom")) instanceof Busy);
+  assert.ok(claudeProblem(c, api(429, "rate_limit_error", "slow down")) instanceof Busy); // без retry-after тоже повтор
+  assert.ok(claudeProblem(c, api(undefined, "overloaded_error", "Overloaded")) instanceof Busy); // ошибка внутри потока
+  assert.ok(claudeProblem(c, new Anthropic.APIConnectionError({ message: "x" })) instanceof Busy);
+  assert.match(claudeProblem(c, api(401, "authentication_error", "bad key")).message, /Неверный ключ/);
+  assert.match(claudeProblem(c, api(404, "not_found_error", "no model")).message, /Нет модели claude-opus-5-5/);
+  assert.match(claudeProblem(c, api(402, "billing_error", "pay")).message, /кончились деньги/);
+  assert.match(claudeProblem(c, api(400, "invalid_request_error", "Your credit balance is too low")).message, /кончились деньги/);
+  assert.match(claudeProblem(c, api(400, "invalid_request_error", "You have reached your specified API usage limits.")).message, /лимит трат, который задан в консоли/);
+  assert.match(claudeProblem(c, api(413, "request_too_large", "big")).message, /Фото слишком большое/);
+  const other = claudeProblem(c, api(400, "invalid_request_error", "messages: bad"));
+  assert.ok(other instanceof Fatal);
+  assert.equal(other.message, "Ошибка Claude 400: messages: bad");
 });
 
 test("рисунок приводится к тёмному стилю: фон, цвета, шрифт, индексы", () => {

@@ -333,7 +333,7 @@ export class Chat extends DurableObject<Env> {
     };
     const deliver = async (raw: string) => {
       const { text, svgs } = splitAnswer(raw);
-      job.svgs.push(...svgs);
+      for (const svg of svgs) if (!job.svgs.includes(svg)) job.svgs.push(svg);
       if (!text) return;
       if (sends >= MAX_SENDS) held.push(text);
       else await post(text);
@@ -353,7 +353,8 @@ export class Chat extends DurableObject<Env> {
     } finally {
       clearTimeout(hello);
     }
-    if (a.rest) await deliver(a.rest);
+    // если модель остановил защитный фильтр, недописанный хвост не отправляем: он оборван на полуслове
+    if (a.rest && !a.refused) await deliver(a.rest);
     if (held.length) await post(held.join("\n\n"));
     job.tokens += a.tokens.in + a.tokens.out;
 
@@ -363,7 +364,12 @@ export class Chat extends DurableObject<Env> {
       if (a.cut && a.empty && job.effort !== "low") throw new Timeout("лимит токенов ушёл на размышления"); // повтор на ступень проще
       return await this.finish(key, job, chatId, a.cut ? "Задание слишком длинное. Сфоткай одно задание." : "Пустой ответ. Пришли фото ещё раз.");
     }
-    if (job.sent.length || job.svgs.length > svgsBefore) await remember([...turns, { role: "assistant", content: job.sent.join("\n\n") || "[рисунок]" }]);
+    if (job.sent.length || job.svgs.length > svgsBefore) {
+      // рисунки в память не кладём, только пометку: иначе после «дальше» модель нарисует их заново
+      const drawn = job.svgs.length ? `\n\n[рисунков уже готово: ${job.svgs.length}, повторять их не нужно]` : "";
+      await remember([...turns, { role: "assistant", content: (job.sent.join("\n\n") || "[рисунок]") + (a.cut ? drawn : "") }]);
+    }
+    if (a.refused) await this.say(chatId, "(модель остановилась и не дорешала. Пересними оставшиеся задания.)");
     job.sent = [];
     job.tries = 0;
     if (a.cut && job.step < this.c.autoMax) {
