@@ -299,7 +299,8 @@ export class Chat extends DurableObject<Env> {
     const live = this.cur?.key === last[0];
     const job = live ? this.cur!.job : last[1];
     // пока запрос к Claude не начат, добавление ничего не стоит; начатое решение выбрасываем только в его первую минуту и не больше MAX_REDO раз
-    const early = !job.asked || (Date.now() - job.asked < MERGE / this.k && (job.redo ?? 0) < MAX_REDO);
+    // (нижняя граница окна нужна только в локальных проверках, где время ускорено)
+    const early = !job.asked || (Date.now() - job.asked < Math.max(MERGE / this.k, 3000) && (job.redo ?? 0) < MAX_REDO);
     const open = job.kind === "image" && job.phase === "solve" && !job.done && early && !job.sent && !job.unsure && !(live && this.posting === last[0]);
     return open ? { key: last[0], job, live } : null;
   }
@@ -570,7 +571,8 @@ export class Chat extends DurableObject<Env> {
     const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
     const { effort } = await this.options();
     const job: Job = { ...j, at: Date.now(), notes: [], quotes: [], fetches: 0, phase: "solve", step: 0, tries: 0, effort, acc: "", sent: 0, outbox: [], shot: 0, pages: 0, down: 0, svgs: [], drawn: 0, msgs: 0, tokens: 0, checks: 0 };
-    if (wait > 0) job.after = Date.now() + wait / this.k;
+    // (нижняя граница нужна только в локальных проверках, где время ускорено: в работе ожидание и так дольше)
+    if (wait > 0) job.after = Date.now() + Math.max(wait / this.k, 300);
     await this.db.put({ ...mark, seq, [`job:${String(seq).padStart(9, "0")}`]: job });
     if (!queue) await this.db.setAlarm(job.after ?? Date.now());
     return queue > 0;

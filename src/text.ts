@@ -7,7 +7,8 @@ const SUB: Record<string, string> = { "0": "₀", "1": "₁", "2": "₂", "3": "
 const conv = (t: string, map: Record<string, string>) => [...t].every((c) => c in map) ? [...t].map((c) => map[c]).join("") : null;
 // Химические формулы и индексы: CH3 -> CH₃, H2SO4 -> H₂SO₄, A1B1 -> A₁B₁, x1 -> x₁ (коэффициент 2H2O не трогаем).
 // Формулу, за которой стоит знак заряда (SO42-), не трогаем: где индекс, а где заряд, по записи не понять.
-const CHEM = /(?<![A-Za-z0-9_.,])(\d*)((?:[A-Z][a-z]?\d*|\((?:[A-Z][a-z]?\d*)+\)\d*)+)(?![A-Za-z0-9₀-₉]|[+−-](?![A-Za-z0-9(]))/g;
+// Номер задания с буквой («№A1», «Задание B2», «Часть C1») это не формула: цифра в нём остаётся цифрой.
+const CHEM = /(?<![A-Za-z0-9_.,№]|№\s|[Зз]адани[ея]\s|[Зз]адач[аи]\s|[Вв]ариант\s|[Чч]аст[ьи]\s)(\d*)((?:[A-Z][a-z]?\d*|\((?:[A-Z][a-z]?\d*)+\)\d*)+)(?![A-Za-z0-9₀-₉]|[+−-](?![A-Za-z0-9(]))/g;
 const ION = /(?<![A-Za-z0-9])([A-Z][a-z]?)(\d)([+−-])(?![A-Za-z0-9(])/g; // Fe3+ -> Fe³⁺: заряд простого иона
 const IDX = /(?<![A-Za-zА-Яа-я0-9])([a-z])(\d{1,2})(?![\d.,]?\d|[₀-₉])/g; // 1A2₁₆ и a1₁₆ это числа в другой системе счисления
 export function subscripts(text: string, sub: (d: string) => string): string {
@@ -135,7 +136,11 @@ const wide = (s: string) => [...s.normalize("NFC")].reduce((n, ch) => n + (/\p{M
 export function textTable(rows: string[][]): string {
   const w = rows[0].map((_, j) => Math.max(...rows.map((r) => wide(r[j]))));
   if (w.reduce((a, b) => a + b, 0) + 3 * (w.length - 1) > TABLE_W || rows.some((r) => r.some((c) => c.includes("`")))) {
-    return [rows[0].join(" | "), "—".repeat(8), ...rows.slice(1).map((r) => r.join(" | "))].join("\n");
+    // два столбца: строки через черту. Больше: каждая строка таблицы идёт своим блоком «столбец: значение»,
+    // иначе длинная строка через черты переносится где попало и столбцы уже не прочитать
+    if (rows[0].length < 3) return [rows[0].join(" | "), "—".repeat(8), ...rows.slice(1).map((r) => r.join(" | "))].join("\n");
+    const head = rows[0];
+    return rows.slice(1).map((r) => [head[0] && r[0] ? `${head[0]}: ${r[0]}` : r[0] || head[0], ...r.slice(1).flatMap((c, j) => (c ? [`  ${head[j + 1] ? `${head[j + 1]}: ` : ""}${c}`] : []))].filter(Boolean).join("\n")).join("\n");
   }
   const line = (r: string[]) => r.map((c, j) => c + " ".repeat(w[j] - wide(c))).join(" | ").trimEnd();
   return ["```", line(rows[0]), w.map((x) => "-".repeat(x)).join("-+-"), ...rows.slice(1).map(line), "```"].join("\n");
@@ -209,7 +214,8 @@ export function brief(part: string): boolean {
 }
 
 // Заголовок задания в виде ключа: по нему исправленное задание встаёт на место прежнего, а рисунок находит своё задание
-export const headKey = (s: string): string => s.toLowerCase().replace(/^\s*исправляю\s*/, "").replace(/[\s.:]/g, "");
+// (точка внутри номера остаётся: «№1.2» и «№12» это разные задания)
+export const headKey = (s: string): string => s.toLowerCase().replace(/^\s*исправляю\s*/, "").replace(/\s/g, "").replace(/[.:]+$/, "");
 export function headOf(part: string): string {
   const top = part.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 3);
   return headKey(top.find((l) => HEAD.test(l) && l.length <= 60) ?? "");
@@ -259,14 +265,33 @@ export function mergeFix(parts: string[], svgs: string[], fix: { parts: string[]
       lost.push(name);
       continue;
     }
-    if (at >= 0) out[at] = p;
-    else at = out.push(p) - 1; // задания с таким номером в ответе не было: оно было пропущено
-    keys[at] = k;
+    // слово «Исправляю» в заголовке читателю не нужно: он получает один готовый ответ, а не историю правок
+    const clean = p.replace(/^(\s*)Исправляю\s+(?=\S)/, "$1");
+    if (at >= 0) out[at] = clean;
+    else at = out.push(clean) - 1; // задания с таким номером в ответе не было: оно было пропущено
+    keys[at] = headOf(clean);
     taken.add(at);
-    changed.push(name);
+    changed.push(name.replace(/^Исправляю\s+/, ""));
   }
-  const fresh = new Set(fix.svgs.map((s) => headKey(figureLabel(s))).filter(Boolean));
-  return { parts: out, svgs: [...svgs.filter((s) => !fresh.has(headKey(figureLabel(s)))), ...fix.svgs], changed, lost };
+  // Рисунок из исправления заменяет прежний рисунок своего задания. Задание ищем так же мягко, как само исправление:
+  // точное совпадение подписи, потом номер. Рисунок без подписи относим к единственному исправленному заданию.
+  const owner = (svg: string, list: string[]): number => {
+    const label = figureLabel(svg), k = headKey(label), id = taskId(label);
+    const exact = list.findIndex((x) => k !== "" && headOf(x) === k);
+    if (exact >= 0) return exact;
+    const hit = id ? list.flatMap((x, i) => {
+      const t = taskId(x);
+      return t && t.num === id.num && (!id.variant || !t.variant || t.variant === id.variant) && (!id.subject || !t.subject || t.subject === id.subject) ? [i] : [];
+    }) : [];
+    return hit.length === 1 ? hit[0] : -1;
+  };
+  const redone = new Set<number>();
+  for (const s of fix.svgs) {
+    const at = owner(s, out);
+    if (at >= 0) redone.add(at);
+    else if (taken.size === 1) redone.add([...taken][0]);
+  }
+  return { parts: out, svgs: [...svgs.filter((s) => !redone.has(owner(s, out))), ...fix.svgs], changed, lost };
 }
 
 // Короткий список ответов: в начале сообщения или подписью к первой странице. На маленьком экране видно прежде всего его.

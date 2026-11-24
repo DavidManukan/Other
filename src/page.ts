@@ -112,7 +112,7 @@ const row = (line: string): string => {
   return a ? `<div class="b row"><div class="main">${inline(a[0])}</div><div class="note">${inline(a[1])}</div></div>` : `<div class="b line">${inline(line)}</div>`;
 };
 
-const key = (s: string) => s.toLowerCase().replace(/[\s.:]/g, "");
+const key = (s: string) => s.toLowerCase().replace(/\s/g, "").replace(/[.:]+$/, ""); // точка внутри номера остаётся: «№1.2» это не «№12»
 
 // own: рисунок стоит в своём задании, номер в его углу повторять незачем
 function figure(svg: string, own: boolean): string {
@@ -175,25 +175,25 @@ function taskBody(part: string, figs: Fig[]): string {
     const m = LABEL.exec(line.trim());
     if (m?.[1] === "Дано") { // «Дано» с чертой справа и «Найти» под чертой, как в тетради
       const given: string[] = m[2] ? [m[2]] : [];
-      const find: string[] = [];
-      let label = "";
+      // под чертой стоит «Найти» или «Доказать», а в задаче из двух пунктов обе строки подряд: чертёж встаёт после них, а не между ними
+      const finds: { label: string; lines: string[] }[] = [];
       for (i++; i < lines.length; i++) {
         const l = lines[i].trim();
         const n = LABEL.exec(l);
+        const cur = finds.at(-1);
         if (/^\s*```/.test(l)) break;
         if (n) {
-          if ((n[1] !== "Найти" && n[1] !== "Доказать") || label) break; // любая другая метка закрывает блок
-          label = n[1];
-          if (n[2]) find.push(n[2]);
+          if ((n[1] !== "Найти" && n[1] !== "Доказать") || finds.some((f) => f.label === n[1]) || (cur && !cur.lines.length)) break; // любая другая метка закрывает блок
+          finds.push({ label: n[1], lines: n[2] ? [n[2]] : [] });
         } else if (!l) continue;
-        else if (!label) given.push(l);
-        else if (!find.length) find.push(l); // «Найти:» отдельной строкой: искомое стоит на следующей
+        else if (!cur) given.push(l);
+        else if (!cur.lines.length) cur.lines.push(l); // «Найти:» отдельной строкой: искомое стоит на следующей
         else break; // дальше уже решение, даже если строки «Решение:» нет
       }
       i--;
       out.push(
         `<div class="b given"><div class="lbl">Дано:</div>${given.map((g) => `<div>${inline(g)}</div>`).join("")}` +
-          (label ? `<div class="find"><span class="lbl">${label}:</span> ${find.map(inline).join("<br>")}</div>` : "") + `</div>`,
+          finds.map((f) => `<div class="find"><span class="lbl">${f.label}:</span> ${f.lines.map(inline).join("<br>")}</div>`).join("") + `</div>`,
       );
       place(); // чертёж сразу под «Дано», до решения
       continue;
@@ -271,7 +271,7 @@ h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .b{margin:6px 0;overflow-wrap:anywhere}
 .lbl{font-weight:bold}
 .given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
-.given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}
+.given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}.given .find+.find{border-top:0;margin-top:2px;padding-top:0}
 .row{display:flex;flex-wrap:wrap;gap:2px 14px;align-items:center}
 .row .main{flex:0 1 auto;min-width:0;max-width:100%}
 .row .note{flex:0 1 auto;min-width:0;max-width:100%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
