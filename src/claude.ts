@@ -3,7 +3,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Cfg, Effort } from "./config.ts";
 import { PROMPT } from "./prompt.ts";
-import { plainText } from "./text.ts";
+import { headOf, plainText } from "./text.ts";
 import { left } from "./util.ts";
 
 export class Timeout extends Error {} // время куска вышло, а модель ещё ничего не написала
@@ -277,24 +277,48 @@ const squeeze = (s: string) => plainText(s).replace(/\s/g, "").replace(/(\d),(\d
 // Число в начале ответа и единица после него: «0.5м/с» -> [0.5, «м/с»], «1/2» -> [0.5, «»]. Не число: null
 function value(x: string): [number, string] | null {
   const m = /^(-?\d+(?:\.\d+)?)(?:\/(\d+(?:\.\d+)?))?/.exec(x);
-  if (!m || /\d/.test(x.slice(m[0].length))) return null;
+  // после числа стоит множитель или знак, а не единица («4π», «2i», «6%», «1/π»): это уже не просто число
+  if (!m || /\d/.test(x.slice(m[0].length)) || /[π√∞%^i]|^\//.test(x.slice(m[0].length))) return null;
   return [m[2] ? Number(m[1]) / Number(m[2]) : Number(m[1]), x.slice(m[0].length)];
 }
 function same(a: string, b: string): boolean {
   if (a === b) return true;
   const [short, long] = a.length <= b.length ? [a, b] : [b, a];
   // Тот же ответ, у одного дописана единица («4» и «4 см») или пояснение после знака («да» и «да, действует»).
-  // Дописанная буква или индекс это уже другой ответ: «CO» и «CO₂», «А» и «АБ», «см» и «см²».
+  // Дописанная буква, индекс, множитель или второй вариант это уже другой ответ: «CO» и «CO₂», «А» и «АБ», «4» и «4π», «А» и «А, В».
   const more = long.slice(short.length);
-  if (short && long.startsWith(short) && !/[\d¹²³⁰-⁹₀-₉]/.test(more) && (/\d$/.test(short) || /^[,;:(]/.test(more))) return true;
+  const unit = /\d$/.test(short) && !/[π√∞%^i]|^\//.test(more);
+  const note = /^[,;:(]/.test(more) && !/^[,;][a-zа-яё](?:\)|[,;]|$)/.test(more);
+  if (short && long.startsWith(short) && !/[\d¹²³⁰-⁹₀-₉]/.test(more) && (unit || note)) return true;
   const x = value(a), y = value(b);
   return !!x && !!y && Math.abs(x[0] - y[0]) < 1e-9 && (!x[1] || !y[1] || x[1] === y[1]);
 }
 const answersOf = (text: string) => [...text.matchAll(/^[ \t]*Ответ:[ \t]*(.+)$/gm)].map((m) => squeeze(m[1])).filter(Boolean);
-// Ответы из текста, которых нет среди ответов отправленного решения. Без решения под рукой (body пуст) сравнить не с чем: новым считается любой
+// Задания текста: новая часть начинается со строки-заголовка или после @@@
+const pieces = (s: string) => {
+  const out: string[][] = [[]];
+  for (const r of s.split("\n")) {
+    if (/^[ \t]*@@@/.test(r)) {
+      out.push([]);
+      continue;
+    }
+    if (TASK.test(r) && out[out.length - 1].some((x) => x.trim())) out.push([]);
+    out[out.length - 1].push(r);
+  }
+  return out.map((p) => p.join("\n")).filter((p) => p.trim());
+};
+// Ответы из текста, которых нет среди ответов отправленного решения. Без решения под рукой (body пуст) сравнить не с чем: новым считается любой.
+// Ответ задания сравнивается с ответами того же задания: исправление «№3: 2» новое, даже если 2 это ответ №1.
+// Задание без пары по заголовку сравнивается со всем решением.
 function fresh(text: string, body: string): string[] {
-  const sent = answersOf(body);
-  return answersOf(text).filter((x) => !body || !sent.some((y) => same(x, y)));
+  if (!body) return answersOf(text);
+  const own = pieces(body).map((t) => [headOf(t), t] as const);
+  return pieces(text).flatMap((t) => {
+    const k = headOf(t);
+    const mine = k ? own.filter(([h]) => h === k) : [];
+    const sent = answersOf(mine.length === 1 ? mine[0][1] : body);
+    return answersOf(t).filter((x) => !sent.some((y) => same(x, y)));
+  });
 }
 
 // 5. Ответ прежний, но в решении не хватало обязательного элемента (рисунка, обоснования): модель пишет строку «ДОПОЛНЕНО»
@@ -310,9 +334,14 @@ const AGREE = /^[\s*]*вс[её]\s+верно[\s.!*]*$/i; // отдельная 
 function added(text: string): string | null {
   const rows = text.split("\n");
   const at = rows.findIndex((r) => marked(r) || headed(r));
-  if (at < 0 || rows.slice(0, at).some((r) => TASK.test(r))) return null;
-  // строка согласия («ВСЁ ВЕРНО») в текст задания не идёт; строки решения («Проверка: … всё верно.») остаются
-  return unmark(rows.slice(at).filter((r) => !AGREE.test(r)).join("\n")).trim();
+  // «№1 – всё верно.» перед меткой это отзыв о другом задании, а не начало исправления
+  const said = (r: string) => !/Ответ:/.test(r) && r.length < 80 && /(?<![а-яё])(?:вс[её]\s+)?верно|дополнять\s+нечего/i.test(r) && !/(?:^|[^а-яё])не\s*верн/i.test(r);
+  if (at < 0 || rows.slice(0, at).some((r) => TASK.test(r) && !said(r))) return null;
+  // строка согласия («ВСЁ ВЕРНО») в текст задания не идёт; строки решения («Проверка: … всё верно.») остаются,
+  // а отзыв о других заданиях после последнего ответа («В №1 и №2 всё верно.») убирается
+  const kept = rows.slice(at).filter((r) => !AGREE.test(r));
+  const end = kept.findLastIndex((r) => /^[ \t]*Ответ:/.test(r));
+  return unmark(kept.filter((r, i) => !(end >= 0 && i > end && PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n")).trim();
 }
 // Слово «ДОПОЛНЕНО» в начале каждого задания исправления человеку не нужно: убираем его, заголовок на той же строке оставляем
 const unmark = (text: string) => text.split(/^([ \t]*@@@.*)$/m).map((piece, k) => {
@@ -326,7 +355,7 @@ const unmark = (text: string) => text.split(/^([ \t]*@@@.*)$/m).map((piece, k) =
 }).join("");
 // Хвост после пересчёта кодом, который ничего не меняет: в нём нет своего ответа, слов об ошибке, отказа дополнять и строки «ВСЁ ВЕРНО».
 // «Ошибки нет», «неверных значений нет» это подтверждение, а не ошибка: такие обороты сначала убираем.
-const NO_ERR = /(?:ошиб(?:ок|ки|ка)|неверн\S*(?:\s+\S+)?|расхождени\S*)\s+нет|нет\s+(?:ни\s+)?(?:ошиб\S*|неверн\S*|расхождени\S*)|не\s+(?:найден\S*|обнаружен\S*|выявлен\S*)\s+(?:ни\s+)?(?:ошиб\S*|неверн\S*)|без\s+ошиб\S*/gi;
+const NO_ERR = /(?:ошиб(?:ок|ки|ка)|неверн\S*(?:\s+\S+)?|расхождени\S*)\s+нет|нет\s+(?:ни\s+)?(?:ошиб\S*|неверн\S*|расхождени\S*)|не\s+(?:найден\S*|обнаружен\S*|выявлен\S*)\s+(?:ни\s+)?(?:ошиб\S*|неверн\S*)|без\s+ошиб\S*|ошиб(?:ок|ки)(?:\s+\S+){0,3}\s+не\s+было|замечани\S*(?:\s+\S+){0,4}\s+не\s+подтвердил\S*/gi;
 const neutral = (tail: string) => {
   const t = tail.replace(NO_ERR, "");
   return !/Ответ:/.test(t) && !/ошибк|ошибо|неверн|не\s+так|нечего|не\s+требуется|не\s+надо|дополнять\s+не\s+нужн/i.test(t) && !t.split("\n").some((l) => AGREE.test(l));
