@@ -736,8 +736,8 @@ try {
   await text("975", "ping");
   ok(await until(() => texts("975").filter((t) => t.startsWith("pong")).length === 2) && texts("975").at(-1).includes("вторая проверка вкл"), "доступ открыт: чужой чат снова получает ответ, ping показывает общую проверку", JSON.stringify(texts("975").slice(-1)));
   // --- воркер перезапустился посреди второй проверки: готовое решение не теряется и заново не заказывается ---
-  await photo("994", "S_RST S_CHKSLOW");
-  ok(await until(() => reqs("S_RST").filter(isCheck).length === 1, 30_000), "перезапуск посреди проверки: проверка началась");
+  await photo("994", "S_KILLCHK S_CHKSLOW");
+  ok(await until(() => reqs("S_KILLCHK").filter(isCheck).length === 1, 30_000), "перезапуск посреди проверки: проверка началась");
   await sleep(500);
   process.kill(-dev.pid, "SIGKILL");
   await sleep(1500);
@@ -745,7 +745,7 @@ try {
   ok(await ready(), "перезапуск посреди проверки: воркер поднялся");
   ok(await until(() => solved("994").length === 1, 60_000) && solved("994")[0].includes("№2: 7"), "перезапуск посреди проверки: пришёл один ответ, уже исправленный", JSON.stringify(texts("994").map((t) => t.slice(0, 40))));
   await sleep(1500);
-  ok(reqs("S_RST").filter(isSolve).length === 1 && reqs("S_RST").filter(isCheck).length === 2 && texts("994").filter((t) => t === CHECKING).length === 1 && solved("994").length === 1, "решение не заказано заново, проверка повторена, «перепроверяю» сказано один раз", JSON.stringify([reqs("S_RST").filter(isSolve).length, reqs("S_RST").filter(isCheck).length, texts("994").map((t) => t.slice(0, 20))]));
+  ok(reqs("S_KILLCHK").filter(isSolve).length === 1 && reqs("S_KILLCHK").filter(isCheck).length === 2 && texts("994").filter((t) => t === CHECKING).length === 1 && solved("994").length === 1, "решение не заказано заново, проверка повторена, «перепроверяю» сказано один раз", JSON.stringify([reqs("S_KILLCHK").filter(isSolve).length, reqs("S_KILLCHK").filter(isCheck).length, texts("994").map((t) => t.slice(0, 20))]));
   await text("111", "проверка выкл");
   ok(await until(() => texts("111").filter((t) => t === "Вторая проверка выключена ✅ Во всех чатах.").length === 2), "вторая проверка выключена для всех чатов");
 

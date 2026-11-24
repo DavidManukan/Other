@@ -63,15 +63,27 @@ export function splitAnswer(raw: string): { text: string; svgs: string[] } {
 // Первая строка ответа служебная: «ВИД: страница» или «ВИД: текст». Модель видит предмет и решает, чем отправить ответ;
 // читателю строка не показывается. Вне блоков кода убираем все такие строки, считается первая.
 export type Look = "page" | "text";
+// Самая первая строка ответа читается терпимо: модель может написать «**ВИД: страница**», «Вид: текст (химия)»,
+// «ВИД — страница». Дальше по тексту убирается только точная запись: строка задания вроде «Вид: несовершенный» остаётся.
+const LOOK_FIRST = /^\s*[*_#>`«"]*\s*вид(?:\s+ответа)?\s*[*_`]*\s*[:—–-]\s*[*_`«"]*\s*(страниц|текст)[^\n]*(?:\n|$)/iu;
+const LOOK_LINE = /^[ \t]*ВИД:[ \t]*([\p{L}-]+)[ \t.]*(?:\n|$)/gmu;
 export function lookOf(raw: string): { look: Look | null; text: string } {
   let look: Look | null = null;
-  const text = raw.split(/(```[\s\S]*?```)/).map((piece, i) => (i % 2 ? piece : piece.replace(/^[ \t]*ВИД:[ \t]*([\p{L}-]+)[ \t.]*(?:\n|$)/gmu, (m, w: string) => {
+  const first = LOOK_FIRST.exec(raw);
+  let src = raw;
+  if (first) {
+    look = first[1].toLowerCase() === "текст" ? "text" : "page";
+    src = raw.slice(first[0].length);
+  }
+  let cut = Boolean(first);
+  const text = src.split(/(```[\s\S]*?```)/).map((piece, i) => (i % 2 ? piece : piece.replace(LOOK_LINE, (m, w: string) => {
     const kind: Look | null = /^страниц/i.test(w) ? "page" : /^текст(ом|овый|овая)?$/i.test(w) ? "text" : null;
     if (!kind) return m;
     look ??= kind;
+    cut = true;
     return "";
   }))).join("");
-  return { look, text: look ? text.replace(/^\s*\n/, "") : raw };
+  return { look, text: cut ? text.replace(/^\s*\n/, "") : raw };
 }
 export const lookLine = (look: Look | null | undefined): string => (look ? `ВИД: ${look === "page" ? "страница" : "текст"}\n` : "");
 
@@ -89,7 +101,8 @@ export function cells(line: string): string[] | null {
     if (ch === "\\" && i + 1 < t.length - 1) cur += t[++i] === "|" && !math ? "|" : ch + t[i];
     else if (ch === "|" && !math) (out.push(cur.trim()), (cur = ""));
     else {
-      if (ch === "$") math = !math;
+      // знак $ без пары дальше по строке это не формула («Цена, $»): ячейки он не склеивает
+      if (ch === "$" && (math || t.indexOf("$", i + 1) > 0)) math = !math;
       cur += ch;
     }
   }
@@ -115,7 +128,8 @@ export function tableAt(lines: string[], i: number): { rows: string[][]; end: nu
   return { rows: rows.map((r) => Array.from({ length: n }, (_, j) => r[j] ?? "")), end };
 }
 export const TABLE_W = 30; // столько знаков моноширинного шрифта помещается в строку сообщения на телефоне
-const wide = (s: string) => [...s].length;
+// Ширина в знакоместах: комбинируемые знаки (черта над AB, стрелка вектора) места не занимают, эмодзи и иероглифы занимают два
+const wide = (s: string) => [...s.normalize("NFC")].reduce((n, ch) => n + (/\p{M}|[\u200B-\u200D\u2060\uFE0F]/u.test(ch) ? 0 : /\p{Extended_Pictographic}|[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFF00-\uFF60]/u.test(ch) ? 2 : 1), 0);
 // Таблица для сообщения. Узкая: блок с ровными столбцами. Широкая строка в блоке перенеслась бы и столбцы рассыпались бы,
 // поэтому широкая таблица идёт строками через черту, без выравнивания.
 export function textTable(rows: string[][]): string {
@@ -129,7 +143,10 @@ export function textTable(rows: string[][]): string {
 
 // Текст с формулами LaTeX -> текст для WhatsApp: формулы знаками Юникода, код программ как есть, таблицы блоком
 export function plainText(text: string): string {
-  const plain = (t: string) => prettyMath(stripTex(plainMath(t)));
+  // признак задания про электронную таблицу считаем один раз по всему тексту: слово «ячейка» стоит до таблицы,
+  // а адреса A1 и C2 в ней самой и после неё
+  const sheet = sheetContext(text);
+  const plain = (t: string) => prettyMath(stripTex(plainMath(t)), sheet);
   return text.split(/(```[\s\S]*?```)/).map((piece, i) => {
     if (i % 2) return piece;
     if (!/^[ \t]*\|.*\|[ \t]*$/m.test(piece)) return plain(piece);
@@ -206,10 +223,19 @@ export function figureLabel(svg: string): string {
 // Вторая проверка нашла ошибку, и основная модель переписала эти задания: ставим их на место прежних.
 // Задание с тем же заголовком заменяется; единственное задание заменяется и без совпадения заголовка;
 // задание, которого в ответе не было (пропущенное), добавляется в конец. Рисунок с тем же номером заменяет старый.
-// Заголовок сверяется сначала точно, потом по хвосту («№3» и «Вариант 1 · №3»), потом по числам («Задание 2» и «№2»).
+// Заголовок сверяется сначала точно, потом по номеру задания: «№1 (2 балла)» и «№1», «Задание 5» и «№5» это одно задание.
+// Вариант и предмет сужают выбор, только если они названы в исправлении: «№3» подходит и к «Вариант 1 · №3», и к «Вариант 2 · №3».
 // lost: исправления, для которых подходит несколько заданий или у которых нет заголовка. Ставить их наугад нельзя:
 // рядом с исправленным осталось бы ошибочное решение.
-const numbers = (k: string) => (k.match(/\d+/g) ?? []).join(".");
+function taskId(part: string): { num: string; variant: string; subject: string } | null {
+  const top = part.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 3);
+  const line = (top.find((l) => HEAD.test(l) && l.length <= 60) ?? "").toLowerCase().replace(/^исправляю\s*/, "");
+  const num = /(?:№\s*|задани[ея]\s+|задач[аи]\s+)([\p{L}\p{N}]+(?:\.\p{N}+)*)/u.exec(line)?.[1];
+  if (!num) return null;
+  const segs = line.split("·").map((x) => x.trim());
+  const subject = segs.length > 1 && !/^вариант/.test(segs[0]) && !/^(№|задани|задач)/.test(segs[0]) ? segs[0] : "";
+  return { num, variant: /вариант\s*([\p{L}\p{N}]+)/u.exec(line)?.[1] ?? "", subject };
+}
 export function mergeFix(parts: string[], svgs: string[], fix: { parts: string[]; svgs: string[] }): { parts: string[]; svgs: string[]; changed: string[]; lost: string[] } {
   const out = [...parts];
   const keys = out.map(headOf);
@@ -218,10 +244,15 @@ export function mergeFix(parts: string[], svgs: string[], fix: { parts: string[]
   for (const p of fix.parts) {
     const k = headOf(p);
     const name = (p.split("\n").map((l) => l.trim()).find(Boolean) ?? "").slice(0, 40);
-    const among = (ok: (h: string) => boolean) => keys.flatMap((h, i) => (h && !taken.has(i) && ok(h) ? [i] : []));
-    let hit = k ? among((h) => h === k) : [];
-    if (!hit.length && k) hit = among((h) => h.endsWith(k) || k.endsWith(h));
-    if (!hit.length && numbers(k)) hit = among((h) => numbers(h) === numbers(k));
+    const free = (ok: (i: number) => boolean) => keys.flatMap((_h, i) => (!taken.has(i) && ok(i) ? [i] : []));
+    let hit = k ? free((i) => keys[i] === k) : [];
+    const id = taskId(p);
+    if (hit.length !== 1 && id) {
+      hit = free((i) => {
+        const x = taskId(out[i]);
+        return !!x && x.num === id.num && (!id.variant || !x.variant || x.variant === id.variant) && (!id.subject || !x.subject || x.subject === id.subject);
+      });
+    }
     let at = hit.length === 1 ? hit[0] : -1;
     if (at < 0 && out.length === 1 && fix.parts.length === 1) at = 0; // задание одно: заменяется и без совпадения заголовка
     if (at < 0 && (hit.length > 1 || !k)) {

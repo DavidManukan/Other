@@ -272,16 +272,19 @@ h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .lbl{font-weight:bold}
 .given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
 .given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}
-.row{display:flex;gap:14px;align-items:center}
-.row .main{flex:0 1 auto;min-width:0}
-.row .note{flex:0 0 auto;max-width:44%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
-.tbl{border-collapse:collapse;font-size:18px;line-height:1.35}.tbl th,.tbl td{border:1.5px solid #fff;padding:4px 9px;text-align:left;vertical-align:top}.tbl th{font-weight:bold}
+.row{display:flex;flex-wrap:wrap;gap:2px 14px;align-items:center}
+.row .main{flex:0 1 auto;min-width:0;max-width:100%}
+.row .note{flex:0 1 auto;min-width:0;max-width:100%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
+.row.under{margin-bottom:14px}.row.under .note{margin-left:30px;max-width:calc(100% - 30px)}
+.tbl{border-collapse:collapse;font-size:18px;line-height:1.35}.tbl th,.tbl td{border:1.5px solid #fff;padding:4px 9px;text-align:left;vertical-align:top;overflow-wrap:normal;word-break:normal}.tbl th{font-weight:bold}
+.tbl.tight th,.tbl.tight td{overflow-wrap:anywhere;padding:3px 5px}
 .ans{margin:12px 0 4px;padding:8px 12px;border:2px solid #fff;border-radius:8px}
 pre{font:17px/1.4 'DejaVu Sans Mono','Liberation Mono',monospace;border:1px solid #666;padding:10px 12px;border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}
 pre.go{border-bottom:0;border-radius:6px 6px 0 0;padding-bottom:0;margin-bottom:0}pre.on{border-top:0;border-radius:0 0 6px 6px;padding-top:0;margin-top:0}pre.go.on{border-radius:0}
 .fig{margin:10px 0}.fig svg{display:block;width:100%;height:auto}
 .raw{font-family:'DejaVu Sans',sans-serif}
 .f{white-space:nowrap}.f wbr{display:none}.f.brk{white-space:normal}.f.brk wbr{display:inline}.fx{white-space:nowrap}.fx.wide{white-space:normal}
+.f.brk .base{margin:4px 0}
 .katex{font-size:1.08em;-webkit-text-stroke:.35px #fff}.katex svg{stroke:#fff;stroke-width:14px}
 .katex .frac-line,.katex .overline-line,.katex .underline-line{border-bottom-width:.06em}.katex-display{margin:0;text-align:left}.katex-display>.katex{text-align:left}
 .foot{font-size:14px;text-align:right;margin-top:6px}`;
@@ -299,10 +302,12 @@ export function pageHtml(parts: string[], svgs: string[], fonts: string, css: st
 export const PAGINATE = `(() => {
   const H = ${PAGE_H};
   const flow = document.getElementById("flow");
-  // 0. Таблица шире листа: уменьшаем её шрифт, пока не поместится (иначе правый край обрежется)
+  // 0. Таблица шире листа: уменьшаем её шрифт, пока не поместится (иначе правый край обрежется). Слова и числа в ячейках
+  // при этом не рвутся. Не помогло и самое мелкое читаемое письмо: тогда разрешаем перенос внутри слова.
   for (const t of flow.querySelectorAll(".tbl")) {
     const avail = t.parentElement.clientWidth;
-    for (let k = 0; k < 4 && t.offsetWidth > avail + 1; k++) t.style.fontSize = Math.max(9, Math.floor(parseFloat(getComputedStyle(t).fontSize) * avail / t.offsetWidth * 0.98)) + "px";
+    for (let k = 0; k < 4 && t.offsetWidth > avail + 1; k++) t.style.fontSize = Math.max(11, Math.floor(parseFloat(getComputedStyle(t).fontSize) * avail / t.offsetWidth * 0.98)) + "px";
+    if (t.offsetWidth > avail + 1) t.classList.add("tight");
   }
   // 1. Формула шире строки: разрешаем перенос между её кусками (перед знаком отношения), а слишком широкому куску и внутри него
   const room = (el) => {
@@ -320,8 +325,13 @@ export const PAGINATE = `(() => {
     for (const b of k.querySelectorAll(".base")) w = Math.max(w, b.getBoundingClientRect().width);
     if (w > avail && avail > 0) k.style.fontSize = Math.max(0.45, Math.floor((1.08 * avail / w) * 100) / 100) + "em";
   }
-  // 2. Пометка «| ·4» стоит сразу за своим преобразованием (так её пишут в тетради), а не колонкой у правого края:
-  //    это делает сама вёрстка строки (.row), здесь выравнивать нечего
+  // 2. Пометка «| ·4» стоит сразу за своим преобразованием (так её пишут в тетради), а не колонкой у правого края.
+  //    Не помещается рядом: встаёт строкой ниже, прямо под ним, а формула остаётся целой. Это делает сама вёрстка строки (.row);
+  //    здесь пометке под формулой добавляется отступ, чтобы её не приняли за пометку к следующей строке.
+  for (const r of flow.querySelectorAll(".row")) {
+    const main = r.querySelector(".main"), note = r.querySelector(".note");
+    if (main && note && note.getBoundingClientRect().top >= main.getBoundingClientRect().bottom - 2) r.classList.add("under");
+  }
   // 3. Подписи на рисунке. Буква, которая легла на линию или на соседнюю подпись, сдвигается на ближайшее свободное место.
   for (const svg of flow.querySelectorAll(".fig svg")) {
    try { // рисунок с вырожденным преобразованием (scale(0)) оставляем как есть: ошибка здесь стоила бы всех страниц ответа
@@ -496,6 +506,39 @@ export const PAGINATE = `(() => {
           nb.classList.add("on");
         }
       }
+    } catch (e) {}
+  }
+  // 5а. Таблица выше листа режется между строками, шапка повторяется на каждой части, ширина столбцов сохраняется
+  for (const t of [...flow.querySelectorAll(".task > .b > table.tbl")]) {
+    try {
+      const limit = H - 160;
+      if (t.getBoundingClientRect().height <= limit) continue;
+      const rows = [...t.rows];
+      if (rows.length < 3) continue;
+      const head = rows[0], headH = head.getBoundingClientRect().height;
+      const widths = [...head.cells].map((c) => c.getBoundingClientRect().width);
+      const heights = rows.map((r) => r.getBoundingClientRect().height);
+      const groups = [[]]; // строки каждой части, без шапки
+      let used = headH;
+      for (let i = 1; i < rows.length; i++) {
+        if (used + heights[i] > limit && groups[groups.length - 1].length) { groups.push([]); used = headH; }
+        groups[groups.length - 1].push(rows[i]);
+        used += heights[i];
+      }
+      if (groups.length < 2) continue;
+      const fix = (table) => { [...table.rows[0].cells].forEach((c, j) => { c.style.width = widths[j] + "px"; }); table.style.width = t.getBoundingClientRect().width + "px"; };
+      let after = t.parentElement;
+      for (const g of groups.slice(1)) {
+        const box = after.cloneNode(false), nt = t.cloneNode(false), body = document.createElement("tbody");
+        body.appendChild(head.cloneNode(true));
+        for (const r of g) body.appendChild(r);
+        nt.appendChild(body);
+        box.appendChild(nt);
+        after.after(box);
+        after = box;
+        fix(nt);
+      }
+      fix(t);
     } catch (e) {}
   }
   // 6. Делим поток на листы
