@@ -37,7 +37,7 @@ function sse(res, events, { gap = 5 } = {}) {
 function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks = [], container, after = "", out = 345 } = {}) {
   if (after) return notes(text, blocks, after, model);
   const ev = [
-    { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", model: model ?? "claude-fable-5-2", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1200, output_tokens: 1, cache_read_input_tokens: 5000, cache_creation_input_tokens: 400 } } },
+    { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", model: model ?? "claude-fable-5-2", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1200, output_tokens: 1, cache_read_input_tokens: 5000, cache_creation_input_tokens: 400, cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 300 } } } },
     { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
     think,
     { type: "content_block_stop", index: 0 },
@@ -52,7 +52,7 @@ function message(text, { stop = "end_turn", think = 50, model, gap = 5, blocks =
     for (let i = 0; i < text.length; i += 17) ev.push({ type: "content_block_delta", index, delta: { type: "text_delta", text: text.slice(i, i + 17) } });
     ev.push({ type: "content_block_stop", index });
   }
-  ev.push({ type: "message_delta", delta: { stop_reason: stop, stop_sequence: null, ...(container ? { container: { id: container, expires_at: "2027-01-01T00:00:00Z" } } : {}) }, usage: { output_tokens: out } });
+  ev.push({ type: "message_delta", delta: { stop_reason: stop, stop_sequence: null, ...(container ? { container: { id: container, expires_at: "2027-01-01T00:00:00Z" } } : {}) }, usage: { output_tokens: out, output_tokens_details: { thinking_tokens: Math.round(out * 0.6) } } });
   ev.push({ type: "message_stop" });
   return { ev, gap };
 }

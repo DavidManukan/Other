@@ -58,7 +58,9 @@ const CHECK_MIN = (SEGMENT - SEGMENT_TAIL) / 2; // в куске осталос�
 const GATE_TTL = 30_000; // столько чат помнит общие настройки (доступ, лимит), не спрашивая служебный объект
 const SPEND_DAYS = 40; // за столько дней хранится расход
 const CHECKING = "✍️ Решение готово. Перепроверяю, чтобы быть уверенным на 100%.";
-const UNCHECKED = "(перепроверить не получилось: это первое решение, без второй проверки)";
+const UNCHECKED = "⚠️ Вторая проверка не прошла, ответ выше без неё.";
+const RECHECK = "⏳ Перепроверяю ещё раз, скоро пришлю."; // проверка нашла, что уточнить: впереди ещё один полный запрос
+const FAILED = "⚠️ Сбой, решение не пришло. Пришли фото ещё раз."; // неизвестная ошибка: подробности идут в журнал, а не в чат
 const CUT_NOTE = "(ответ получился слишком длинным и оборван: пришли оставшиеся задания отдельным фото)";
 const CONT = "Ответ оборвался. Продолжай со следующей строки после уже написанного: написанное не повторяй, незаконченный рисунок начни заново целиком.";
 export const STATUS = "__status"; // имя служебного объекта: журнал, страница проверки, хозяин бота
@@ -173,6 +175,9 @@ interface Job {
   msgs: number;
   tokens: number;
   usd?: number; // примерная цена всех запросов к Claude по этой работе
+  think?: number; // из токенов: размышления моделей (главная статья расхода)
+  slow?: number; // сколько раз модель думала весь кусок и ничего не написала
+  t?: Record<string, number>; // сколько миллисекунд заняла каждая часть работы: по этим цифрам видно, где уходит время
   lean?: boolean; // файлы PDF прошлых работ в запросы этой работы не идут: вместе с ними запрос слишком велик
   checks: number; // сколько раз модель пересчитывала вычисления кодом
   model?: string;
@@ -209,6 +214,19 @@ const tabled = (part: string): boolean => {
 // (дробь, корень, интеграл, система, вектор), или оно оформлено через «Дано» с формулами
 const heavy = (part: string): boolean =>
   /\\(?:d?frac|sqrt|int|sum|prod|lim|begin|vec|overline|binom)(?![A-Za-z])/.test(part) || (/^Дано:/m.test(part) && /\$[^$\n]+\$/.test(part));
+
+// «; время: решение 140 с, проверка 95 с, страницы 5 с, отправка 3 с»
+const SPAN: Record<string, string> = { solve: "решение", check: "проверка", judge: "разбор замечаний", pack: "страницы", send: "отправка" };
+const spans = (t?: Record<string, number>): string => {
+  const list = Object.keys(SPAN).filter((k) => t?.[k]).map((k) => `${SPAN[k]} ${Math.round(t![k] / 1000)} с`);
+  return list.length ? `; время: ${list.join(", ")}` : "";
+};
+
+// Прибавляет к части работы k время, прошедшее с момента from
+const lap = (job: Job, k: string, from: number) => {
+  const t = (job.t ??= {});
+  t[k] = (t[k] ?? 0) + (Date.now() - from);
+};
 
 class Delivery extends Error {} // ответ готов, но шлюз его сейчас не принимает: Claude не переспрашиваем, ждём шлюз
 class Added extends Error {} // к заданию добавили фото или уточнение: решение начинается заново со всем сразу
@@ -284,7 +302,9 @@ export class Chat extends DurableObject<Env> {
     } catch (e: any) {
       console.log(this.hide(e?.stack ?? e));
       await this.markSeen(id, meta);
-      await this.say(chatId, `⚠️ ${this.hide(e?.message ?? e)}`);
+      // само сообщение об ошибке (часто английское, из недр кода) человеку ни к чему: оно в журнале
+      await this.note(`ошибка на входе: ${this.hide(e?.message ?? e).slice(0, 160)}`);
+      await this.say(chatId, /очеред/i.test(String(e?.message ?? "")) ? "⚠️ В очереди уже много заданий. Дождись ответов и пришли фото ещё раз." : FAILED);
     }
   }
 
@@ -414,6 +434,7 @@ export class Chat extends DurableObject<Env> {
     const usd = list.reduce((n, s) => n + s.usd, 0);
     if (job) {
       job.tokens += tokens;
+      job.think = (job.think ?? 0) + list.reduce((n, s) => n + (s.think ?? 0), 0);
       job.usd = (job.usd ?? 0) + usd;
     }
     try {
@@ -671,27 +692,32 @@ export class Chat extends DurableObject<Env> {
       }
       const retry = job.tries < MAX_TRIES;
       if (e instanceof Timeout && retry) {
-        // модель думала весь кусок и ничего не написала: следующая попытка на ступень проще
-        job.effort = lower(job.effort);
+        // Модель думала весь кусок и ничего не написала. Хозяин просил режим не трогать («пусть думает, сколько влезет»):
+        // вторая попытка идёт на том же режиме. Не вышло и во второй раз: дальше на ступень проще, иначе ответа не будет вовсе.
+        job.slow = (job.slow ?? 0) + 1;
+        if (job.slow > 1) job.effort = lower(job.effort);
         if (!job.done && !job.acc) job.asked = undefined; // решение начнётся заново: новое фото к нему добавится без потерь (если оплаченного начала ответа ещё нет)
         await this.db.put(key, job);
-        await this.say(chatId, "⏳ Долго думаю, решаю быстрее…");
+        if (job.slow === 1) await this.say(chatId, "⏳ Задание тяжёлое, продолжаю решать.");
       } else if (e instanceof Busy && retry) {
         if (!job.done && !job.acc) job.asked = undefined; // ответа нет, выбрасывать нечего: пауза перед повтором окно добавления не тратит
         job.after = Date.now() + (BACKOFF[job.tries - 1] ?? BACKOFF[0]) / this.k;
         await this.db.put(key, job);
-        if (job.tries === 1) await this.say(chatId, "⏳ Claude занят, пробую ещё раз…");
+        if (job.tries === 1) await this.say(chatId, "⏳ Сервер занят, повторяю…");
       } else {
         await this.db.delete(key);
         const why = e instanceof Timeout
           ? "Не успел решить. Пришли фото ещё раз (лучше одно задание)."
           : e instanceof Busy
-          ? "Claude занят. Пришли ещё раз через минуту."
+          ? "Сервер занят. Пришли фото через минуту."
           : e instanceof TooBig
           ? "Файл больше 5 МБ. Пришли обычное фото или файл поменьше."
           : String(e?.message ?? e);
         await this.note(`ошибка: ${this.hide(why).slice(0, 160)}`);
-        await this.say(chatId, `⚠️ ${this.hide(why)}`);
+        // Понятные причины, которые может устранить только хозяин (ключ, баланс, слишком большое фото), говорим как есть.
+        // Сырой ответ API и неизвестные ошибки человеку ни к чему: они остаются в журнале.
+        const known = e instanceof Timeout || e instanceof Busy || e instanceof TooBig || (e instanceof Fatal && !/^Ошибка Claude \d/.test(why) && !/^GREEN-API/.test(why));
+        await this.say(chatId, known ? `⚠️ ${this.hide(why)}` : FAILED);
       }
     } finally {
       if (this.stop === stop) this.stop = null;
@@ -715,8 +741,8 @@ export class Chat extends DurableObject<Env> {
       const capped = gate.cap !== null && gate.today >= gate.cap;
       const capNote = capped ? `дневной лимит исчерпан (${money(gate.today)} из ${money(gate.cap!)})` : "";
       const capText = !capped ? "" : this.mine(chatId, gate)
-        ? `Дневной лимит расходов исчерпан: потрачено ${money(gate.today)} из ${money(gate.cap!)}. Напиши «лимит выкл» или подними лимит и пришли задание ещё раз.`
-        : "На сегодня бот закончил работу. Пришли задание завтра.";
+        ? `⛔ Дневной лимит расходов исчерпан: потрачено ${money(gate.today)} из ${money(gate.cap!)}. Пришли фото после 03:00 по Москве.`
+        : "На сегодня всё. Пришли задание после 03:00 по Москве.";
       if (capped && !job.acc) {
         await this.note(`${capNote}: задание не решено`);
         return await this.finish(key, job, chatId, capText);
@@ -771,9 +797,11 @@ export class Chat extends DurableObject<Env> {
 
         const { fast } = await this.options();
         const bills: Spent[] = [];
+        const t0 = Date.now();
         try {
           a = await ask(this.c, { messages, effort: job.effort, fast, until: end - SEGMENT_TAIL / this.k, stop, spent: (s) => bills.push(s) });
         } finally {
+          lap(job, "solve", t0);
           clearTimeout(hello);
           await this.bill(job, bills); // расход считаем при любом исходе: оборванный запрос тоже стоит денег
         }
@@ -815,8 +843,17 @@ export class Chat extends DurableObject<Env> {
     if (!job.verified && !(await this.verify(job, chatId, end, stop, save))) return;
 
     // 4. Раскладываем ответ по сообщениям (страницы-картинки или текст) и отправляем
-    if (!job.packed) await this.pack(job, stop, save);
-    await this.flush(key, job, chatId, origin, stop);
+    if (!job.packed) {
+      const t0 = Date.now();
+      await this.pack(job, stop, save);
+      lap(job, "pack", t0);
+    }
+    const sending = Date.now();
+    try {
+      await this.flush(key, job, chatId, origin, stop);
+    } finally {
+      lap(job, "send", sending);
+    }
     // Память чата и задание без вопроса пишем одной записью: после перезапуска пара не добавится второй раз
     const turn = job.turn;
     job.turn = undefined;
@@ -830,12 +867,12 @@ export class Chat extends DurableObject<Env> {
     const a = job.done!;
     job.tries = 0;
     if (a.empty && !job.svgs.length) {
-      return await this.finish(key, job, chatId, a.refused ? "Модель не стала это решать. Пересними задание." : a.cut ? "Задание слишком длинное. Сфоткай одно задание." : "Пустой ответ. Пришли фото ещё раз.");
+      return await this.finish(key, job, chatId, a.refused ? "Не получилось решить. Пересними задание." : a.cut ? "Задание слишком длинное. Сфоткай одно задание." : "Пустой ответ. Пришли фото ещё раз.");
     }
     if (!a.noted && (a.refused || a.cut)) {
       a.noted = true; // пометка уходит один раз, даже если объект перезапустится до конца работы
       await this.db.put(key, job);
-      if (a.refused) await this.say(chatId, "(модель остановилась и не дорешала. Пересними оставшиеся задания.)");
+      if (a.refused) await this.say(chatId, "(дорешал не всё: пересними оставшиеся задания)");
       if (a.cut) await this.say(chatId, a.capped ?? CUT_NOTE); // оборван лимитом: прислать остальное отдельно сейчас не выйдет, поэтому говорим про лимит
     }
     if (job.verified === "failed" && !a.unchecked) {
@@ -1107,7 +1144,7 @@ export class Chat extends DurableObject<Env> {
     const sec = Math.round((Date.now() - (job.started ?? job.at)) / 1000);
     const photos = job.shots.length ? `, фото ${job.shots.length}${job.shots[0].size ? ` (${job.shots[0].size})` : ""}` : "";
     await this.note(
-      `${message ? "без ответа" : "решено"} за ${sec} с${photos}: сообщений ${job.msgs}, страниц ${job.pages ?? 0}, рисунков ${job.drawn}, пересчётов кодом ${job.checks}, вторая проверка: ${job.verified === "ok" ? "подтвердила" : job.verified === "fixed" ? "исправила до отправки" : job.verified === "failed" ? "не состоялась" : "не было"}, режим ${job.effort}, модель ${job.model ?? this.c.model}, токенов ${job.tokens}${job.usd ? `, примерно ${money(job.usd)}` : ""}`,
+      `${message ? "без ответа" : "решено"} за ${sec} с${photos}: сообщений ${job.msgs}, страниц ${job.pages ?? 0}, рисунков ${job.drawn}, пересчётов кодом ${job.checks}, вторая проверка: ${job.verified === "ok" ? "подтвердила" : job.verified === "fixed" ? "исправила до отправки" : job.verified === "failed" ? "не состоялась" : "не было"}, режим ${job.effort}, модель ${job.model ?? this.c.model}, токенов ${job.tokens}${job.think ? ` (размышления ${job.think})` : ""}${job.usd ? `, примерно ${money(job.usd)}` : ""}${spans(job.t)}`,
     );
   }
 
@@ -1250,6 +1287,7 @@ export class Chat extends DurableObject<Env> {
       const body = job.body ?? "";
       const bills: Spent[] = [];
       const spent = (x: Spent) => void bills.push(x);
+      const began = Date.now(), phase = chk.phase;
       try {
         // тот же материал, что видела основная модель: фото этой работы и, если была, прошлая работа чата
         const msgs = await this.toApi([...(await this.past(job)), { role: "user", content: job.turn }], job.lean ? job.turn : undefined);
@@ -1272,10 +1310,14 @@ export class Chat extends DurableObject<Env> {
             throw new Busy("проверяющая модель ответила не по форме");
           }
           if (v.ok) return await close("ok", "вторая проверка: решение подтверждено");
+          // время и цену проверки пишем до сохранения: если куска на разбор не хватит, работа продолжится из записи
+          lap(job, phase, began);
+          await this.bill(job, bills.splice(0));
           chk.phase = "judge";
           chk.issues = v.issues.slice(0, 4000);
           chk.tries = 0;
           await save();
+          await this.say(chatId, RECHECK);
           continue;
         }
         const a = await ask(this.c, {
@@ -1307,10 +1349,12 @@ export class Chat extends DurableObject<Env> {
         // Claude занят, время куска вышло или ответ не по форме: пауза и ещё попытка (их число ограничено)
         if (chk.tries >= CHECK_TRIES) continue;
         job.after = Date.now() + (BACKOFF[chk.tries - 1] ?? BACKOFF[BACKOFF.length - 1]) / this.k;
-        await this.bill(job, bills.splice(0)); // до сохранения: иначе цена этой попытки не попала бы в запись работы
+        lap(job, phase, began);
+        await this.bill(job, bills.splice(0)); // до сохранения: иначе цена и время этой попытки не попали бы в запись работы
         await save();
         return false;
       } finally {
+        if (bills.length) lap(job, phase, began); // (при повторе время уже записано вместе с ценой)
         await this.bill(job, bills);
       }
     }

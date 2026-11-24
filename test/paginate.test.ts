@@ -3,7 +3,8 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { after, test } from "node:test";
-import { PAGE_H, PAGE_W, PAGINATE, pageHtml } from "../src/page.ts";
+import { readFileSync } from "node:fs";
+import { PAGE_H, PAGE_W, PAGINATE, katexCss, pageHtml, textFont } from "../src/page.ts";
 import { texLeak } from "../src/tex.ts";
 import { splitAnswer } from "../src/text.ts";
 
@@ -175,4 +176,111 @@ test("широкая таблица со словами: слова и числ�
   });
   await page.close();
   assert.ok(out.right <= out.sheet && out.lines === 1 && out.font >= 11, JSON.stringify(out));
+});
+
+// настоящие стили и шрифты формул: без них дробь и корень не имеют своей ширины
+const real = () => {
+  const dist = new URL("../node_modules/katex/dist/", import.meta.url);
+  const css = katexCss(readFileSync(new URL("katex.min.css", dist), "utf8"), (n) => { try { return readFileSync(new URL(`fonts/${n}.woff2`, dist)).toString("base64"); } catch { return undefined; } });
+  const fonts = textFont(readFileSync(new URL("../node_modules/dejavu-fonts-ttf/ttf/DejaVuSans.ttf", import.meta.url)).toString("base64"));
+  return { css, fonts };
+};
+
+test("единица, приклеенная к широкой формуле, не вылезает за край листа", { skip }, async () => {
+  const { css, fonts } = real();
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  const rows = Array.from({ length: 16 }, (_, i) => `Это $\\dfrac{1}{${"2".repeat(30 + i)}}$ кДж.`);
+  const roots = Array.from({ length: 12 }, (_, i) => `Путь $\\sqrt{${"3".repeat(34 + i)}}$ км.`);
+  await page.setContent(pageHtml([`№1\n${[...rows, ...roots].join("\n")}\nОтвет: $5$ кДж.`], [], fonts, css));
+  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(PAGINATE);
+  const r = await page.evaluate(() => {
+    const out = { over: 0, loose: 0, glued: 0 };
+    for (const g of document.querySelectorAll(".glue")) {
+      const box = (g.closest(".b") as HTMLElement).getBoundingClientRect();
+      for (const rect of g.getClientRects()) if (rect.right > box.right + 1) out.over++;
+      g.classList.contains("loose") ? out.loose++ : out.glued++;
+    }
+    return out;
+  });
+  await page.close();
+  assert.equal(r.over, 0, JSON.stringify(r));
+  assert.ok(r.loose > 0 && r.glued > 0, JSON.stringify(r)); // длинным хвост отпущен, у коротких остался приклеен
+});
+
+test("лист-огрызок присоединяется к предыдущему, только если общий лист не выше обычного предела", { skip }, async () => {
+  for (const n of [38, 41, 43, 45, 47, 50]) {
+    const r = await lay(["№1\n" + Array.from({ length: n }, (_, i) => `$x_{${i + 1}} = \\dfrac{${i + 3}}{${i + 7}}$`).join("\n") + "\nОтвет: $x = \\dfrac{1}{2}$"]);
+    assert.ok(Math.max(...r.heights) <= PAGE_H + 120, `${n}: ${JSON.stringify(r.heights)}`);
+  }
+});
+
+test("знак препинания после широкой формулы не уходит один на новую строку и не вылезает за край", { skip }, async () => {
+  const { css, fonts } = real();
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  const marks = [".", ",", ";", ")"];
+  const rows = Array.from({ length: 14 }, (_, i) => `Итак $\\dfrac{1}{${"2".repeat(36 + i)}}$${marks[i % 4]}`);
+  await page.setContent(pageHtml([`№1\n${rows.join("\n")}\nОтвет: $5$.`], [], fonts, css));
+  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(PAGINATE);
+  const r = await page.evaluate(() => {
+    const out = { lone: 0, over: 0, n: 0 };
+    for (const g of document.querySelectorAll(".glue")) {
+      const tail = [...g.childNodes].filter((t) => t.nodeType === 3);
+      if (!tail.length) continue;
+      out.n++;
+      const range = document.createRange();
+      range.setStartBefore(tail[0]);
+      range.setEndAfter(tail[tail.length - 1]);
+      const t = range.getBoundingClientRect(), f = (g.firstElementChild as HTMLElement).getBoundingClientRect(), box = (g.closest(".b") as HTMLElement).getBoundingClientRect();
+      if (t.top >= f.bottom - 2) out.lone++;
+      if (t.right > box.right + 1) out.over++;
+    }
+    return out;
+  });
+  await page.close();
+  assert.ok(r.n >= 14, JSON.stringify(r));
+  assert.equal(r.lone, 0, JSON.stringify(r));
+  assert.equal(r.over, 0, JSON.stringify(r));
+});
+
+test("смешанные решения: после присоединения листа-огрызка ни один лист не выше предела", { skip }, async () => {
+  const { css, fonts } = real();
+  let seed = 7;
+  const rnd = (n: number) => (seed = (seed * 1103515245 + 12345) % 2147483648) % n;
+  const kinds = [
+    (i: number) => `$x_{${i}} = \\dfrac{${i + 3}}{${i + 7}}$`,
+    (i: number) => `Подставим значение в формулу и получим $a_{${i}} = ${i} \\cdot 3 + 1$ для каждого шага решения.`,
+    (i: number) => `$${i}x^2 - ${i + 2}x = 0$ | возводим в квадрат, обе части неотрицательны`,
+    (i: number) => `Так как левая часть неотрицательна при всех допустимых значениях переменной, правая часть тоже должна быть неотрицательной, поэтому отбираем только подходящие корни номер ${i}.`,
+  ];
+  const tall: string[] = [];
+  for (let run = 0; run < 40; run++) {
+    const parts = Array.from({ length: 1 + rnd(3) }, (_, t) => `№${t + 1}\n` + Array.from({ length: 12 + rnd(26) }, (_, i) => kinds[rnd(4)](i + 1)).join("\n") + `\nОтвет: $x = \\dfrac{1}{2}$`);
+    const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+    await page.setContent(pageHtml(parts, [], fonts, css));
+    await page.evaluate(() => document.fonts.ready);
+    await page.evaluate(PAGINATE);
+    const heights = await page.evaluate(() => [...document.querySelectorAll(".sheet")].map((x) => Math.round(x.getBoundingClientRect().height)));
+    await page.close();
+    // обычный лист с шапкой и номером не выше PAGE_H + 65; слитый не должен быть заметно выше него
+    if (Math.max(...heights) > PAGE_H + 90) tall.push(JSON.stringify(heights));
+  }
+  assert.deepEqual(tall, []);
+});
+
+test("длинная формула в ячейке таблицы переносится: таблица не выходит за край листа", { skip }, async () => {
+  const { css, fonts } = real();
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  const sum = Array.from({ length: 20 }, (_, i) => 11 + i).join("+");
+  await page.setContent(pageHtml([`№1\n| n | Сумма |\n| --- | --- |\n| $1$ | $${sum}$ |\n| $2$ | $5$ |\nОтвет: $410$`], [], fonts, css));
+  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(PAGINATE);
+  const r = await page.evaluate(() => {
+    const t = document.querySelector(".tbl") as HTMLElement, sheet = (t.closest(".sheet") as HTMLElement).getBoundingClientRect();
+    return { right: Math.round(t.getBoundingClientRect().right), edge: Math.round(sheet.right), text: (t as HTMLElement).innerText.replace(/\s+/g, "") };
+  });
+  await page.close();
+  assert.ok(r.right <= r.edge - 10, JSON.stringify(r));
+  assert.ok(r.text.includes("29+30"), JSON.stringify(r));
 });

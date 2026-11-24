@@ -60,3 +60,148 @@ test("исправление с заголовком «Исправляю №2»
   const body = "№1\nОтвет: 4\n\n№2\nОтвет: 5";
   assert.deepEqual(judgeReply({ text: "Исправляю №2\n3 + 4 = 7\nОтвет: 7", cut: false, refused: false }, body), { fix: "Исправляю №2\n3 + 4 = 7\nОтвет: 7" });
 });
+
+test("«ДОПОЛНЕНО»: ответ прежний, но в решение добавлен обязательный элемент: это исправление", () => {
+  const body = "№1\nx = 4\nОтвет: 4\n\n№2\nF = ma\nОтвет: 5 Н";
+  const fix = "№2\nОбоснование:\nсистема отсчёта инерциальная\nF = ma\nОтвет: 5 Н";
+  assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, cut: false, refused: false }, body), { fix });
+  assert.deepEqual(judgeReply({ text: `**ДОПОЛНЕНО.**\n\n${fix}`, cut: false, refused: false }, body), { fix });
+  // без этой строки переписанное задание с прежним ответом исправлением не считается, как и раньше
+  assert.deepEqual(judgeReply({ text: fix, cut: false, refused: false }, body), { ok: true });
+  // одно слово без задания ничего не значит; оборванный ответ тоже
+  assert.equal(judgeReply({ text: "ДОПОЛНЕНО", cut: false, refused: false }, body), null);
+  assert.equal(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, cut: true, refused: false }, body), null);
+});
+
+test("«ДОПОЛНЕНО» с заметкой, с заголовком на той же строке и с пересчётом кодом после задания: исправление не теряется", () => {
+  const body = "№1\nx = 4\nОтвет: 4\n\n№2\nF = ma\nОтвет: 5 Н";
+  const fix = "№2\nОбоснование:\nсистема отсчёта инерциальная\nF = ma\nОтвет: 5 Н";
+  for (const head of ["ДОПОЛНЕНО: рисунок сил", "ДОПОЛНЕНО – добавлено обоснование", "Дополнено."]) {
+    assert.deepEqual(judgeReply({ text: `${head}\n${fix}`, cut: false, refused: false }, body), { fix }, head);
+  }
+  // заголовок задания на строке со словом остаётся заголовком
+  assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО ${fix}`, cut: false, refused: false }, body), { fix });
+  // после задания модель ещё раз пересчитала кодом: в хвосте только заметка, задание берётся из основного текста
+  for (const tail of ["Проверка кодом подтвердила: всё верно.", "Пересчёт сошёлся."]) {
+    assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, tail, cut: false, refused: false }, body), { fix }, tail);
+  }
+  // слово в середине решения меткой не считается: стоит после заголовка задания
+  assert.deepEqual(judgeReply({ text: "№2\nДополнено условие: m = 1 кг\nF = ma\nОтвет: 5 Н", cut: false, refused: false }, body), { ok: true });
+  // «Дополненоe» внутри другого слова тоже не метка
+  assert.deepEqual(judgeReply({ text: `Дополненное решение проверил.\nВСЁ ВЕРНО`, cut: false, refused: false }, body), { ok: true });
+});
+
+test("«ДОПОЛНЕНО»: обычная фраза с этим словом меткой не считается, а хвост об ошибке отменяет дополнение", () => {
+  const body = "№1\nx = 4\nОтвет: 4\n\n№2\nF = ma\nОтвет: 5 Н";
+  const fix = "№2\nрисунок\nF = ma\nОтвет: 5 Н";
+  // согласие, в котором есть слово «дополнено»: решение остаётся, платного повтора нет
+  for (const text of [
+    "Дополнено ничего не требуется: рисунок уже есть.\nВСЁ ВЕРНО",
+    "**Дополнено:** решение верно, добавлять нечего.\nВСЁ ВЕРНО",
+    "ДОПОЛНЕНО не требуется.\nВСЁ ВЕРНО",
+    "Дополнено ли решение обоснованием? Проверю заново.\n№2\nF = ma\nОтвет: 5 Н\nВСЁ ВЕРНО",
+    "Дополнено условие: g = 10 м/с².\n№2\nF = ma\nОтвет: 5 Н",
+  ]) assert.deepEqual(judgeReply({ text, cut: false, refused: false }, body), { ok: true }, text);
+  // после «ДОПОЛНЕНО» пересчёт показал ошибку: старый ответ исправлением не уходит, запрос повторяется
+  assert.equal(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, tail: "Пересчёт кодом показал ошибку: в №2 сила 7 Н, а не 5 Н.", cut: false, refused: false }, body), null);
+  // в хвосте сказано, что дополнять нечего: решение остаётся прежним
+  assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, tail: "Рисунок уже был, дополнять нечего.\nВСЁ ВЕРНО", cut: false, refused: false }, body), { ok: true });
+  // строка согласия после дополненного задания в текст для человека не попадает
+  assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО\n${fix}\nВСЁ ВЕРНО`, cut: false, refused: false }, body), { fix });
+});
+
+test("«ДОПОЛНЕНО»: слово не попадает в текст ни одного задания, строки решения не теряются, обычные формы метки приняты", () => {
+  const body = "№1\nрешение\nОтвет: 4 см²\n\n№2\nРешение второго.\nОтвет: 1/2";
+  const two = judgeReply({ text: "ДОПОЛНЕНО\n№1\nx = 2, рисунок\nОтвет: 4 см²\n@@@\nДОПОЛНЕНО\n№2\nРисунок сил и обоснование.\nОтвет: 1/2", cut: false, refused: false }, body);
+  assert.deepEqual(two, { fix: "№1\nx = 2, рисунок\nОтвет: 4 см²\n@@@\n№2\nРисунок сил и обоснование.\nОтвет: 1/2" });
+  // исправление одного задания и дополнение другого в одном ответе
+  const mixed = judgeReply({ text: "№1\nx = 3\nОтвет: 9 см²\n@@@\nДОПОЛНЕНО\n№2\nРисунок сил и обоснование.\nОтвет: 1/2", cut: false, refused: false }, body);
+  assert.deepEqual(mixed, { fix: "№1\nx = 3\nОтвет: 9 см²\n@@@\n№2\nРисунок сил и обоснование.\nОтвет: 1/2" });
+  // проверка, ради которой задание дополняли, остаётся в нём
+  const checked = judgeReply({ text: "ДОПОЛНЕНО\n№2\nРешение второго.\nПроверка: 2 · 1/2 = 1, всё верно.\nОтвет: 1/2", cut: false, refused: false }, body);
+  assert.deepEqual(checked, { fix: "№2\nРешение второго.\nПроверка: 2 · 1/2 = 1, всё верно.\nОтвет: 1/2" });
+  const fix = "№2\nРисунок сил и обоснование.\nОтвет: 1/2";
+  for (const head of ["Дополнено: добавлен рисунок сил", "ДОПОЛНЕНО (рисунок сил)", "ДОПОЛНЕНО, добавлено обоснование", "**ДОПОЛНЕНО** – рисунок"]) {
+    assert.deepEqual(judgeReply({ text: `${head}\n${fix}`, cut: false, refused: false }, body), { fix }, head);
+  }
+  // после задания модель пересчитала кодом и подтвердила: дополнение принимается
+  for (const tail of ["Пересчёт кодом: ошибки нет, ответ 1/2.", "Проверил кодом: неверных значений нет.", "Рисунок исправлен: стрелка вниз.", "Пересчитал без ошибок."]) {
+    assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, tail, cut: false, refused: false }, body), { fix }, tail);
+  }
+  // а после слов об ошибке старый ответ исправлением не уходит
+  for (const tail of ["Ошибка в №2, ответ 3.", "Пересчёт показал: ответ неверный."]) {
+    assert.equal(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, tail, cut: false, refused: false }, body), null, tail);
+  }
+});
+
+test("дописанная буква или индекс это новый ответ, дописанная единица или пояснение нет", () => {
+  const ask = (was: string, now: string) => judgeReply({ text: `№1\nрешение заново\nОтвет: ${now}`, cut: false, refused: false }, `№1\nрешение\nОтвет: ${was}`);
+  for (const [was, now] of [["CO", "CO₂"], ["А", "АБ"], ["4 см", "4 см²"], ["12", "13"]]) {
+    assert.deepEqual(ask(was, now), { fix: `№1\nрешение заново\nОтвет: ${now}` }, `${was} -> ${now}`);
+  }
+  for (const [was, now] of [["4", "4 см"], ["да", "да, действует"], ["0,5", "0.5"], ["x = 5", "5"]]) {
+    assert.deepEqual(ask(was, now), { ok: true }, `${was} -> ${now}`);
+  }
+});
+
+test("исправление не теряется, если новый ответ совпал с ответом другого задания", () => {
+  const body = "№1\nрешение\nОтвет: 2\n\n№2\nрешение\nОтвет: 7\n\n№3\nрешение\nОтвет: 5";
+  for (const now of ["2", "7"]) {
+    const fix = `№3\nРешение: S = 2 · 1 = ${now}.\nОтвет: ${now}`;
+    assert.deepEqual(judgeReply({ text: fix, cut: false, refused: false }, body), { fix }, now);
+  }
+  // переписанное задание с прежним ответом исправлением не считается
+  assert.deepEqual(judgeReply({ text: "№3\nрешение заново\nОтвет: 5", cut: false, refused: false }, body), { ok: true });
+  // «да» и «нет» в соседних заданиях
+  const yn = "№1\nрешение\nОтвет: да, действует.\n\n№2\nрешение\nОтвет: нет";
+  assert.deepEqual(judgeReply({ text: "№1\nрешение заново\nОтвет: нет", cut: false, refused: false }, yn), { fix: "№1\nрешение заново\nОтвет: нет" });
+  // разные предметы с одним номером
+  const subj = "Физика · №1\nрешение\nОтвет: 6 м\n\nГеометрия · №1\nрешение\nОтвет: 4";
+  assert.deepEqual(judgeReply({ text: "Геометрия · №1\nрешение заново\nОтвет: 6", cut: false, refused: false }, subj), { fix: "Геометрия · №1\nрешение заново\nОтвет: 6" });
+  // согласие с заметками, где ответы прежние, остаётся согласием
+  assert.deepEqual(judgeReply({ text: "ВСЁ ВЕРНО", all: "№1\nпересчёт\nОтвет: 2\n№3\nпересчёт\nОтвет: 5\nВСЁ ВЕРНО", cut: false, refused: false }, body), { ok: true });
+  // а если в заметках у задания получился другой ответ, согласие не принимается: запрос повторяется
+  assert.equal(judgeReply({ text: "ВСЁ ВЕРНО", all: "№3\nпересчёт\nОтвет: 2\nВСЁ ВЕРНО", cut: false, refused: false }, body), null);
+});
+
+test("множитель и второй вариант это новый ответ: «4» и «4π», «А» и «А, В»", () => {
+  const ask = (was: string, now: string) => judgeReply({ text: `№1\nрешение заново\nОтвет: ${now}`, cut: false, refused: false }, `№1\nрешение\nОтвет: ${was}`);
+  for (const [was, now] of [["4", "4π"], ["4", "4π см²"], ["2", "2i"], ["А", "А, В"], ["1", "1/π"]]) {
+    assert.deepEqual(ask(was, now), { fix: `№1\nрешение заново\nОтвет: ${now}` }, `${was} -> ${now}`);
+  }
+  for (const [was, now] of [["4", "4 см"], ["12", "12 кг"], ["6", "6%"], ["да", "да, действует"], ["да", "да (по закону Ома)"]]) {
+    assert.deepEqual(ask(was, now), { ok: true }, `${was} -> ${now}`);
+  }
+});
+
+test("«ДОПОЛНЕНО» рядом с отзывом о других заданиях: дополнение принято, отзыв в текст не идёт", () => {
+  const body = "№1\nx = 4\nОтвет: 4\n\n№2\nF = ma\nОтвет: 5 Н";
+  const fix = "№2\nРешение: рисунок сил.\nОтвет: 5 Н";
+  for (const head of ["№1 – всё верно.", "№1 верно, дополнять нечего."]) {
+    assert.deepEqual(judgeReply({ text: `${head}\nДОПОЛНЕНО\n${fix}`, cut: false, refused: false }, body), { fix }, head);
+  }
+  assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО\n${fix}\n\nВ №1 всё верно.`, cut: false, refused: false }, body), { fix });
+  // настоящее исправление перед меткой отзывом не считается
+  const both = judgeReply({ text: `№1\nx = 3 неверно, x = 5\nОтвет: 5\n@@@\nДОПОЛНЕНО\n${fix}`, cut: false, refused: false }, body);
+  assert.deepEqual(both, { fix: `№1\nx = 3 неверно, x = 5\nОтвет: 5\n@@@\n${fix}` });
+  // хвост «ошибки не было» после пересчёта это подтверждение
+  for (const tail of ["Пересчёт подтвердил ответ, ошибки не было.", "Замечание о неверном ответе не подтвердилось, добавлен рисунок."]) {
+    assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, tail, cut: false, refused: false }, body), { fix }, tail);
+  }
+});
+
+test("согласие с заметкой остаётся согласием: разбор случаев в решении, процент и единица латиницей", () => {
+  const agree = (body: string, note: string) => judgeReply({ text: "ВСЁ ВЕРНО", all: `${note}\nВСЁ ВЕРНО`, cut: false, refused: false }, body);
+  // строки «Вариант 1: …» и «№ 2 – …» внутри задания не делят его на части
+  const cases = "№1\nОтвет: 5\n@@@\n№3\nРассмотрим два случая.\nВариант 1: точка C между A и B, AC = 10 − 3 = 7.\nВариант 2: C вне отрезка, AC = 10 + 3 = 13.\nОтвет: 7 или 13";
+  assert.deepEqual(agree(cases, "№3\nПересчитал оба случая кодом.\nОтвет: 7 или 13"), { ok: true });
+  assert.deepEqual(agree("№4\nПредложения:\n№ 2 – сложное\n№ 5 – сложное\nОтвет: 25", "№4\nОтвет: 25"), { ok: true });
+  // настоящее исправление такого задания по-прежнему принимается
+  assert.deepEqual(judgeReply({ text: "№3\nТри случая.\nОтвет: 7, 10 или 13", cut: false, refused: false }, cases), { fix: "№3\nТри случая.\nОтвет: 7, 10 или 13" });
+  // «20%» и «20», «8 bit» и «8» это один ответ
+  assert.deepEqual(agree("№1\nОтвет: 20%\n\n№2\nОтвет: 4", "№1\nОтвет: 20"), { ok: true });
+  assert.deepEqual(agree("№1\nОтвет: 8 bit\n\n№2\nОтвет: 3", "№1\nОтвет: 8"), { ok: true });
+  // а «4» и «4i», «4» и «4π» разные
+  assert.equal(agree("№1\nОтвет: 4", "№1\nОтвет: 4i"), null);
+  assert.equal(agree("№1\nОтвет: 4", "№1\nОтвет: 4π"), null);
+});

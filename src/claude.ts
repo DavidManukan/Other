@@ -3,7 +3,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Cfg, Effort } from "./config.ts";
 import { PROMPT } from "./prompt.ts";
-import { plainText } from "./text.ts";
+import { headOf, plainText } from "./text.ts";
 import { left } from "./util.ts";
 
 export class Timeout extends Error {} // время куска вышло, а модель ещё ничего не написала
@@ -39,11 +39,14 @@ export interface Spent {
   in: number;
   out: number;
   read: number; // прочитано из кэша
-  write: number; // записано в кэш
+  write: number; // записано в кэш (всего)
+  write1h?: number; // из них на час: такая запись вдвое дороже обычного входа
+  think?: number; // токены размышлений (они входят в out): главная статья расхода
   usd: number;
   approx?: boolean; // цена или выход посчитаны примерно: модель с неизвестной ценой или поток оборвался до итога
 }
 // Цена за миллион токенов, доллары: вход, выход, чтение кэша, запись в кэш на 5 минут. Fast-режим вдвое дороже.
+// Запись в кэш на час стоит вдвое дороже обычного входа (на 5 минут в 1,25 раза).
 // claude-opus-5 и claude-opus-4-8 сами не заказываем: на них Anthropic переводит запрос, если основная модель его отклонит.
 const PRICES: Record<string, [number, number, number, number]> = {
   "claude-fable-5-2": [8, 40, 0.2, 10],
@@ -52,12 +55,13 @@ const PRICES: Record<string, [number, number, number, number]> = {
   "claude-opus-5": [5, 25, 0.5, 6.25],
   "claude-opus-4-8": [5, 25, 0.5, 6.25],
 };
-type Usage = { in: number; out: number; read: number; write: number };
+type Usage = { in: number; out: number; read: number; write: number; write1h?: number };
 // Сначала точное имя, потом самое длинное известное начало («claude-fable-5-2-20261001»): «claude-opus-5» не должен оценить «claude-opus-5-5»
 export function price(model: string, u: Usage, fast: boolean): number | null {
   const key = model in PRICES ? model : Object.keys(PRICES).filter((k) => model.startsWith(k + "-")).sort((a, b) => b.length - a.length)[0];
   const p = key ? PRICES[key] : undefined;
-  return p ? ((u.in * p[0] + u.out * p[1] + u.read * p[2] + u.write * p[3]) / 1e6) * (fast ? 2 : 1) : null;
+  const hour = Math.min(u.write, u.write1h ?? 0); // часть записи с часовым сроком
+  return p ? ((u.in * p[0] + u.out * p[1] + u.read * p[2] + (u.write - hour) * p[3] + hour * p[0] * 2) / 1e6) * (fast ? 2 : 1) : null;
 }
 // Цена для дневного лимита. Оплаченный запрос не может стоить $0: модель с неизвестной ценой считаем по цене заказанной,
 // а если неизвестна и та, по самой дорогой из известных. Такая сумма помечается как примерная.
@@ -73,7 +77,7 @@ type Content = Anthropic.Beta.BetaMessage["content"];
 
 // Необязательные параметры запроса. Если модель из MODEL какой-то из них не знает (ошибка 400),
 // бот отключает именно его и запоминает, чтобы не ошибаться на каждом фото.
-type Feature = "speed" | "fallbacks" | "effort" | "tools" | "thinking";
+type Feature = "speed" | "fallbacks" | "effort" | "tools" | "thinking" | "ttl";
 const disabled = new Map<string, Set<Feature>>();
 export const featureOff = (model: string, f: Feature) => disabled.get(model)?.has(f) ?? false;
 
@@ -110,7 +114,9 @@ export function claudeProblem(c: Cfg, e: unknown, model = c.model): Error {
   }
   if (e instanceof Anthropic.ContentTooLargeError) return new Fatal("Фото слишком большое. Пришли обычное фото.");
   if (e instanceof Anthropic.PermissionDeniedError) {
-    return new Fatal(`Claude отказал в доступе (403): ${String(e.apiMessage ?? "").slice(0, 120)}`);
+    // сырой текст API человеку в чате ни к чему: он остаётся в логах воркера
+    console.log("403:", String(e.apiMessage ?? "").slice(0, 300));
+    return new Fatal(`Ключ Claude не даёт доступа к модели ${model} (403). Проверь ключ и MODEL.`);
   }
   if (e instanceof Anthropic.APIConnectionError) return new Busy("нет связи с Claude");
   if (e instanceof Anthropic.APIError) {
@@ -151,7 +157,9 @@ export async function inputTokens(c: Cfg, messages: Anthropic.Beta.BetaMessagePa
 function blamed(e: unknown, o: AskOptions, c: Cfg, off: Set<Feature>): Feature | undefined {
   if (!(e instanceof Anthropic.BadRequestError)) return undefined;
   const msg = String(e.apiMessage ?? e.message ?? "");
-  const f: Feature | undefined = /speed|fast/i.test(msg)
+  const f: Feature | undefined = /\bttl\b|cache_control/i.test(msg)
+    ? "ttl"
+    : /speed|fast/i.test(msg)
     ? "speed"
     : /fallback|anthropic-beta/i.test(msg)
     ? "fallbacks"
@@ -266,36 +274,110 @@ const whole = (text: string) => text.split(/^[ \t]*@@@.*$/m).some((t) => {
 });
 // Ответ в виде, удобном для сравнения: без разметки и пробелов, десятичная запятая как точка, без «S =» в начале
 const squeeze = (s: string) => plainText(s).replace(/\s/g, "").replace(/(\d),(\d)/g, "$1.$2").replace(/−/g, "-").replace(/[.;]+$/, "").toLowerCase().replace(/^[a-zа-яё][a-zа-яё0-9₀-₉()]*=/, "");
+// Множитель или знак сразу за числом («4π», «2i», «1/π»), в отличие от единицы («4 см», «20%», «8 bit»)
+const FACTOR = /[π√∞^]|^i(?![a-z])|^\//;
 // Число в начале ответа и единица после него: «0.5м/с» -> [0.5, «м/с»], «1/2» -> [0.5, «»]. Не число: null
 function value(x: string): [number, string] | null {
   const m = /^(-?\d+(?:\.\d+)?)(?:\/(\d+(?:\.\d+)?))?/.exec(x);
-  if (!m || /\d/.test(x.slice(m[0].length))) return null;
+  // после числа стоит множитель или знак, а не единица («4π», «2i», «6%», «1/π»): это уже не просто число
+  if (!m || /\d/.test(x.slice(m[0].length)) || FACTOR.test(x.slice(m[0].length))) return null;
   return [m[2] ? Number(m[1]) / Number(m[2]) : Number(m[1]), x.slice(m[0].length)];
 }
 function same(a: string, b: string): boolean {
   if (a === b) return true;
   const [short, long] = a.length <= b.length ? [a, b] : [b, a];
-  if (short && long.startsWith(short) && !/\d/.test(long.slice(short.length))) return true; // тот же ответ, у одного дописана единица
+  // Тот же ответ, у одного дописана единица («4» и «4 см») или пояснение после знака («да» и «да, действует»).
+  // Дописанная буква, индекс, множитель или второй вариант это уже другой ответ: «CO» и «CO₂», «А» и «АБ», «4» и «4π», «А» и «А, В».
+  const more = long.slice(short.length);
+  const unit = /\d$/.test(short) && !FACTOR.test(more);
+  const note = /^[,;:(]/.test(more) && !/^[,;][a-zа-яё](?:\)|[,;]|$)/.test(more);
+  if (short && long.startsWith(short) && !/[\d¹²³⁰-⁹₀-₉]/.test(more) && (unit || note)) return true;
   const x = value(a), y = value(b);
   return !!x && !!y && Math.abs(x[0] - y[0]) < 1e-9 && (!x[1] || !y[1] || x[1] === y[1]);
 }
 const answersOf = (text: string) => [...text.matchAll(/^[ \t]*Ответ:[ \t]*(.+)$/gm)].map((m) => squeeze(m[1])).filter(Boolean);
-// Ответы из текста, которых нет среди ответов отправленного решения. Без решения под рукой (body пуст) сравнить не с чем: новым считается любой
+// Задания текста: новая часть начинается со строки-заголовка или после @@@
+const pieces = (s: string) => {
+  const out: string[][] = [[]];
+  for (const r of s.split("\n")) {
+    if (/^[ \t]*@@@/.test(r)) {
+      out.push([]);
+      continue;
+    }
+    if (TASK.test(r) && out[out.length - 1].some((x) => x.trim())) out.push([]);
+    out[out.length - 1].push(r);
+  }
+  return out.map((p) => p.join("\n")).filter((p) => p.trim());
+};
+// Ответы из текста, которых нет среди ответов отправленного решения. Без решения под рукой (body пуст) сравнить не с чем: новым считается любой.
+// Ответ задания сравнивается с ответами того же задания: исправление «№3: 2» новое, даже если 2 это ответ №1.
+// Задание без пары по заголовку сравнивается со всем решением.
 function fresh(text: string, body: string): string[] {
-  const sent = answersOf(body);
-  return answersOf(text).filter((x) => !body || !sent.some((y) => same(x, y)));
+  if (!body) return answersOf(text);
+  const own = pieces(body).map((t) => [headOf(t), t] as const);
+  return pieces(text).flatMap((t) => {
+    const k = headOf(t);
+    const mine = k ? own.filter(([h]) => h === k) : [];
+    // в куске своего задания ответа может не оказаться (решение разрезано строкой «Вариант 2: …»): тогда сравниваем со всем решением
+    const own1 = mine.length === 1 ? answersOf(mine[0][1]) : [];
+    const sent = own1.length ? own1 : answersOf(body);
+    return answersOf(t).filter((x) => !sent.some((y) => same(x, y)));
+  });
 }
 
+// 5. Ответ прежний, но в решении не хватало обязательного элемента (рисунка, обоснования): модель пишет строку «ДОПОЛНЕНО»
+//    и задание целиком. Это тоже исправление, хотя новых ответов в нём нет.
+//    Слово стоит до первого задания: одно на строке («Дополнено.»), с заметкой после знака («ДОПОЛНЕНО: рисунок сил»)
+//    или с заголовком задания на той же строке («ДОПОЛНЕНО №2»). Обычная фраза «Дополнено ли решение…» меткой не считается.
+const ADDED_BARE = /^[\s*]*дополнено[\s.:!*]*$/i;
+const ADDED_NOTE = /^[\s*]*дополнено[\s*]*[:;,(—–-]/i;
+const ADDED_HEAD = /^[\s*]*ДОПОЛНЕНО[\s.:!*]+(?=\S)/;
+const marked = (r: string) => ADDED_BARE.test(r) || ADDED_NOTE.test(r);
+const headed = (r: string) => ADDED_HEAD.test(r) && TASK.test(r.replace(ADDED_HEAD, ""));
+const AGREE = /^[\s*]*вс[её]\s+верно[\s.!*]*$/i; // отдельная строка согласия
+function added(text: string): string | null {
+  const rows = text.split("\n");
+  const at = rows.findIndex((r) => marked(r) || headed(r));
+  // «№1 – всё верно.» перед меткой это отзыв о другом задании, а не начало исправления
+  const said = (r: string) => !/Ответ:/.test(r) && r.length < 80 && /(?<![а-яё])(?:вс[её]\s+)?верно|дополнять\s+нечего/i.test(r) && !/(?:^|[^а-яё])не\s*верн/i.test(r);
+  if (at < 0 || rows.slice(0, at).some((r) => TASK.test(r) && !said(r))) return null;
+  // строка согласия («ВСЁ ВЕРНО») в текст задания не идёт; строки решения («Проверка: … всё верно.») остаются,
+  // а отзыв о других заданиях после последнего ответа («В №1 и №2 всё верно.») убирается
+  const kept = rows.slice(at).filter((r) => !AGREE.test(r));
+  const end = kept.findLastIndex((r) => /^[ \t]*Ответ:/.test(r));
+  return unmark(kept.filter((r, i) => !(end >= 0 && i > end && PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n")).trim();
+}
+// Слово «ДОПОЛНЕНО» в начале каждого задания исправления человеку не нужно: убираем его, заголовок на той же строке оставляем
+const unmark = (text: string) => text.split(/^([ \t]*@@@.*)$/m).map((piece, k) => {
+  if (k % 2) return piece; // сама строка @@@
+  const rows = piece.split("\n");
+  const at = rows.findIndex((r) => r.trim());
+  if (at < 0) return piece;
+  if (marked(rows[at])) rows.splice(at, 1);
+  else if (headed(rows[at])) rows[at] = rows[at].replace(ADDED_HEAD, "");
+  return rows.join("\n");
+}).join("");
+// Хвост после пересчёта кодом, который ничего не меняет: в нём нет своего ответа, слов об ошибке, отказа дополнять и строки «ВСЁ ВЕРНО».
+// «Ошибки нет», «неверных значений нет» это подтверждение, а не ошибка: такие обороты сначала убираем.
+const NO_ERR = /(?:ошиб(?:ок|ки|ка)|неверн\S*(?:\s+\S+)?|расхождени\S*)\s+нет|нет\s+(?:ни\s+)?(?:ошиб\S*|неверн\S*|расхождени\S*)|не\s+(?:найден\S*|обнаружен\S*|выявлен\S*)\s+(?:ни\s+)?(?:ошиб\S*|неверн\S*)|без\s+ошиб\S*|ошиб(?:ок|ки)(?:\s+\S+){0,3}\s+не\s+было|замечани\S*(?:\s+\S+){0,4}\s+не\s+подтвердил\S*/gi;
+const neutral = (tail: string) => {
+  const t = tail.replace(NO_ERR, "");
+  return !/Ответ:/.test(t) && !/ошибк|ошибо|неверн|не\s+так|нечего|не\s+требуется|не\s+надо|дополнять\s+не\s+нужн/i.test(t) && !t.split("\n").some((l) => AGREE.test(l));
+};
 export function judgeReply(a: Pick<Answer, "text" | "tail" | "all" | "cut" | "refused">, body = ""): { ok: true } | { fix: string } | null {
   if (a.cut || a.refused) return null;
   const last = (a.tail ?? a.text).trim();
-  const pure = last.split("\n").some((l) => /^[\s*]*вс[её]\s+верно[\s.!*]*$/i.test(l)); // отдельная строка «ВСЁ ВЕРНО»
+  // После слова «ДОПОЛНЕНО» и задания модель могла ещё раз пересчитать кодом: тогда в хвосте только заметка, а задание в основном тексте.
+  // Если в хвосте сказано об ошибке или о том, что дополнять нечего, основной текст уже не итог: решает обычный разбор ниже.
+  const more = added(last) ?? (last !== a.text.trim() && neutral(last) ? added(a.text.trim()) : null);
+  if (more !== null && whole(more)) return { fix: more };
+  const pure = last.split("\n").some((l) => AGREE.test(l)); // отдельная строка «ВСЁ ВЕРНО»
   if (!pure && whole(last) && fresh(last, body).length) {
-    return { fix: last.split("\n").filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim() };
+    return { fix: unmark(last.split("\n").filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n")).trim() };
   }
   if (agrees(last)) return body && fresh(a.all ?? a.text, body).length ? null : { ok: true };
   if (body && whole(last) && !fresh(last, body).length) return { ok: true };
-  return !pure && whole(a.text) && fresh(a.text, body).length ? { fix: a.text } : null;
+  return !pure && whole(a.text) && fresh(a.text, body).length ? { fix: unmark(a.text).trim() } : null;
 }
 
 // Один ход модели. Пересчёт в песочнице идёт на стороне Anthropic; если он затянулся, ход приходит
@@ -371,6 +453,11 @@ async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
   }
 }
 
+// Оценка размышлений оборванного потока по времени молчания. Точной скорости API не сообщает: берём около 50 токенов в секунду
+// (в быстром режиме вдвое больше) и не больше max_tokens. Это оценка для дневного лимита, в журнале она помечена «примерно».
+const PAUSE = 2_000;
+export const thinkGuess = (quietMs: number, fast: boolean, max: number) => Math.min(max, Math.round((quietMs / 1000) * (fast ? 100 : 50)));
+
 interface Attempt {
   text: string; // если поток оборвался: текст, написанный после последней проверки в этом потоке
   fresh?: boolean; // в оборванном потоке была проверка: текст прошлых кругов к ответу уже не относится
@@ -384,9 +471,12 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
     model,
     // размышления тоже идут в счёт max_tokens, на высоких ступенях им нужно больше места
     max_tokens: o.effort === "xhigh" || o.effort === "max" ? 128_000 : 64_000,
-    // инструкция одна и та же для всех фото: кэшируем, следующие запросы дешевле и быстрее
-    system: [{ type: "text", text: o.system ?? PROMPT, cache_control: { type: "ephemeral" } }],
-    // и разговор тоже: при добавлении фото, продолжении и уточнениях старые фото читаются из кэша
+    // Инструкция одна и та же для всех фото и всех чатов: кэшируем её на час. Фото приходят с перерывами в 10–30 минут,
+    // и с пятиминутным кэшем каждое решение заново платило бы за запись всей инструкции (это была заметная часть счёта).
+    // Запись на час дороже, но окупается уже вторым фото за час; каждое чтение продлевает срок.
+    system: [{ type: "text", text: o.system ?? PROMPT, cache_control: off.has("ttl") ? { type: "ephemeral" } : { type: "ephemeral", ttl: "1h" } }],
+    // Разговор кэшируется на 5 минут: при добавлении фото, продолжении и разборе замечаний фото читаются из кэша.
+    // (часовая отметка стоит раньше пятиминутной: такой порядок API разрешает)
     cache_control: { type: "ephemeral" },
     messages,
   };
@@ -416,24 +506,38 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   let fresh = false;
   let opened = false; // поток открылся: модель приняла запрос и начала работать
   // Расход считаем по ходу потока: если он оборвётся, уже потраченное всё равно попадёт в учёт
-  const used = { in: 0, out: 0, read: 0, write: 0 };
+  const used = { in: 0, out: 0, read: 0, write: 0, write1h: 0, think: 0 };
   let served = model;
   // Точный выход приходит только в конце потока. Если поток оборвётся раньше, выход оцениваем по написанному
   // (текст, размышления, код для песочницы): около 3 знаков русского текста на токен. Иначе лимит видел бы почти $0.
   let streamed = 0;
   let exact = false;
-  const count = (u: { input_tokens?: number | null; output_tokens?: number | null; cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null } | undefined, final = false) => {
+  // Размышления в поток не пишутся (их текст скрыт), но оплачиваются как выход. Пока модель думает, поток молчит:
+  // паузы между событиями считаем временем размышлений. Ожидание песочницы (код уже отправлен, результата ещё нет) не в счёт.
+  let quiet = 0;
+  let seen = 0; // время последнего события потока
+  let sandbox = false;
+  let toolAt = -1; // номер блока с вызовом песочницы: после его конца идёт ожидание результата
+  const count = (u: { input_tokens?: number | null; output_tokens?: number | null; cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null; cache_creation?: { ephemeral_1h_input_tokens?: number | null } | null; output_tokens_details?: { thinking_tokens?: number | null } | null } | undefined, final = false) => {
     if (!u) return;
     if (final) exact = true;
     used.in = Math.max(used.in, u.input_tokens ?? 0);
     used.out = Math.max(used.out, u.output_tokens ?? 0);
     used.read = Math.max(used.read, u.cache_read_input_tokens ?? 0);
     used.write = Math.max(used.write, u.cache_creation_input_tokens ?? 0);
+    used.write1h = Math.max(used.write1h, u.cache_creation?.ephemeral_1h_input_tokens ?? 0);
+    used.think = Math.max(used.think, u.output_tokens_details?.thinking_tokens ?? 0);
   };
   try {
     const stream = client(c).beta.messages.stream(params, { signal: ctrl.signal });
     for await (const ev of stream) {
       opened = true;
+      const now = Date.now();
+      if (seen && !sandbox && now - seen > PAUSE) quiet += now - seen;
+      seen = now;
+      if (ev.type === "content_block_start") sandbox = false;
+      else if (ev.type === "content_block_stop" && toolAt === ev.index) sandbox = true;
+      if (ev.type === "content_block_start" && (ev.content_block.type as string) === "server_tool_use") toolAt = ev.index;
       if (ev.type === "message_start") (count(ev.message.usage), (served = ev.message.model || served));
       else if (ev.type === "message_delta") count(ev.usage, true);
       if (ev.type === "content_block_delta") {
@@ -467,9 +571,12 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   } finally {
     clearTimeout(timer);
     o.stop?.removeEventListener("abort", interrupt);
-    const guess = exact ? 0 : Math.ceil(streamed / 3);
+    if (!exact && seen && !sandbox && Date.now() - seen > PAUSE) quiet += Date.now() - seen;
+    const thought = exact ? 0 : thinkGuess(quiet, params.speed === "fast", params.max_tokens);
+    const guess = exact ? 0 : Math.ceil(streamed / 3) + thought;
     const estimated = guess > used.out;
     if (estimated) used.out = guess;
+    if (thought > used.think) used.think = thought;
     if (used.in + used.out + used.read + used.write > 0) {
       try {
         const paid = cost(served, model, used, params.speed === "fast");

@@ -64,7 +64,11 @@ export function chunks(src: string): string[] {
 // Формула: KaTeX пишет готовый HTML. Не разобралась (опечатка модели): показываем её обычным текстом.
 export function tex(src: string): string {
   const clean = src.replace(/\\tag\*?\{[^{}]*\}/g, "") // номера формул на странице не нужны
-    .replace(/\\(?:sfrac|nicefrac)(?![A-Za-z])/g, "\\frac"); // таких дробей KaTeX не знает, рисуем обычной
+    .replace(/\\(?:sfrac|nicefrac)(?![A-Za-z])/g, "\\frac") // таких дробей KaTeX не знает, рисуем обычной
+    // знак % в формуле для KaTeX начинает комментарий: без черты перед ним остаток формулы пропал бы («r = 10% годовых» -> «r = 10»)
+    .replace(/(^|[^\\])%/g, "$1\\%")
+    // пробел между разрядами числа в формуле не рисуется: «1 320 000» слиплось бы в «1320000»
+    .replace(/(\d) (?=\d{3}(?!\d))/g, "$1\\,");
   const one = (s: string) => sound(katex.renderToString(`\\displaystyle ${s}`, KATEX));
   try {
     // .f: формула целиком. Она не рвётся, пока помещается в строку; не помещается: переносится между кусками .fx
@@ -86,7 +90,28 @@ export function tex(src: string): string {
 // Строка с формулами $…$ -> HTML
 export function inline(text: string): string {
   // вне формул разметки быть не должно: что осталось (знак $ без пары, команда без $), переводится в обычные знаки
-  return mathSpans(text).map((s) => (s.math ? tex(s.body) : s.lit ? esc(s.body) : esc(prettyMath(stripTex(s.body), sheet || undefined)))).join("");
+  const segs = mathSpans(text);
+  const out: string[] = [];
+  // «4-го» не рвётся по дефису, а знак между словами («пуля + брусок») не начинает строку
+  const words = (t: string) => esc(prettyMath(stripTex(t), sheet || undefined))
+    .replace(/(?<![\p{L}\d])(\d+-[а-яё]{1,3})(?![а-яё])/giu, '<span class="nb">$1</span>')
+    .replace(/(?<=[\p{L}\d)]) ([+=]) (?=[\p{L}\d(])/gu, "\u00a0$1 ");
+  for (let k = 0; k < segs.length; k++) {
+    const s = segs[k];
+    if (!s.math) {
+      out.push(s.lit ? esc(s.body) : words(s.body));
+      continue;
+    }
+    // Короткий хвост сразу за формулой (единица «см.», «Н,», знак препинания) не уходит на новую строку один
+    const next = segs[k + 1];
+    const m = next && !next.math && !next.lit ? /^(\s?)([^\s$]{1,4})(?=\s|$)/.exec(next.body) : null;
+    // (и окончание порядкового сразу за формулой: «$n$-й член»)
+    if (m && (/^[\p{L}]{0,3}[.,;:!?)»]*$/u.test(m[2]) || (!m[1] && /^-[а-яё]{1,3}[.,;:!?)»]*$/iu.test(m[2])))) {
+      out.push(`<span class="glue">${tex(s.body)}${m[1] ? "\u00a0" : ""}${words(m[2])}</span>`);
+      segs[k + 1] = { ...next, body: next.body.slice(m[0].length) };
+    } else out.push(tex(s.body));
+  }
+  return out.join("");
 }
 
 // Пометка справа от преобразования: «выражение | что сделали». Черту ищем только вне формул.
@@ -284,7 +309,10 @@ body{width:${PAGE_W}px;color:#fff;font:21px/1.5 'DejaVu Sans',sans-serif;-webkit
 .task{padding:0 0 14px}.task+.task{border-top:2px solid #555;padding-top:10px}
 h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .cont{font-size:17px;margin:0 0 6px}
-.b{margin:6px 0;overflow-wrap:anywhere}
+.b{margin:6px 0;overflow-wrap:anywhere}.b:has(.mfrac){margin:11px 0}
+.b.line{padding-left:.9em;text-indent:-.9em}.b.line.more{text-indent:0}.b.line,.row .main,.ans,.given>div{text-wrap:pretty}
+.glue{white-space:nowrap}.nb{white-space:nowrap}
+.glue.loose{white-space:normal}
 .lbl{font-weight:bold}
 .given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
 .given .tbl{margin:4px 0}.given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}.given .find+.find{border-top:0;margin-top:2px;padding-top:0}
@@ -324,6 +352,11 @@ export const PAGINATE = `(() => {
     const avail = t.parentElement.clientWidth;
     for (let k = 0; k < 4 && t.offsetWidth > avail + 1; k++) t.style.fontSize = Math.max(11, Math.floor(parseFloat(getComputedStyle(t).fontSize) * avail / t.offsetWidth * 0.98)) + "px";
     if (t.offsetWidth > avail + 1) t.classList.add("tight");
+    // Ячейку распирает длинная формула: разрешаем ей перенос, иначе край листа обрежет конец значения и рамку таблицы
+    if (t.offsetWidth > avail + 1) {
+      for (const f of t.querySelectorAll(".f")) f.classList.add("brk");
+      for (const fx of t.querySelectorAll(".fx")) fx.classList.add("wide");
+    }
   }
   // 1. Формула шире строки: разрешаем перенос между её кусками (перед знаком отношения), а слишком широкому куску и внутри него
   const room = (el) => {
@@ -334,9 +367,24 @@ export const PAGINATE = `(() => {
   };
   for (const f of flow.querySelectorAll(".f")) if (f.getBoundingClientRect().width > room(f) + 1) f.classList.add("brk");
   for (const fx of flow.querySelectorAll(".fx")) if (fx.getBoundingClientRect().width > room(fx) + 1) fx.classList.add("wide");
+  // Формула с приклеенным хвостом («кДж.») шире строки: хвост отпускаем на следующую строку, иначе край листа его обрежет
+  // Хвост из одного знака препинания один на строку не уходит: он остаётся при формуле, а место под него учитывается при её ужатии.
+  for (const g of flow.querySelectorAll(".glue")) if (g.getBoundingClientRect().width > room(g) + 1) {
+    const tail = [...g.childNodes].filter((t) => t.nodeType === 3);
+    if (/^[\\s\u00a0]*[.,;:!?)»]+$/.test(tail.map((t) => t.data).join(""))) {
+      const r = document.createRange();
+      r.setStartBefore(tail[0]);
+      r.setEndAfter(tail[tail.length - 1]);
+      g.dataset.tail = String(Math.ceil(r.getBoundingClientRect().width) + 1);
+      continue;
+    }
+    g.classList.add("loose");
+    for (const t of tail) t.data = t.data.replace(/\u00a0/g, " ");
+  }
   // Дробь, корень или матрицу перенести нельзя: если такой кусок шире строки, уменьшаем формулу, чтобы её не обрезало краем листа
   for (const k of flow.querySelectorAll(".katex")) {
-    const avail = room(k);
+    const kept = k.closest(".glue:not(.loose)");
+    const avail = room(k) - Number((kept && kept.dataset.tail) || 0);
     let w = 0;
     for (const b of k.querySelectorAll(".base")) w = Math.max(w, b.getBoundingClientRect().width);
     if (w > avail && avail > 0) k.style.fontSize = Math.max(0.45, Math.floor((1.08 * avail / w) * 100) / 100) + "em";
@@ -514,6 +562,7 @@ export const PAGINATE = `(() => {
         if (c.off < 0) range.setStartBefore(c.node); else range.setStart(c.node, c.off);
         range.setEndAfter(b.lastChild);
         nb.appendChild(range.extractContents());
+        if (!pre) nb.classList.add("more"); // продолжение абзаца, а не новый шаг: первая строка без выступа
         if (pre) {
           // перевод строки на стыке остался в конце первой части: в листинге он дал бы пустую строку
           const t = b.lastChild;
@@ -588,6 +637,17 @@ export const PAGINATE = `(() => {
         start = (moved.length ? moved[0].b.getBoundingClientRect().top : br.top) - top;
       }
       pages[pages.length - 1].push({ b, task, first: b === task.firstElementChild });
+    }
+  }
+  // Лист-огрызок (две-три строки и рамка ответа) не идёт отдельной картинкой, если помещается под предыдущим листом.
+  // Мерка та же, что у обычного листа (H - 60), с небольшим допуском: шапка продолжения, поля и номер листа добавляются сверх неё.
+  const edge = (p, last) => p[last ? p.length - 1 : 0].b.getBoundingClientRect();
+  for (let i = pages.length - 1; i > 0; i--) {
+    const cur = pages[i], prev = pages[i - 1];
+    if (!cur.length || !prev.length) continue;
+    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= H - 45) {
+      prev.push(...cur);
+      pages.splice(i, 1);
     }
   }
   const total = pages.filter((p) => p.length).length;

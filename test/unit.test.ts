@@ -2,13 +2,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import Anthropic from "@anthropic-ai/sdk";
-import { Busy, Fatal, activeModel, allText, answerText, claudeProblem, tasks, unavailable } from "../src/claude.ts";
+import { Busy, Fatal, activeModel, allText, answerText, claudeProblem, tasks, thinkGuess, unavailable } from "../src/claude.ts";
 import { config, hider, hookKey, logKey, lower, publicOrigin } from "../src/config.ts";
 import { Green, GreenError, permanent } from "../src/green.ts";
-import { assign, chunks, figureLabel, inline, pageHtml, taskHtml } from "../src/page.ts";
+import { assign, chunks, figureLabel, inline, pageHtml, taskHtml, tex } from "../src/page.ts";
 import { fixSvg } from "../src/svg.ts";
 import { mathSpans, plainMath, texToPlain } from "../src/tex.ts";
-import { RULE, card, compose, plainText, prettyMath, seam, splitAnswer } from "../src/text.ts";
+import { RULE, card, compose, plainText, prettyMath, seam, splitAnswer, tidy } from "../src/text.ts";
 import { base64, fingerprint, imageSize, imageType, sameSecret } from "../src/util.ts";
 
 test("степени и индексы: то, что модель написала через ^ и _, становится маленькими цифрами", () => {
@@ -211,12 +211,13 @@ test("формулы LaTeX переводятся в обычный текст �
 test("страница решения: формулы набраны, «Дано» блоком, пометки справа, ответ в рамке", () => {
   const html = taskHtml("№2\nДано:\n$AB = 6$ см\nНайти: $SO$\nРешение:\n$x^2 = 4$ | $\\cdot 2$\n|x − 1| = 3\nОтвет: $\\dfrac{4}{3}$.", []);
   assert.match(html, /<section class="task" data-title="№2"><h2 class="b">№2<\/h2>/);
-  assert.match(html, /<div class="b given"><div class="lbl">Дано:<\/div><div><span class="f"><span class="fx"><span class="katex">/);
+  // единица после формулы склеена с ней: «6 см» не разорвётся по строкам
+  assert.match(html, /<div class="b given"><div class="lbl">Дано:<\/div><div><span class="glue"><span class="f"><span class="fx"><span class="katex">.*<\/span>\u00a0см<\/span><\/div>/);
   assert.match(html, /<div class="find"><span class="lbl">Найти:<\/span> <span class="f"><span class="fx"><span class="katex">/);
   assert.match(html, /<div class="b lbl">Решение:<\/div>/);
   assert.match(html, /<div class="b row"><div class="main"><span class="f"><span class="fx"><span class="katex">.*<div class="note"><span class="f"><span class="fx"><span class="katex">/);
   assert.match(html, /<div class="b line">\|x − 1\| = 3<\/div>/); // модуль это не пометка
-  assert.match(html, /<div class="b ans"><span class="lbl">Ответ:<\/span> <span class="f"><span class="fx"><span class="katex">.*mfrac/);
+  assert.match(html, /<div class="b ans"><span class="lbl">Ответ:<\/span> <span class="glue"><span class="f"><span class="fx"><span class="katex">.*mfrac.*<\/span>\.<\/span><\/div>/);
   // цепочка равенств делится на куски по знакам верхнего уровня: на странице она переносится перед знаком, а не посреди скобки
   assert.deepEqual(chunks("S = \\dfrac{a = b}{2} = \\left(x = 1\\right) \\le 54"), ["S ", "= \\dfrac{a = b}{2} ", "= \\left(x = 1\\right) ", "\\le 54"]);
   assert.deepEqual(chunks("P(X = 2) = 0{,}3"), ["P(X = 2) ", "= 0{,}3"]); // внутри скобок не режем
@@ -231,7 +232,7 @@ test("страница решения: формулы набраны, «Дано
   assert.match(taskHtml("№1\nMn⁺⁷ + 5e⁻ → Mn⁺² | 2\nОтвет: 1", []), /<div class="main">Mn⁺⁷ \+ 5e⁻ → Mn⁺²<\/div><div class="note">2<\/div>/);
   // «Найти:» отдельной строкой: искомое не попадает в данные; решение без строки «Решение:» не попадает в блок «Дано»
   const bare = taskHtml("№3\nДано:\n$m = 1$ кг\nНайти:\n$F$ — ?\nОбоснование:\nтело точка\n$F = ma$ | закон\nОтвет: 1", []);
-  assert.match(bare, /Дано:<\/div><div><span class="f"><span class="fx">[^]*?<\/div><div class="find"><span class="lbl">Найти:<\/span> <span class="f"><span class="fx">[^]*? — \?<\/div><\/div><div class="b lbl">Обоснование:<\/div><div class="b line">тело точка<\/div><div class="b row">/);
+  assert.match(bare, /Дано:<\/div><div><span class="glue"><span class="f"><span class="fx">[^]*?<\/div><div class="find"><span class="lbl">Найти:<\/span> <span class="f"><span class="fx">[^]*? — \?<\/div><\/div><div class="b lbl">Обоснование:<\/div><div class="b line">тело точка<\/div><div class="b row">/);
   const noLabel = taskHtml("№3\nДано: $v = 2$\nНайти: $t$\nРешение.\n$t = 1$ | делим\nОтвет: 1", []);
   assert.match(noLabel, /<\/div><\/div><div class="b line">Решение\.<\/div><div class="b row">/);
   // формула с опечаткой показывается текстом, страница не ломается; разметка из текста не исполняется
@@ -478,5 +479,182 @@ test("картинка: после таймаута загрузки по ссы
     assert.ok(calls.length === 2 && calls[1].includes("sendFileByUrl"));
   } finally {
     globalThis.fetch = real;
+  }
+});
+
+test("знак процента и разряды числа в формуле не пропадают на странице; единица не отрывается от формулы", () => {
+  const text = (html: string) => html.replace(/<[^>]+>/g, "").replace(/\s+/g, "");
+  assert.equal(text(tex("12% + 3 = 15")), "12%+3=15"); // без черты перед % KaTeX счёл бы остаток комментарием
+  assert.equal(text(tex("r = 10\\%")), "r=10%"); // уже с чертой: вторая не добавляется
+  assert.equal((tex("S = 1 320 000").match(/margin-right:0\.1667em/g) ?? []).length, 2); // между разрядами стоит тонкий пробел
+  assert.equal((tex("S = 1320000").match(/margin-right:0\.1667em/g) ?? []).length, 0);
+  assert.equal(text(tex("x = 5 + 3")), "x=5+3"); // обычные пробелы в формуле по-прежнему ничего не значат
+  assert.match(inline("Итого $AC = 12$ см."), /<span class="glue"><span class="f">.*<\/span>\u00a0см\.<\/span>$/);
+  assert.ok(!inline("Здесь $x = 5$ получается при подстановке.").includes('class="glue"')); // длинное слово не приклеивается
+  assert.ok(!inline("$x = 5$ и $y = 6$").includes('class="glue"') || inline("$x = 5$ и $y = 6$").includes("\u00a0и")); // союз из одной буквы можно приклеить, формулы при этом целы
+});
+
+test("текст для тетради: строка «Ответ: сочинение, N слов» уходит в заголовок, отсылка «в решении» убирается", () => {
+  assert.equal(tidy("№27\nТекст сочинения. Второе предложение.\nОтвет: сочинение, 250 слов."), "№27 · 250 слов\nТекст сочинения. Второе предложение.");
+  assert.equal(tidy("№1\n1) CH₃–CH₃ + Cl₂ → CH₃–CH₂Cl + HCl\n2) ещё уравнение\nОтвет: уравнения 1)–2) в решении."), "№1\n1) CH₃–CH₃ + Cl₂ → CH₃–CH₂Cl + HCl\n2) ещё уравнение");
+  // обычный ответ, ответ с полезным хвостом и код остаются как есть
+  for (const p of ["№3\nx = 5\nОтвет: 5", "№9\nтекст\nОтвет: программа в решении; нужен файл 17.txt.", "№2\n```\nprint(1)\n```\nОтвет: программа в решении."]) assert.equal(tidy(p), p);
+  assert.deepEqual(compose(["№1\nРешение первого.\nОтвет: 4", "№27\nТекст сочинения. Ещё.\nОтвет: сочинение, 250 слов."], 12_000), ["✅ Ответы\n№1: 4\n№27: сочинение, 250 слов.\n——————————\n№1\nРешение первого.\nОтвет: 4\n——————————\n№27 · 250 слов\nТекст сочинения. Ещё."]);
+  assert.equal(card(["№1\n1) уравнение\nОтвет: уравнения 1)–4) в решении."]), "✅ Ответы\n№1: см. решение");
+  // длинный ответ в списке режется после целого пункта, а не посреди слова
+  const long = card([`№2\nОтвет: ${"да, действует; "}${"невесомость возникает потому что космонавт и станция свободно падают вместе с одинаковым ускорением, ".repeat(2)}конец`]);
+  assert.ok(/[а-яё]…$/.test(long) && !/[,;]…$/.test(long) && long.length < 170, long);
+});
+
+test("ответ со значением не пропадает из-за слов «в решении»: убирается только отсылка", () => {
+  // значение остаётся и в тексте, и в списке ответов
+  assert.equal(tidy("№2\nS = 3 · 4\nОтвет: 12 см² – расчёт в решении."), "№2\nS = 3 · 4\nОтвет: 12 см².");
+  assert.equal(tidy("№3\nD > 0\nОтвет: 2 корня, они найдены в решении."), "№3\nD > 0\nОтвет: 2 корня.");
+  assert.equal(tidy("№4\nподстановка\nОтвет: x = 5 (проверка в решении)"), "№4\nподстановка\nОтвет: x = 5");
+  assert.equal(card(["№1\nОтвет: 4", "№2\nS = 3 · 4\nОтвет: 12 см² – расчёт в решении."]), "✅ Ответы\n№1: 4\n№2: 12 см².");
+  assert.equal(card(["№3\nD > 0\nОтвет: 2 корня, они найдены в решении."]), "✅ Ответы\n№3: 2 корня.");
+  assert.deepEqual(compose(["№3\nD > 0\nОтвет: 2 корня, они найдены в решении."], 12_000), ["№3\nD > 0\nОтвет: 2 корня."]);
+  // чистая отсылка по-прежнему убирается из текста, а в списке стоит «см. решение»
+  assert.equal(tidy("№5\n```python\nprint(1)\n```".replace(/```/g, "'''") + "\nещё строка\nОтвет: программа в решении."), "№5\n'''python\nprint(1)\n'''\nещё строка");
+  assert.equal(card(["№5\nкод\nОтвет: программа в решении."]), "✅ Ответы\n№5: см. решение");
+});
+
+test("объём сочинения в заголовке согласован с числом: слово, слова, слов", () => {
+  const head = (n: number) => tidy(`№27\nТекст сочинения. Ещё предложение.\nОтвет: сочинение, ${n} слов.`).split("\n")[0];
+  assert.equal(head(271), "№27 · 271 слово");
+  assert.equal(head(202), "№27 · 202 слова");
+  assert.equal(head(250), "№27 · 250 слов");
+  assert.equal(head(211), "№27 · 211 слов");
+  assert.equal(head(214), "№27 · 214 слов");
+  assert.equal(head(183), "№27 · 183 слова");
+});
+
+test("403 от Claude: человеку понятная причина без сырого текста API", () => {
+  const raw = "Your organization does not have access to this resource in region X";
+  const e = Anthropic.APIError.generate(403, { type: "error", error: { type: "permission_error", message: raw } }, raw, new Headers());
+  const p = claudeProblem({ model: "claude-fable-5-2" } as any, e);
+  assert.ok(p instanceof Fatal);
+  assert.ok(!p.message.includes("organization") && !/[a-z]{6,} [a-z]{4,} [a-z]{4,}/.test(p.message), p.message);
+  assert.match(p.message, /403/);
+});
+
+test("оборванный поток: размышления оцениваются по времени молчания и не больше max_tokens", () => {
+  assert.equal(thinkGuess(0, true, 64_000), 0);
+  assert.equal(thinkGuess(60_000, false, 64_000), 3_000);
+  assert.equal(thinkGuess(60_000, true, 64_000), 6_000);
+  assert.equal(thinkGuess(780_000, true, 64_000), 64_000); // весь кусок в быстром режиме: упираемся в предел запроса
+});
+
+test("в тексте листа «4-го» не рвётся по дефису, знак между словами не начинает строку", () => {
+  assert.match(inline("среднее 4-го и 5-го членов"), /<span class="nb">4-го<\/span> и <span class="nb">5-го<\/span>/);
+  assert.ok(inline("система пуля + брусок замкнута").includes("пуля\u00a0+ брусок"));
+  assert.ok(!inline("x-ось и y-ось").includes('class="nb"'));
+  assert.ok(!inline("в 1990-х годах").includes("<span class=\"nb\">1990-х годах"));
+});
+
+test("отсылка «в решении»: значение не обрезается и не пропадает, чистая отсылка убирается", () => {
+  const list = (line: string) => card([`№1\nрешение\nещё строка\nОтвет: ${line}`]).split("\n")[1].replace("№1: ", "");
+  const kept = (line: string) => tidy(`№1\nрешение\nещё строка\nОтвет: ${line}`).split("\n").at(-1);
+  // хвост срезается, значение целое
+  for (const [line, value] of [
+    ["x = 0,5 - проверка в решении", "x = 0,5"],
+    ["А-3, Б-1, В-2 - пояснения в решении.", "А-3, Б-1, В-2."],
+    ["x = 3, x = -2 - проверка в решении.", "x = 3, x = -2."],
+    ["программа выводит 15, код в решении.", "программа выводит 15."],
+    ["решение имеет 2 корня, они в решении.", "решение имеет 2 корня."],
+    ["рисунок 2, объяснение в решении.", "рисунок 2."],
+    ["текст относится к публицистическому стилю, разбор в решении.", "текст относится к публицистическому стилю."],
+    ["таблица истинности: 3 набора дают 1, таблица в решении.", "таблица истинности: 3 набора дают 1."],
+    ["цепочка: Fe → FeCl₂ → Fe(OH)₂ — уравнения в решении.", "цепочка: Fe → FeCl₂ → Fe(OH)₂."],
+    ["А, Б, В - пояснения в решении", "А, Б, В"],
+    ["да, объяснение в решении.", "да."],
+  ]) {
+    assert.equal(list(line), value, line);
+    assert.equal(kept(line), `Ответ: ${value}`, line);
+  }
+  // чистого хвоста нет: строка остаётся как есть
+  for (const line of ["корни 1, 4 и 9 найдены в решении.", "2,5 в решении", "x₁ = 1 и x₂ = 4 найдены в решении.", "перевод: «Я люблю читать», полный перевод в решении."]) {
+    assert.equal(list(line), line, line);
+    assert.equal(kept(line), `Ответ: ${line}`, line);
+  }
+  // значения нет совсем: в списке «см. решение», из текста строка уходит
+  for (const line of ["в решении.", "см. в решении.", "все ответы в решении.", "уравнения 1)–4) в решении.", "уравнения 1)-3) в решении.", "уравнения реакций 1), 2) и 3) в решении.", "программа на Python в решении.", "доказательство в решении.", "электронный баланс и уравнение — в решении.", "структурные формулы в решении."]) {
+    assert.equal(list(line), "см. решение", line);
+    assert.equal(kept(line), "ещё строка", line);
+  }
+  // одно задание: списка ответов нет, поэтому ответ обязан остаться в тексте
+  assert.deepEqual(compose(["№1\nрешение\nещё строка\nОтвет: программа выводит 15, код в решении."], 12_000), ["№1\nрешение\nещё строка\nОтвет: программа выводит 15."]);
+});
+
+test("отсылка «в решении»: перечисление и словесный ответ остаются целыми", () => {
+  const list = (line: string) => card([`№1\nрешение\nещё строка\nОтвет: ${line}`]).split("\n")[1].replace("№1: ", "");
+  const kept = (line: string) => tidy(`№1\nрешение\nещё строка\nОтвет: ${line}`).split("\n").at(-1);
+  // последний пункт перечисления не отсылка: строка не меняется
+  for (const line of ["подлежащее, сказуемое, дополнение подчёркнуты в решении.", "А, Б, В отмечены в решении.", "Пушкин, Лермонтов в решении.", "1861–1874 гг. — реформы в решении."]) {
+    assert.equal(list(line), line, line);
+    assert.equal(kept(line), `Ответ: ${line}`, line);
+  }
+  // словесный ответ с пустой отсылкой остаётся ответом
+  for (const [line, value] of [
+    ["Наполеон (в решении)", "Наполеон"],
+    ["да (в решении)", "да"],
+    ["Пушкин — в решении.", "Пушкин."],
+    ["Куликовская битва — в решении.", "Куликовская битва."],
+    ["да, в решении.", "да."],
+    ["1812 год, причины в решении.", "1812 год."],
+    ["1861–1874 гг. — подробно в решении.", "1861–1874 гг."],
+  ]) {
+    assert.equal(list(line), value, line);
+    assert.equal(kept(line), `Ответ: ${value}`, line);
+  }
+  // два ответа в задании, второй только отсылает к решению: первый остаётся в списке
+  assert.equal(card(["№3\nпервая часть\nОтвет: да.\nвторая часть\nОтвет: в решении."]), "✅ Ответы\n№3: да.");
+  assert.equal(card(["№3\nкод\nОтвет: программа в решении."]), "✅ Ответы\n№3: см. решение");
+});
+
+test("окончание порядкового сразу за формулой приклеено к ней: «$n$-й член»", () => {
+  assert.match(inline("Получаем $n$-й член"), /<span class="glue"><span class="f">.*<\/span>-й<\/span> член$/);
+  assert.match(inline("для $k$-го, а не"), /<span class="glue">.*-го,<\/span> а не$/);
+  assert.ok(!inline("разность $a$ - $b$").includes('class="glue"'));
+});
+
+test("отсылка «в решении»: второе предложение ответа и пометка о неполноте не срезаются", () => {
+  const list = (line: string) => card([`№1\nрешение\nещё строка\nОтвет: ${line}`]).split("\n")[1].replace("№1: ", "");
+  const kept = (line: string) => tidy(`№1\nрешение\nещё строка\nОтвет: ${line}`).split("\n").at(-1);
+  // отсылка отдельным предложением: уходит только она
+  for (const [line, value] of [
+    ["да, она увеличится вдвое. Расчёт в решении.", "да, она увеличится вдвое."],
+    ["нет, граф не является деревом. Обоснование в решении.", "нет, граф не является деревом."],
+    ["да, это оксид. Уравнения в решении.", "да, это оксид."],
+    ["x = 5, см. в решении.", "x = 5."],
+  ]) {
+    assert.equal(list(line), value, line);
+    assert.equal(kept(line), `Ответ: ${value}`, line);
+  }
+  // «остальные», «все», «полный» говорят, что ответ в строке неполный: строка остаётся целой
+  for (const line of ["x = ±1, остальные корни в решении.", "А – 2, Б – 3, остальные в решении.", "мера стоимости; средство обращения, остальные функции в решении.", "x = 1, все корни в решении.", "5 см. Расчёт в решении."]) {
+    assert.equal(list(line), line, line);
+    assert.equal(kept(line), `Ответ: ${line}`, line);
+  }
+  // название документа не «код в решении»
+  assert.equal(list("Гражданский кодекс – в решении."), "Гражданский кодекс.");
+  assert.equal(list("точная формулировка – в решении."), "точная формулировка.");
+  assert.equal(list("код – в решении."), "см. решение");
+});
+
+test("отсылка «в решении»: знак вопроса остаётся, сокращение с точкой не конец предложения", () => {
+  const list = (line: string) => card([`№1\nрешение\nещё строка\nОтвет: ${line}`]).split("\n")[1].replace("№1: ", "");
+  const kept = (line: string) => tidy(`№1\nрешение\nещё строка\nОтвет: ${line}`).split("\n").at(-1);
+  for (const [line, value] of [
+    ["Where does he live? Перевод в решении.", "Where does he live?"],
+    ["Hello! Перевод в решении.", "Hello!"],
+    ["Как дела? Перевод в решении.", "Как дела?"],
+  ]) {
+    assert.equal(list(line), value, line);
+    assert.equal(kept(line), `Ответ: ${value}`, line);
+  }
+  for (const line of ["нет, т. к. он не проводит ток в решении.", "нет, т. к. это показано в решении.", "5, т. е. это видно в решении.", "в 1861 г. Подробно в решении."]) {
+    assert.equal(list(line), line, line);
+    assert.equal(kept(line), `Ответ: ${line}`, line);
   }
 });
