@@ -105,7 +105,8 @@ export function inline(text: string): string {
     // Короткий хвост сразу за формулой (единица «см.», «Н,», знак препинания) не уходит на новую строку один
     const next = segs[k + 1];
     const m = next && !next.math && !next.lit ? /^(\s?)([^\s$]{1,4})(?=\s|$)/.exec(next.body) : null;
-    if (m && /^[\p{L}]{0,3}[.,;:!?)»]*$/u.test(m[2])) {
+    // (и окончание порядкового сразу за формулой: «$n$-й член»)
+    if (m && (/^[\p{L}]{0,3}[.,;:!?)»]*$/u.test(m[2]) || (!m[1] && /^-[а-яё]{1,3}[.,;:!?)»]*$/iu.test(m[2])))) {
       out.push(`<span class="glue">${tex(s.body)}${m[1] ? "\u00a0" : ""}${words(m[2])}</span>`);
       segs[k + 1] = { ...next, body: next.body.slice(m[0].length) };
     } else out.push(tex(s.body));
@@ -351,6 +352,11 @@ export const PAGINATE = `(() => {
     const avail = t.parentElement.clientWidth;
     for (let k = 0; k < 4 && t.offsetWidth > avail + 1; k++) t.style.fontSize = Math.max(11, Math.floor(parseFloat(getComputedStyle(t).fontSize) * avail / t.offsetWidth * 0.98)) + "px";
     if (t.offsetWidth > avail + 1) t.classList.add("tight");
+    // Ячейку распирает длинная формула: разрешаем ей перенос, иначе край листа обрежет конец значения и рамку таблицы
+    if (t.offsetWidth > avail + 1) {
+      for (const f of t.querySelectorAll(".f")) f.classList.add("brk");
+      for (const fx of t.querySelectorAll(".fx")) fx.classList.add("wide");
+    }
   }
   // 1. Формула шире строки: разрешаем перенос между её кусками (перед знаком отношения), а слишком широкому куску и внутри него
   const room = (el) => {

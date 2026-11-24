@@ -268,3 +268,19 @@ test("смешанные решения: после присоединения �
   }
   assert.deepEqual(tall, []);
 });
+
+test("длинная формула в ячейке таблицы переносится: таблица не выходит за край листа", { skip }, async () => {
+  const { css, fonts } = real();
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  const sum = Array.from({ length: 20 }, (_, i) => 11 + i).join("+");
+  await page.setContent(pageHtml([`№1\n| n | Сумма |\n| --- | --- |\n| $1$ | $${sum}$ |\n| $2$ | $5$ |\nОтвет: $410$`], [], fonts, css));
+  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(PAGINATE);
+  const r = await page.evaluate(() => {
+    const t = document.querySelector(".tbl") as HTMLElement, sheet = (t.closest(".sheet") as HTMLElement).getBoundingClientRect();
+    return { right: Math.round(t.getBoundingClientRect().right), edge: Math.round(sheet.right), text: (t as HTMLElement).innerText.replace(/\s+/g, "") };
+  });
+  await page.close();
+  assert.ok(r.right <= r.edge - 10, JSON.stringify(r));
+  assert.ok(r.text.includes("29+30"), JSON.stringify(r));
+});

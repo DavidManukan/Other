@@ -283,7 +283,10 @@ function value(x: string): [number, string] | null {
 function same(a: string, b: string): boolean {
   if (a === b) return true;
   const [short, long] = a.length <= b.length ? [a, b] : [b, a];
-  if (short && long.startsWith(short) && !/\d/.test(long.slice(short.length))) return true; // тот же ответ, у одного дописана единица
+  // Тот же ответ, у одного дописана единица («4» и «4 см») или пояснение после знака («да» и «да, действует»).
+  // Дописанная буква или индекс это уже другой ответ: «CO» и «CO₂», «А» и «АБ», «см» и «см²».
+  const more = long.slice(short.length);
+  if (short && long.startsWith(short) && !/[\d¹²³⁰-⁹₀-₉]/.test(more) && (/\d$/.test(short) || /^[,;:(]/.test(more))) return true;
   const x = value(a), y = value(b);
   return !!x && !!y && Math.abs(x[0] - y[0]) < 1e-9 && (!x[1] || !y[1] || x[1] === y[1]);
 }
@@ -299,18 +302,35 @@ function fresh(text: string, body: string): string[] {
 //    Слово стоит до первого задания: одно на строке («Дополнено.»), с заметкой после знака («ДОПОЛНЕНО: рисунок сил»)
 //    или с заголовком задания на той же строке («ДОПОЛНЕНО №2»). Обычная фраза «Дополнено ли решение…» меткой не считается.
 const ADDED_BARE = /^[\s*]*дополнено[\s.:!*]*$/i;
-const ADDED_NOTE = /^[\s*]*ДОПОЛНЕНО[\s*]*[:—–-]/;
+const ADDED_NOTE = /^[\s*]*дополнено[\s*]*[:;,(—–-]/i;
 const ADDED_HEAD = /^[\s*]*ДОПОЛНЕНО[\s.:!*]+(?=\S)/;
+const marked = (r: string) => ADDED_BARE.test(r) || ADDED_NOTE.test(r);
+const headed = (r: string) => ADDED_HEAD.test(r) && TASK.test(r.replace(ADDED_HEAD, ""));
+const AGREE = /^[\s*]*вс[её]\s+верно[\s.!*]*$/i; // отдельная строка согласия
 function added(text: string): string | null {
   const rows = text.split("\n");
-  const at = rows.findIndex((r) => ADDED_BARE.test(r) || ADDED_NOTE.test(r) || (ADDED_HEAD.test(r) && TASK.test(r.replace(ADDED_HEAD, ""))));
+  const at = rows.findIndex((r) => marked(r) || headed(r));
   if (at < 0 || rows.slice(0, at).some((r) => TASK.test(r))) return null;
-  const left = ADDED_BARE.test(rows[at]) || ADDED_NOTE.test(rows[at]) ? "" : rows[at].replace(ADDED_HEAD, "");
-  // строка согласия («ВСЁ ВЕРНО») в текст задания не идёт
-  return [...(left ? [left] : []), ...rows.slice(at + 1)].filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim();
+  // строка согласия («ВСЁ ВЕРНО») в текст задания не идёт; строки решения («Проверка: … всё верно.») остаются
+  return unmark(rows.slice(at).filter((r) => !AGREE.test(r)).join("\n")).trim();
 }
-// Хвост после пересчёта кодом, который ничего не меняет: в нём нет своего ответа, слов об ошибке, отказа дополнять и строки «ВСЁ ВЕРНО»
-const neutral = (tail: string) => !/Ответ:/.test(tail) && !/ошибк|неверн|не\s+так|исправ|нечего|не\s+требуется|не\s+нужн|не\s+надо/i.test(tail) && !tail.split("\n").some((l) => /^[\s*]*вс[её]\s+верно[\s.!*]*$/i.test(l));
+// Слово «ДОПОЛНЕНО» в начале каждого задания исправления человеку не нужно: убираем его, заголовок на той же строке оставляем
+const unmark = (text: string) => text.split(/^([ \t]*@@@.*)$/m).map((piece, k) => {
+  if (k % 2) return piece; // сама строка @@@
+  const rows = piece.split("\n");
+  const at = rows.findIndex((r) => r.trim());
+  if (at < 0) return piece;
+  if (marked(rows[at])) rows.splice(at, 1);
+  else if (headed(rows[at])) rows[at] = rows[at].replace(ADDED_HEAD, "");
+  return rows.join("\n");
+}).join("");
+// Хвост после пересчёта кодом, который ничего не меняет: в нём нет своего ответа, слов об ошибке, отказа дополнять и строки «ВСЁ ВЕРНО».
+// «Ошибки нет», «неверных значений нет» это подтверждение, а не ошибка: такие обороты сначала убираем.
+const NO_ERR = /(?:ошиб(?:ок|ки|ка)|неверн\S*(?:\s+\S+)?|расхождени\S*)\s+нет|нет\s+(?:ни\s+)?(?:ошиб\S*|неверн\S*|расхождени\S*)|не\s+(?:найден\S*|обнаружен\S*|выявлен\S*)\s+(?:ни\s+)?(?:ошиб\S*|неверн\S*)|без\s+ошиб\S*/gi;
+const neutral = (tail: string) => {
+  const t = tail.replace(NO_ERR, "");
+  return !/Ответ:/.test(t) && !/ошибк|ошибо|неверн|не\s+так|нечего|не\s+требуется|не\s+надо|дополнять\s+не\s+нужн/i.test(t) && !t.split("\n").some((l) => AGREE.test(l));
+};
 export function judgeReply(a: Pick<Answer, "text" | "tail" | "all" | "cut" | "refused">, body = ""): { ok: true } | { fix: string } | null {
   if (a.cut || a.refused) return null;
   const last = (a.tail ?? a.text).trim();
@@ -318,13 +338,13 @@ export function judgeReply(a: Pick<Answer, "text" | "tail" | "all" | "cut" | "re
   // Если в хвосте сказано об ошибке или о том, что дополнять нечего, основной текст уже не итог: решает обычный разбор ниже.
   const more = added(last) ?? (last !== a.text.trim() && neutral(last) ? added(a.text.trim()) : null);
   if (more !== null && whole(more)) return { fix: more };
-  const pure = last.split("\n").some((l) => /^[\s*]*вс[её]\s+верно[\s.!*]*$/i.test(l)); // отдельная строка «ВСЁ ВЕРНО»
+  const pure = last.split("\n").some((l) => AGREE.test(l)); // отдельная строка «ВСЁ ВЕРНО»
   if (!pure && whole(last) && fresh(last, body).length) {
-    return { fix: last.split("\n").filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim() };
+    return { fix: unmark(last.split("\n").filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n")).trim() };
   }
   if (agrees(last)) return body && fresh(a.all ?? a.text, body).length ? null : { ok: true };
   if (body && whole(last) && !fresh(last, body).length) return { ok: true };
-  return !pure && whole(a.text) && fresh(a.text, body).length ? { fix: a.text } : null;
+  return !pure && whole(a.text) && fresh(a.text, body).length ? { fix: unmark(a.text).trim() } : null;
 }
 
 // Один ход модели. Пересчёт в песочнице идёт на стороне Anthropic; если он затянулся, ход приходит
