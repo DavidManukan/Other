@@ -5,7 +5,8 @@ import katex from "katex";
 import "katex/contrib/mhchem"; // химическая запись \ce{…}, если модель всё же напишет формулу так
 import { fixSvg } from "./svg.ts";
 import { mathSpans, stripTex, texToPlain } from "./tex.ts";
-import { answerAt, HEAD as TASK_HEAD, prettyMath, sheetContext } from "./text.ts";
+import { answerAt, figureLabel, HEAD as TASK_HEAD, prettyMath, sheetContext, tableAt } from "./text.ts";
+export { figureLabel };
 import { esc } from "./util.ts";
 
 export const PAGE_W = 560; // ширина страницы в точках CSS
@@ -111,11 +112,6 @@ const row = (line: string): string => {
   return a ? `<div class="b row"><div class="main">${inline(a[0])}</div><div class="note">${inline(a[1])}</div></div>` : `<div class="b line">${inline(line)}</div>`;
 };
 
-// Номер задачи, для которой сделан рисунок: первая подпись в левом верхнем углу («№3», «Вариант 2 · №1»)
-export function figureLabel(svg: string): string {
-  const m = /<text\b[^>]*>([\s\S]*?)<\/text>/i.exec(svg);
-  return (m?.[1] ?? "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-}
 const key = (s: string) => s.toLowerCase().replace(/[\s.:]/g, "");
 
 // own: рисунок стоит в своём задании, номер в его углу повторять незачем
@@ -167,6 +163,13 @@ function taskBody(part: string, figs: Fig[]): string {
       const code: string[] = [];
       for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
       out.push(`<pre class="b">${esc(code.join("\n"))}</pre>`);
+      continue;
+    }
+    const tb = tableAt(lines, i);
+    if (tb) { // таблица: настоящая, с линиями; формулы в ячейках набраны
+      const tr = (r: string[], tag: string) => `<tr>${r.map((c) => `<${tag}>${inline(c)}</${tag}>`).join("")}</tr>`;
+      out.push(`<div class="b"><table class="tbl">${tr(tb.rows[0], "th")}${tb.rows.slice(1).map((r) => tr(r, "td")).join("")}</table></div>`);
+      i = tb.end;
       continue;
     }
     const m = LABEL.exec(line.trim());
@@ -269,9 +272,10 @@ h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .lbl{font-weight:bold}
 .given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
 .given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}
-.row{display:flex;gap:12px;align-items:center}
-.row .main{flex:1 1 auto;min-width:0}
-.row .note{flex:0 1 auto;max-width:44%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
+.row{display:flex;gap:14px;align-items:center}
+.row .main{flex:0 1 auto;min-width:0}
+.row .note{flex:0 0 auto;max-width:44%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
+.tbl{border-collapse:collapse;font-size:18px;line-height:1.35}.tbl th,.tbl td{border:1.5px solid #fff;padding:4px 9px;text-align:left;vertical-align:top}.tbl th{font-weight:bold}
 .ans{margin:12px 0 4px;padding:8px 12px;border:2px solid #fff;border-radius:8px}
 pre{font:17px/1.4 'DejaVu Sans Mono','Liberation Mono',monospace;border:1px solid #666;padding:10px 12px;border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}
 pre.go{border-bottom:0;border-radius:6px 6px 0 0;padding-bottom:0;margin-bottom:0}pre.on{border-top:0;border-radius:0 0 6px 6px;padding-top:0;margin-top:0}pre.go.on{border-radius:0}
@@ -295,9 +299,14 @@ export function pageHtml(parts: string[], svgs: string[], fonts: string, css: st
 export const PAGINATE = `(() => {
   const H = ${PAGE_H};
   const flow = document.getElementById("flow");
+  // 0. Таблица шире листа: уменьшаем её шрифт, пока не поместится (иначе правый край обрежется)
+  for (const t of flow.querySelectorAll(".tbl")) {
+    const avail = t.parentElement.clientWidth;
+    for (let k = 0; k < 4 && t.offsetWidth > avail + 1; k++) t.style.fontSize = Math.max(9, Math.floor(parseFloat(getComputedStyle(t).fontSize) * avail / t.offsetWidth * 0.98)) + "px";
+  }
   // 1. Формула шире строки: разрешаем перенос между её кусками (перед знаком отношения), а слишком широкому куску и внутри него
   const room = (el) => {
-    const box = el.closest(".main, .note, .ans, .given, .b");
+    const box = el.closest("td, th, .main, .note, .ans, .given, .b");
     if (!box) return 0;
     const cs = getComputedStyle(box);
     return box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
@@ -311,13 +320,8 @@ export const PAGINATE = `(() => {
     for (const b of k.querySelectorAll(".base")) w = Math.max(w, b.getBoundingClientRect().width);
     if (w > avail && avail > 0) k.style.fontSize = Math.max(0.45, Math.floor((1.08 * avail / w) * 100) / 100) + "em";
   }
-  // 2. Пометки справа в одном задании стоят одной колонкой: черта на одной вертикали
-  for (const task of flow.querySelectorAll(".task")) {
-    const notes = [...task.querySelectorAll(".row > .note")];
-    if (notes.length < 2) continue;
-    const w = Math.ceil(Math.max(...notes.map((n) => n.getBoundingClientRect().width)));
-    for (const n of notes) n.style.flex = "0 0 " + w + "px";
-  }
+  // 2. Пометка «| ·4» стоит сразу за своим преобразованием (так её пишут в тетради), а не колонкой у правого края:
+  //    это делает сама вёрстка строки (.row), здесь выравнивать нечего
   // 3. Подписи на рисунке. Буква, которая легла на линию или на соседнюю подпись, сдвигается на ближайшее свободное место.
   for (const svg of flow.querySelectorAll(".fig svg")) {
    try { // рисунок с вырожденным преобразованием (scale(0)) оставляем как есть: ошибка здесь стоила бы всех страниц ответа

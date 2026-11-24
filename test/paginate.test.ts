@@ -105,3 +105,33 @@ test("листинг с одной очень длинной строкой то
   const body = r.text.replace(/Информатика · №5 \(продолжение\)/g, "").replace(/\d+ \/ \d+/g, "");
   assert.ok(body.replace(/\s+/g, "").includes(data.replace(/\s+/g, "")), "числа из листинга потерялись");
 });
+
+test("пометка «| ·4» стоит сразу за своим преобразованием, а не у правого края листа", { skip }, async () => {
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  await page.setContent(pageHtml(["№1\n$x^2 = 9$ | $\\cdot 4$\n$4x^2 = 36$ | делим на 4\n$\\dfrac{x}{x-2} - \\dfrac{7}{x+2} = \\dfrac{8}{(x-2)(x+2)}$ | $\\cdot (x-2)(x+2)$\nОтвет: $3$"], [], "", ""));
+  await page.evaluate(PAGINATE);
+  const rows = await page.evaluate(() => [...document.querySelectorAll(".row")].map((r) => {
+    const main = (r.querySelector(".main") as HTMLElement).getBoundingClientRect(), note = (r.querySelector(".note") as HTMLElement).getBoundingClientRect(), all = r.getBoundingClientRect();
+    return { gap: Math.round(note.left - main.right), free: Math.round(all.right - note.right), inside: note.right <= all.right + 1 };
+  }));
+  await page.close();
+  assert.equal(rows.length, 3);
+  for (const r of rows) assert.ok(r.gap >= 8 && r.gap <= 20 && r.inside, JSON.stringify(rows));
+  assert.ok(rows[0].free > 150, JSON.stringify(rows)); // у короткой формулы пометка рядом с ней: справа остаётся пустое место
+});
+
+test("таблица шире листа ужимается и не выходит за его край", { skip }, async () => {
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  const head = "| " + Array.from({ length: 9 }, (_, i) => `Столбец ${i + 1}`).join(" | ") + " |";
+  const rule = "| " + Array.from({ length: 9 }, () => "---").join(" | ") + " |";
+  const row = "| " + Array.from({ length: 9 }, (_, i) => `$\\dfrac{${i + 1}}{7}$`).join(" | ") + " |";
+  await page.setContent(pageHtml([`№1\n${head}\n${rule}\n${row}\n${row}\nОтвет: 1`], [], "", ""));
+  await page.evaluate(PAGINATE);
+  const box = await page.evaluate(() => {
+    const t = (document.querySelector(".tbl") as HTMLElement).getBoundingClientRect(), s = (document.querySelector(".sheet") as HTMLElement).getBoundingClientRect();
+    return { right: Math.round(t.right), sheet: Math.round(s.right), cells: document.querySelectorAll(".tbl td, .tbl th").length };
+  });
+  await page.close();
+  assert.equal(box.cells, 27);
+  assert.ok(box.right <= box.sheet, JSON.stringify(box));
+});

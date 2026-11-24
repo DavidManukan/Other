@@ -60,9 +60,99 @@ export function splitAnswer(raw: string): { text: string; svgs: string[] } {
   return { text, svgs };
 }
 
-// Текст с формулами LaTeX -> текст для WhatsApp: формулы знаками Юникода, код программ как есть
+// Первая строка ответа служебная: «ВИД: страница» или «ВИД: текст». Модель видит предмет и решает, чем отправить ответ;
+// читателю строка не показывается. Вне блоков кода убираем все такие строки, считается первая.
+export type Look = "page" | "text";
+export function lookOf(raw: string): { look: Look | null; text: string } {
+  let look: Look | null = null;
+  const text = raw.split(/(```[\s\S]*?```)/).map((piece, i) => (i % 2 ? piece : piece.replace(/^[ \t]*ВИД:[ \t]*([\p{L}-]+)[ \t.]*(?:\n|$)/gmu, (m, w: string) => {
+    const kind: Look | null = /^страниц/i.test(w) ? "page" : /^текст(ом|овый|овая)?$/i.test(w) ? "text" : null;
+    if (!kind) return m;
+    look ??= kind;
+    return "";
+  }))).join("");
+  return { look, text: look ? text.replace(/^\s*\n/, "") : raw };
+}
+export const lookLine = (look: Look | null | undefined): string => (look ? `ВИД: ${look === "page" ? "страница" : "текст"}\n` : "");
+
+// ---------- таблицы ----------
+// Таблицу модель пишет строками «| a | b |» с чертой «|---|---|» под шапкой. В тексте она уходит моноширинным блоком
+// с выровненными столбцами (ровнять пробелами модель не умеет, это делает код), на странице рисуется настоящей таблицей.
+// Строка таблицы -> ячейки. Черта внутри формулы $…$ (модуль) ячейки не делит. null: это не строка таблицы
+export function cells(line: string): string[] | null {
+  const t = line.trim();
+  if (t.length < 3 || !t.startsWith("|") || !t.endsWith("|")) return null;
+  const out: string[] = [];
+  let cur = "", math = false;
+  for (let i = 1; i < t.length - 1; i++) {
+    const ch = t[i];
+    if (ch === "\\" && i + 1 < t.length - 1) cur += t[++i] === "|" && !math ? "|" : ch + t[i];
+    else if (ch === "|" && !math) (out.push(cur.trim()), (cur = ""));
+    else {
+      if (ch === "$") math = !math;
+      cur += ch;
+    }
+  }
+  out.push(cur.trim());
+  return math || out.length < 2 ? null : out;
+}
+const ruleRow = (c: string[]) => c.every((x) => /^:?-{2,}:?$/.test(x));
+// Таблица, которая начинается в строке i: шапка, черта, хотя бы одна строка. Черта обязательна:
+// по ней таблицу не спутать с двумя строками вида «|x| = |y|»
+export function tableAt(lines: string[], i: number): { rows: string[][]; end: number } | null {
+  const head = cells(lines[i] ?? ""), rule = cells(lines[i + 1] ?? "");
+  if (!head || !rule || ruleRow(head) || !ruleRow(rule)) return null;
+  const rows = [head];
+  let end = i + 1;
+  for (let k = i + 2; k < lines.length; k++) {
+    const row = cells(lines[k]);
+    if (!row) break;
+    if (!ruleRow(row)) rows.push(row);
+    end = k;
+  }
+  if (rows.length < 2) return null;
+  const n = Math.max(...rows.map((r) => r.length));
+  return { rows: rows.map((r) => Array.from({ length: n }, (_, j) => r[j] ?? "")), end };
+}
+export const TABLE_W = 30; // столько знаков моноширинного шрифта помещается в строку сообщения на телефоне
+const wide = (s: string) => [...s].length;
+// Таблица для сообщения. Узкая: блок с ровными столбцами. Широкая строка в блоке перенеслась бы и столбцы рассыпались бы,
+// поэтому широкая таблица идёт строками через черту, без выравнивания.
+export function textTable(rows: string[][]): string {
+  const w = rows[0].map((_, j) => Math.max(...rows.map((r) => wide(r[j]))));
+  if (w.reduce((a, b) => a + b, 0) + 3 * (w.length - 1) > TABLE_W || rows.some((r) => r.some((c) => c.includes("`")))) {
+    return [rows[0].join(" | "), "—".repeat(8), ...rows.slice(1).map((r) => r.join(" | "))].join("\n");
+  }
+  const line = (r: string[]) => r.map((c, j) => c + " ".repeat(w[j] - wide(c))).join(" | ").trimEnd();
+  return ["```", line(rows[0]), w.map((x) => "-".repeat(x)).join("-+-"), ...rows.slice(1).map(line), "```"].join("\n");
+}
+
+// Текст с формулами LaTeX -> текст для WhatsApp: формулы знаками Юникода, код программ как есть, таблицы блоком
 export function plainText(text: string): string {
-  return text.split(/(```[\s\S]*?```)/).map((piece, i) => (i % 2 ? piece : prettyMath(stripTex(plainMath(piece))))).join("");
+  const plain = (t: string) => prettyMath(stripTex(plainMath(t)));
+  return text.split(/(```[\s\S]*?```)/).map((piece, i) => {
+    if (i % 2) return piece;
+    if (!/^[ \t]*\|.*\|[ \t]*$/m.test(piece)) return plain(piece);
+    const lines = piece.split("\n");
+    const out: string[] = [];
+    let buf: string[] = [];
+    const flush = () => {
+      if (buf.length) out.push(plain(buf.join("\n")));
+      buf = [];
+    };
+    for (let k = 0; k < lines.length; k++) {
+      const t = tableAt(lines, k);
+      if (!t) {
+        buf.push(lines[k]);
+        continue;
+      }
+      flush();
+      out.push(textTable(t.rows.map((r) => r.map((c) => plain(c).replace(/\s+/g, " ").trim()))));
+      k = t.end;
+    }
+    flush();
+    return out.join("\n");
+  }).join("");
 }
 
 export const RULE = "——————————"; // черта между заданиями: длинное тире есть в любом шрифте
@@ -89,6 +179,46 @@ export function answerAt(rows: string[], i: number): { value: string; last: numb
     last = k;
   }
   return { value, last };
+}
+
+// Задание из одного заголовка и строки ответа (тест, краткий ответ): в списке ответов оно видно целиком,
+// отдельным блоком его не повторяем. Длинный ответ список обрезал бы, поэтому такое задание кратким не считается.
+export function brief(part: string): boolean {
+  if (part.includes("```")) return false;
+  const rows = part.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (rows.length < 2 || rows.length > 4 || !HEAD.test(rows[0]) || rows[0].replace(/[:.]+$/, "").length > 40 || !/^Ответ:/.test(rows[1])) return false;
+  const a = answerAt(rows, 1);
+  return a.last === rows.length - 1 && a.value.length > 0 && a.value.length <= 140;
+}
+
+// Заголовок задания в виде ключа: по нему исправленное задание встаёт на место прежнего, а рисунок находит своё задание
+export const headKey = (s: string): string => s.toLowerCase().replace(/^\s*исправляю\s*/, "").replace(/[\s.:]/g, "");
+export function headOf(part: string): string {
+  const top = part.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 3);
+  return headKey(top.find((l) => HEAD.test(l) && l.length <= 60) ?? "");
+}
+// Номер задачи, для которой сделан рисунок: первая подпись в левом верхнем углу («№3», «Вариант 2 · №1»)
+export function figureLabel(svg: string): string {
+  const m = /<text\b[^>]*>([\s\S]*?)<\/text>/i.exec(svg);
+  return (m?.[1] ?? "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+}
+
+// Вторая проверка нашла ошибку, и основная модель переписала эти задания: ставим их на место прежних.
+// Задание с тем же заголовком заменяется; единственное задание заменяется и без совпадения заголовка;
+// задание, которого в ответе не было (пропущенное), добавляется в конец. Рисунок с тем же номером заменяет старый.
+export function mergeFix(parts: string[], svgs: string[], fix: { parts: string[]; svgs: string[] }): { parts: string[]; svgs: string[]; changed: string[] } {
+  const out = [...parts];
+  const changed: string[] = [];
+  for (const p of fix.parts) {
+    const k = headOf(p);
+    let at = k ? out.findIndex((x) => headOf(x) === k) : -1;
+    if (at < 0 && out.length === 1 && fix.parts.length === 1) at = 0;
+    if (at >= 0) out[at] = p;
+    else out.push(p);
+    changed.push(p.split("\n")[0].trim().slice(0, 40));
+  }
+  const fresh = new Set(fix.svgs.map((s) => headKey(figureLabel(s))).filter(Boolean));
+  return { parts: out, svgs: [...svgs.filter((s) => !fresh.has(headKey(figureLabel(s)))), ...fix.svgs], changed };
 }
 
 // Короткий список ответов: в начале сообщения или подписью к первой странице. На маленьком экране видно прежде всего его.
@@ -150,7 +280,8 @@ function pieces(block: string, max: number): string[] {
 // title: свой заголовок списка ответов («Исправление…»); с ним список стоит сверху, даже если задание одно.
 export function compose(parts: string[], max: number, title?: string): string[] {
   if (!parts.length) return [];
-  const blocks = parts.length > 1 || title ? [card(parts, title), ...parts] : [...parts];
+  // краткие задания (тест) целиком видны в списке ответов: отдельными блоками их не повторяем
+  const blocks = parts.length > 1 || title ? [card(parts, title), ...parts.filter((p) => !brief(p))] : [...parts];
   const whole = blocks.join(`\n${RULE}\n`);
   if (whole.length <= max) return [whole];
   const out: string[] = [];
