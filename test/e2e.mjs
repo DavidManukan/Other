@@ -403,6 +403,7 @@ try {
   await Promise.all([photo("992", "S_ALB альбом992", "AL1"), photo("992", "вторая из альбома", "AL2", `http://127.0.0.1:${MOCK}/photo2.jpg`)]);
   ok(await until(() => answers("992").length === 1, 30_000), "альбом: ответ пришёл", JSON.stringify(texts("992")));
   ok(reqs("альбом992").length === 1 && imgs(reqs("альбом992")[0].messages.at(-1)) === 2 && lastText(reqs("альбом992")[0]).includes("определи по содержанию"), "альбом из двух фото: один запрос к Claude с обоими фото", String(reqs("альбом992").length));
+  ok(texts("992").filter((t) => ACK.test(t)).join("|") === "📥 Принял фото, решаю.|➕ Всего 2 фото, решаю одним ответом.", "альбом: одно «принял» и одно сообщение о числе фото, без «добавил» на каждое", JSON.stringify(texts("992")));
 
   // --- фото приходит, когда модель думает уже дольше минуты: решение не выбрасывается, фото становится следующей работой ---
   await photo("993", "S_SLOWB окно993", "W1");
@@ -643,6 +644,16 @@ try {
   await text("986", "стоп");
   ok(await until(() => texts("986").includes("Остановил ✅")), "стоп: подтверждение");
   ok(await quiet("986", 6000) && solved("986").length === 0 && reqs("S_STOPCHK").filter(isJudge).length === 0, "стоп во время второй проверки: ответа нет, основная модель не спрошена", JSON.stringify(texts("986").map((t) => t.slice(0, 40))));
+  // 6а. «сброс» во время проверки: оплаченный ответ доходит, но без проверки, и об этом сказано; основная модель не спрошена
+  await photo("995", "S_RSTMEM S_CHKSLOW");
+  ok(await until(() => reqs("S_RSTMEM").filter(isCheck).length === 1, 30_000), "сброс: проверка началась");
+  await text("995", "сброс");
+  ok(await until(() => texts("995").includes("Память чата очищена ✅")), "сброс во время проверки: подтверждение");
+  ok(await until(() => texts("995").includes(UNCHECKED), 30_000) && solved("995").length === 1 && solved("995")[0].includes("№2: 5"), "сброс во время проверки: ответ пришёл, сказано, что без проверки", JSON.stringify(texts("995").map((t) => t.slice(0, 40))));
+  ok(reqs("S_RSTMEM").filter(isJudge).length === 0 && reqs("S_RSTMEM").filter(isSolve).length === 1, "сброс во время проверки: лишних запросов нет");
+  const br = claude.length;
+  await text("995", "что было раньше");
+  ok(await until(() => claude.length > br) && claude[br].messages.length === 1, "после сброса ответ проверявшейся работы в память не попал", String(claude[br]?.messages.length));
   // 7. проверяющий сам решает со строкой «Ответ:» и пишет вердикт после пересчёта; основная модель согласна другими словами
   await photo("987", "S_CHKNOTE");
   ok(await until(() => solved("987").length === 1, 30_000) && solved("987")[0].includes("№2: 5"), "вердикт после заметок и согласие своими словами: ответ прежний", JSON.stringify(texts("987")));
@@ -724,6 +735,17 @@ try {
   await sleep(800);
   await text("975", "ping");
   ok(await until(() => texts("975").filter((t) => t.startsWith("pong")).length === 2) && texts("975").at(-1).includes("вторая проверка вкл"), "доступ открыт: чужой чат снова получает ответ, ping показывает общую проверку", JSON.stringify(texts("975").slice(-1)));
+  // --- воркер перезапустился посреди второй проверки: готовое решение не теряется и заново не заказывается ---
+  await photo("994", "S_RST S_CHKSLOW");
+  ok(await until(() => reqs("S_RST").filter(isCheck).length === 1, 30_000), "перезапуск посреди проверки: проверка началась");
+  await sleep(500);
+  process.kill(-dev.pid, "SIGKILL");
+  await sleep(1500);
+  dev = startDev({ OWNER: "111" });
+  ok(await ready(), "перезапуск посреди проверки: воркер поднялся");
+  ok(await until(() => solved("994").length === 1, 60_000) && solved("994")[0].includes("№2: 7"), "перезапуск посреди проверки: пришёл один ответ, уже исправленный", JSON.stringify(texts("994").map((t) => t.slice(0, 40))));
+  await sleep(1500);
+  ok(reqs("S_RST").filter(isSolve).length === 1 && reqs("S_RST").filter(isCheck).length === 2 && texts("994").filter((t) => t === CHECKING).length === 1 && solved("994").length === 1, "решение не заказано заново, проверка повторена, «перепроверяю» сказано один раз", JSON.stringify([reqs("S_RST").filter(isSolve).length, reqs("S_RST").filter(isCheck).length, texts("994").map((t) => t.slice(0, 20))]));
   await text("111", "проверка выкл");
   ok(await until(() => texts("111").filter((t) => t === "Вторая проверка выключена ✅ Во всех чатах.").length === 2), "вторая проверка выключена для всех чатов");
 

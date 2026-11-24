@@ -206,19 +206,36 @@ export function figureLabel(svg: string): string {
 // Вторая проверка нашла ошибку, и основная модель переписала эти задания: ставим их на место прежних.
 // Задание с тем же заголовком заменяется; единственное задание заменяется и без совпадения заголовка;
 // задание, которого в ответе не было (пропущенное), добавляется в конец. Рисунок с тем же номером заменяет старый.
-export function mergeFix(parts: string[], svgs: string[], fix: { parts: string[]; svgs: string[] }): { parts: string[]; svgs: string[]; changed: string[] } {
+// Заголовок сверяется сначала точно, потом по хвосту («№3» и «Вариант 1 · №3»), потом по числам («Задание 2» и «№2»).
+// lost: исправления, для которых подходит несколько заданий или у которых нет заголовка. Ставить их наугад нельзя:
+// рядом с исправленным осталось бы ошибочное решение.
+const numbers = (k: string) => (k.match(/\d+/g) ?? []).join(".");
+export function mergeFix(parts: string[], svgs: string[], fix: { parts: string[]; svgs: string[] }): { parts: string[]; svgs: string[]; changed: string[]; lost: string[] } {
   const out = [...parts];
-  const changed: string[] = [];
+  const keys = out.map(headOf);
+  const taken = new Set<number>();
+  const changed: string[] = [], lost: string[] = [];
   for (const p of fix.parts) {
     const k = headOf(p);
-    let at = k ? out.findIndex((x) => headOf(x) === k) : -1;
-    if (at < 0 && out.length === 1 && fix.parts.length === 1) at = 0;
+    const name = (p.split("\n").map((l) => l.trim()).find(Boolean) ?? "").slice(0, 40);
+    const among = (ok: (h: string) => boolean) => keys.flatMap((h, i) => (h && !taken.has(i) && ok(h) ? [i] : []));
+    let hit = k ? among((h) => h === k) : [];
+    if (!hit.length && k) hit = among((h) => h.endsWith(k) || k.endsWith(h));
+    if (!hit.length && numbers(k)) hit = among((h) => numbers(h) === numbers(k));
+    let at = hit.length === 1 ? hit[0] : -1;
+    if (at < 0 && out.length === 1 && fix.parts.length === 1) at = 0; // задание одно: заменяется и без совпадения заголовка
+    if (at < 0 && (hit.length > 1 || !k)) {
+      lost.push(name);
+      continue;
+    }
     if (at >= 0) out[at] = p;
-    else out.push(p);
-    changed.push(p.split("\n")[0].trim().slice(0, 40));
+    else at = out.push(p) - 1; // задания с таким номером в ответе не было: оно было пропущено
+    keys[at] = k;
+    taken.add(at);
+    changed.push(name);
   }
   const fresh = new Set(fix.svgs.map((s) => headKey(figureLabel(s))).filter(Boolean));
-  return { parts: out, svgs: [...svgs.filter((s) => !fresh.has(headKey(figureLabel(s)))), ...fix.svgs], changed };
+  return { parts: out, svgs: [...svgs.filter((s) => !fresh.has(headKey(figureLabel(s)))), ...fix.svgs], changed, lost };
 }
 
 // Короткий список ответов: в начале сообщения или подписью к первой странице. На маленьком экране видно прежде всего его.

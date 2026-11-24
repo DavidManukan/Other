@@ -144,6 +144,7 @@ interface Job {
   tries: number; // попытки текущего куска
   effort: Effort;
   acc: string; // начало ответа из прошлых кусков (если ответ обрезало и он продолжается)
+  told?: number; // о скольких фото этой работы человеку уже сказано
   asked?: number; // когда начался первый запрос к Claude по этой работе: в первую минуту новое фото ещё добавляется к ней
   past?: number; // отметка памяти чата, из которой в запросы этой работы взята прошлая работа (0: не взята)
   look?: Look; // чем отправить ответ, по мнению модели: страницами или текстом
@@ -333,12 +334,17 @@ export class Chat extends DurableObject<Env> {
       // если идёт серия, следующее фото придёт в том же темпе, и решать лучше один раз всё сразу.
       const { key, job, live } = open;
       const gap = (shot.at - (job.shots.at(-1)?.at ?? shot.at)) * this.k;
+      const started = !!job.asked; // решение уже шло: его придётся начать заново
       job.shots.push(shot);
-      this.rewind(job, Math.min(ADD_MAX, Math.max(ADD_MIN, gap * 1.5)));
+      // Работа ещё не начата (несколько фото отправлены разом): ждём недолго. Уже решалась: ждём дольше, каждый перезапуск стоит денег.
+      this.rewind(job, Math.min(ADD_MAX, Math.max(started ? ADD_MIN : FIRST_WAIT, gap * 1.5)));
+      if (started) job.told = job.shots.length;
       await this.db.put({ ...mark, [key]: job });
       if (live) this.stop?.abort(new Added("добавлено фото"));
       await this.db.setAlarm(job.after!);
-      return await this.say(chatId, `➕ Добавил к прошлому: теперь ${count(job.shots)}. Решение пришлю одним ответом.`);
+      // о фото, которые пришли до начала решения, скажем одним сообщением, когда оно начнётся
+      if (started) await this.say(chatId, `➕ Добавил к прошлому: теперь ${count(job.shots)}. Решение пришлю одним ответом.`);
+      return;
     }
     const busy = await this.enqueue({ kind: "image", id: shot.id, shots: [shot] }, mark, FIRST_WAIT);
     const what = shot.pdf ? "файл" : "фото";
@@ -705,6 +711,12 @@ export class Chat extends DurableObject<Env> {
       }
       const content = await this.question(key, job, chatId);
       if (!content) return;
+      // несколько фото пришли до начала решения: одно сообщение о том, сколько их взято в работу
+      if (job.kind === "image" && job.shots.length > 1 && job.told !== job.shots.length && !job.acc && !capped) {
+        job.told = job.shots.length;
+        await save();
+        await this.say(chatId, `➕ Всего ${count(job.shots)}, решаю одним ответом.`);
+      }
 
       let a: Answer;
       let full: string;
@@ -783,6 +795,7 @@ export class Chat extends DurableObject<Env> {
       job.packed = false;
       job.done = { cut: a.cut, refused: a.refused, empty: !job.parts.length, ...(capped ? { capped: capText } : {}) };
       job.acc = "";
+      job.tries = 0; // попытки считались для запроса к Claude: готовый ответ, который ждёт проверку или шлюз, из-за них сниматься не должен
       await save();
     }
 
@@ -1204,6 +1217,8 @@ export class Chat extends DurableObject<Env> {
     const chk = job.check!;
     for (;;) {
       if (stop.aborted) throw stop.reason;
+      // «сброс» пришёл, пока шла проверка: память и фото очищены, проверять уже не по чему
+      if (!job.turn) return await failed("память чата очищена");
       const gate = await this.gate(true);
       // доступ закрыли, пока шла работа чужого чата: на её проверку деньги хозяина больше не тратим, уже оплаченный ответ уходит как есть
       if (gate.closed && !this.mine(chatId, gate)) return await close("skip", "доступ закрыт: вторая проверка чужого чата снята");
@@ -1254,6 +1269,8 @@ export class Chat extends DurableObject<Env> {
         if ("fix" in r) {
           const fixed = splitAnswer(lookOf(r.fix).text);
           const merged = mergeFix(job.parts ?? [], job.svgs, { parts: tasks(fixed.text), svgs: [...new Set(fixed.svgs)] });
+          // непонятно, какое задание заменять: вставить исправление рядом с ошибочным решением хуже, чем спросить ещё раз
+          if (merged.lost.length) throw new Busy(`исправление не удалось поставить на место: ${merged.lost.join(", ")}`);
           if (merged.changed.length) {
             job.parts = merged.parts;
             job.svgs = merged.svgs.slice(0, MAX_DRAWINGS);
