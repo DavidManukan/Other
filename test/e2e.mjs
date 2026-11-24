@@ -394,7 +394,7 @@ try {
   ok(await until(() => answers("991").length >= 5, 20_000), "ответ на вопрос пришёл");
   // без служебной строки решает содержание: дроби и корни идут страницей, обычный текст сообщением
   await photo("991", "S_TEX без строки вида");
-  ok(await until(() => pics("991").length === 3 && /^reshenie-/.test(pics("991")[2].fileName), 30_000), "без строки вида: решение с дробями ушло страницей", JSON.stringify(of("991").slice(-3).map((c) => c.method + ":" + (c.text ?? c.fileName))));
+  ok(await until(() => pics("991").length === 4 && pics("991").slice(2).every((c) => /^reshenie-/.test(c.fileName)), 30_000), "без строки вида: решение с дробями ушло страницами", JSON.stringify(of("991").slice(-3).map((c) => c.method + ":" + (c.text ?? c.fileName))));
   const plainBefore = answers("991").length;
   await photo("991", "S_PLAIN обычный");
   ok(await until(() => answers("991").length > plainBefore && answers("991").at(-1).startsWith("✅ Ответы\n№1: 4 см²"), 30_000), "без строки вида: решение без формул ушло текстом", JSON.stringify(answers("991").slice(-1)));
@@ -410,15 +410,16 @@ try {
   await sleep(2500);
   await photo("993", "S_WAIT позже993", "W2", `http://127.0.0.1:${MOCK}/photo2.jpg`);
   ok(await until(() => texts("993").includes("📥 Принял фото, решу сразу после текущего."), 5000) && !texts("993").some((t) => t.startsWith("➕")), "фото через минуту после начала: следующая работа", JSON.stringify(texts("993")));
-  ok(await until(() => answers("993").length === 2, 40_000), "окно добавления: оба ответа пришли", JSON.stringify(texts("993")));
+  const got = () => texts("993").filter((t) => t.includes("Ответ: 42")).length; // «ещё решаю» ответом не считаем
+  ok(await until(() => got() === 2, 40_000), "окно добавления: оба ответа пришли", JSON.stringify(texts("993")));
   const late = reqs("позже993").at(-1);
   ok(claude.filter((b) => lastText(b).includes("окно993")).length === 1 && late.messages.length === 3 && imgs(late.messages.at(-1)) === 1, "первое решение не заказано заново; вторая работа видит прошлую", String(late?.messages.length));
   // работа по фото видит только прошлую работу, и только свежую; вопрос текстом видит весь разговор
   await photo("993", "S_WAIT третья993", "W3");
-  ok(await until(() => answers("993").length === 3, 30_000) && reqs("третья993")[0].messages.length === 3, "третья работа видит только вторую, а не весь разговор", String(reqs("третья993")[0]?.messages.length));
+  ok(await until(() => got() === 3, 30_000) && reqs("третья993")[0].messages.length === 3, "третья работа видит только вторую, а не весь разговор", String(reqs("третья993")[0]?.messages.length));
   await sleep(11_000); // десять минут (время в тестах ускорено)
   await photo("993", "S_WAIT поздняя993", "W4");
-  ok(await until(() => answers("993").length === 4, 30_000) && reqs("поздняя993")[0].messages.length === 1, "через десять минут работа по фото прошлую уже не видит", String(reqs("поздняя993")[0]?.messages.length));
+  ok(await until(() => got() === 4, 30_000) && reqs("поздняя993")[0].messages.length === 1, "через десять минут работа по фото прошлую уже не видит", String(reqs("поздняя993")[0]?.messages.length));
   const bh = claude.length;
   await text("993", "объясни первое");
   ok(await until(() => claude.length > bh) && claude[bh].messages.length === 9, "вопрос текстом видит весь разговор", String(claude[bh]?.messages.length));
@@ -616,7 +617,7 @@ try {
   const bm = claude.length;
   await text("982", "объясни №2");
   ok(await until(() => claude.length > bm) && claude[bm].messages[1].content.includes("Ответ: $7$") && !claude[bm].messages[1].content.includes("Ответ: 5"), "в памяти чата лежит исправленный ответ", JSON.stringify(claude[bm]?.messages[1]).slice(0, 300));
-  ok(await until(() => texts("982").length === 5, 20_000), "ответ на вопрос пришёл");
+  ok(await until(() => texts("982").length === 4, 20_000), "ответ на вопрос пришёл", JSON.stringify(texts("982").map((t) => t.slice(0, 30))));
   page = await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text();
   ok(page.includes("вторая проверка нашла ошибку, ответ исправлен до отправки: №2"), "исправление до отправки видно в журнале", page.split("Последние события")[1]?.slice(0, 500));
   // 3. ложная тревога: основная модель перепроверила и осталась при своём, ответ прежний

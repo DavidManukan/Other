@@ -839,12 +839,14 @@ export class Chat extends DurableObject<Env> {
     const { look } = await this.options();
     const full = parts.filter((p) => !brief(p)); // краткие задания целиком видны в списке ответов: на страницы их не ставим
     const solved = parts.some((p) => /^Ответ:/m.test(p)) || job.svgs.length > 0;
-    const formulas = full.some((p) => /\$[^$\n]+\$/.test(p));
-    // разговор без формул и служебный ответ («Не разобрал фото. Пересними ближе.») страницей не становятся никогда
-    const fit = solved && full.length > 0 && (formulas || job.svgs.length > 0 || full.some(tabled));
-    const want = look === "pages" ? job.kind !== "text" || formulas || job.svgs.length > 0 : look === "auto" && (job.look ? job.look === "page" : full.some(heavy));
+    // на странице есть что набирать: формулы, рисунок или таблица
+    const rich = full.some((p) => /\$[^$\n]+\$/.test(p)) || job.svgs.length > 0 || full.some(tabled);
+    // Служебный ответ («Не разобрал фото. Пересними ближе.») и тест из одних кратких ответов страницей не становятся никогда.
+    // «картинкой»: страницей идёт любое решение по фото, а ответ на вопрос текстом только если в нём есть что набирать.
+    // «авто»: страницу называет модель (без её строки решает содержание), и только когда на ней есть что набирать.
+    const page = solved && full.length > 0 && (look === "pages" ? job.kind !== "text" || rich : look === "auto" && rich && (job.look ? job.look === "page" : full.some(heavy)));
     let shots: Uint8Array[] | null = null;
-    if (want && fit && job.shot < 2 && (this.env.BROWSER || this.env.SHOT) && Date.now() >= ((await this.db.get<number>("nobrowser")) ?? 0)) {
+    if (page && job.shot < 2 && (this.env.BROWSER || this.env.SHOT) && Date.now() >= ((await this.db.get<number>("nobrowser")) ?? 0)) {
       job.shot++; // попытка засчитывается заранее: если снимок уронит объект, во второй раз не пробуем
       await save();
       const began = Date.now();
