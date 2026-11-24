@@ -19,7 +19,8 @@ export function subscripts(text: string, sub: (d: string) => string): string {
 
 // Признаки задания про электронную таблицу: слово «ячейка», формула «=A1*B2», ссылка со знаком $ ($A$1, C$3).
 // В таком задании C2 и A1 это ячейки, а не углерод с индексом: индексы там не ставим.
-const SHEET = /ячейк|[Ээ]лектронн\S* таблиц|Excel|(?<![^\s"'«(`])=\$?[A-Z]{1,3}\$?\d|\$[A-Z]{1,3}\$\d|[A-Z]{1,3}\$\d/;
+// То же в шахматной задаче: a1 и h8 это клетки доски, а не члены последовательности.
+const SHEET = /ячейк|[Ээ]лектронн\S* таблиц|Excel|[Шш]ахмат|[Лл]ад(?:ья|ьи|ью|ье|ей|ьей|ьям|ьями|ьях)(?![а-яё])|[Фф]ерз[ьяюеёи]|(?<![^\s"'«(`])=\$?[A-Z]{1,3}\$?\d|\$[A-Z]{1,3}\$\d|[A-Z]{1,3}\$\d/;
 export const sheetContext = (text: string): boolean => SHEET.test(text);
 // sheet: текст из задания про электронную таблицу (по умолчанию определяется по самому тексту)
 export function prettyMath(text: string, sheet = sheetContext(text)): string {
@@ -133,7 +134,7 @@ export function tableAt(lines: string[], i: number): { rows: string[][]; end: nu
 }
 export const TABLE_W = 30; // столько знаков моноширинного шрифта помещается в строку сообщения на телефоне
 // Ширина в знакоместах: комбинируемые знаки (черта над AB, стрелка вектора) места не занимают, эмодзи и иероглифы занимают два
-const wide = (s: string) => [...s.normalize("NFC")].reduce((n, ch) => n + (/\p{M}|[\u200B-\u200D\u2060\uFE0F]/u.test(ch) ? 0 : /\p{Extended_Pictographic}|[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFF00-\uFF60]/u.test(ch) ? 2 : 1), 0);
+const wide = (s: string) => [...s.normalize("NFC")].reduce((n, ch) => n + (/\p{M}|[\u200B-\u200D\u2060\uFE0F]/u.test(ch) ? 0 : /\p{Emoji_Presentation}|[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFF00-\uFF60]/u.test(ch) ? 2 : 1), 0);
 // Таблица для сообщения. Узкая: блок с ровными столбцами. Широкая строка в блоке перенеслась бы и столбцы рассыпались бы,
 // поэтому широкая таблица идёт строками через черту, без выравнивания.
 export function textTable(rows: string[][]): string {
@@ -182,7 +183,8 @@ export function plainText(text: string): string {
 }
 
 export const RULE = "——————————"; // черта между заданиями: длинное тире есть в любом шрифте
-export const HEAD = /^\s*(([^·\n]{1,30}·\s*){0,2}(№|Задание|Задача)|Исправляю|Вариант\s)/; // «№3», «Вариант 1 · №3», «Физика · №1»
+// «№3», «Вариант 1 · №3», «Физика · №1»; номер с буквой без знака № («A1», «В2.») тоже заголовок, если стоит в строке один
+export const HEAD = /^\s*(([^·\n]{1,30}·\s*){0,2}(№|Задание|Задача)|Исправляю|Вариант\s|[A-ZА-ЯЁ]\d{1,2}[.)]?\s*$)/;
 // (граница слова \b кириллицу не понимает, поэтому конец слова проверяем сами)
 const OTHER = /^(Ответ|Дано|Найти|Доказать|Решение|Доказательство|Обоснование|Проверка|ОДЗ|Если|Не видно|Прочитал|Прочитано|Правило)(?![\p{L}\p{N}])|^\d+\)|^[а-я]\)|^```|^@@@/u;
 
@@ -240,7 +242,7 @@ export function figureLabel(svg: string): string {
 function taskId(part: string): { num: string; variant: string; subject: string } | null {
   const top = part.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 3);
   const line = (top.find((l) => HEAD.test(l) && l.length <= 60) ?? "").toLowerCase().replace(/^исправляю\s*/, "");
-  const num = /(?:№\s*|задани[ея]\s+|задач[аи]\s+)([\p{L}\p{N}]+(?:\.\p{N}+)*)/u.exec(line)?.[1];
+  const num = /(?:№\s*|задани[ея]\s+|задач[аи]\s+)([\p{L}\p{N}]+(?:\.\p{N}+)*)/u.exec(line)?.[1] ?? /^([a-zа-яё]\d{1,2})[.)]?$/.exec(line)?.[1];
   if (!num) return null;
   const segs = line.split("·").map((x) => x.trim());
   const subject = segs.length > 1 && !/^вариант/.test(segs[0]) && !/^(№|задани|задач)/.test(segs[0]) ? segs[0] : "";

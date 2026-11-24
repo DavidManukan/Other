@@ -91,10 +91,10 @@ const BIG = new Set(["lim", "sum", "prod", "int", "max", "min", "sup", "inf"]);
 const KNOWN = new Set<string>([...Object.keys(SYM), ...WRAP, ...TWO, ...THREE, ...GONE, ...FUNCS, ...DROP, ...STRUCT]);
 
 const map = (s: string, m: Record<string, string>) => [...s].every((c) => c in m) ? [...s].map((c) => m[c]).join("") : null;
-const simple = (s: string) => /^[\p{L}\p{N}.,°′√∞π⁰¹²³⁴-⁹₀-₉ₐₑₒₓₙₘₖₜᵢⱼⁿ]*$/u.test(s) || /^\([^()]*\)$/.test(s) || /^√\([^()]*\)$/.test(s) || /^\p{L}+\([^()]*\)$/u.test(s);
+const simple = (s: string) => /^[\p{L}\p{N}.,°′√∞π⁰¹²³⁴-⁹₀-₉ₐₑₒₓₙₘₖₜᵢⱼⁿ]*$/u.test(s) || /^\([^()]*\)(?:[⁰¹²³⁴-⁹ⁿ]+|\^\d+|\^\{[^{}]*\})?$/.test(s) || /^√\([^()]*\)$/.test(s) || /^\p{L}+\([^()]*\)$/u.test(s);
 const paren = (s: string) => (simple(s) ? s : `(${s})`);
 // Знаменатель без скобок только если это одно число, одна буква или имя отрезка: a/2a читалось бы неверно
-const below = (s: string) => (/^(\d+(,\d+)?|\p{Lu}+[₀-₉]*|\p{L}[⁰¹²³⁴-⁹₀-₉ₐₑₒₓₙₘₖₜᵢⱼⁿ]*|d\p{Ll}|\p{L}+\([^()]*\)|√\d+|π)$/u.test(s) || /^\([^()]*\)$/.test(s) ? s : `(${s})`);
+const below = (s: string) => (/^(\d+(,\d+)?|\p{Lu}+[₀-₉]*|\p{L}[⁰¹²³⁴-⁹₀-₉ₐₑₒₓₙₘₖₜᵢⱼⁿ]*|d\p{Ll}|\p{L}+\([^()]*\)|√\d+|π)$/u.test(s) || /^\([^()]*\)(?:[⁰¹²³⁴-⁹ⁿ]+|\^\d+|\^\{[^{}]*\})?$/.test(s) ? s : `(${s})`); // «(R+h)²» уже в своих скобках
 // После дроби сразу идёт множитель (буква, число, скобка, корень, степень): без скобок «1/2x» читалось бы как деление на 2x
 const NOT_FACTOR = new Set(["in", "notin", "ni", "subset", "subseteq", "cup", "cap", "setminus", "to", "mid", "vert", "land", "wedge", "lor", "vee", "neg", "lnot", "right", "end", "quad", "qquad"]);
 function factorNext(rest: string): boolean {
