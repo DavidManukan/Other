@@ -296,22 +296,28 @@ function fresh(text: string, body: string): string[] {
 
 // 5. Ответ прежний, но в решении не хватало обязательного элемента (рисунка, обоснования): модель пишет строку «ДОПОЛНЕНО»
 //    и задание целиком. Это тоже исправление, хотя новых ответов в нём нет.
-//    Слово стоит до первого задания. После него бывает заметка («ДОПОЛНЕНО: рисунок сил») или сразу заголовок («ДОПОЛНЕНО №2»).
-//    (граница слова \b кириллицу не понимает, поэтому конец слова проверяем сами)
-const ADDED = /^[\s*]*ДОПОЛНЕНО(?![а-яё])/i;
+//    Слово стоит до первого задания: одно на строке («Дополнено.»), с заметкой после знака («ДОПОЛНЕНО: рисунок сил»)
+//    или с заголовком задания на той же строке («ДОПОЛНЕНО №2»). Обычная фраза «Дополнено ли решение…» меткой не считается.
+const ADDED_BARE = /^[\s*]*дополнено[\s.:!*]*$/i;
+const ADDED_NOTE = /^[\s*]*ДОПОЛНЕНО[\s*]*[:—–-]/;
+const ADDED_HEAD = /^[\s*]*ДОПОЛНЕНО[\s.:!*]+(?=\S)/;
 function added(text: string): string | null {
   const rows = text.split("\n");
-  const at = rows.findIndex((r) => ADDED.test(r));
+  const at = rows.findIndex((r) => ADDED_BARE.test(r) || ADDED_NOTE.test(r) || (ADDED_HEAD.test(r) && TASK.test(r.replace(ADDED_HEAD, ""))));
   if (at < 0 || rows.slice(0, at).some((r) => TASK.test(r))) return null;
-  const left = rows[at].replace(/^[\s*]*ДОПОЛНЕНО[\s.:!*—–-]*/i, "");
-  return [...(TASK.test(left) ? [left] : []), ...rows.slice(at + 1)].join("\n").trim();
+  const left = ADDED_BARE.test(rows[at]) || ADDED_NOTE.test(rows[at]) ? "" : rows[at].replace(ADDED_HEAD, "");
+  // строка согласия («ВСЁ ВЕРНО») в текст задания не идёт
+  return [...(left ? [left] : []), ...rows.slice(at + 1)].filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim();
 }
+// Хвост после пересчёта кодом, который ничего не меняет: в нём нет своего ответа, слов об ошибке, отказа дополнять и строки «ВСЁ ВЕРНО»
+const neutral = (tail: string) => !/Ответ:/.test(tail) && !/ошибк|неверн|не\s+так|исправ|нечего|не\s+требуется|не\s+нужн|не\s+надо/i.test(tail) && !tail.split("\n").some((l) => /^[\s*]*вс[её]\s+верно[\s.!*]*$/i.test(l));
 export function judgeReply(a: Pick<Answer, "text" | "tail" | "all" | "cut" | "refused">, body = ""): { ok: true } | { fix: string } | null {
   if (a.cut || a.refused) return null;
   const last = (a.tail ?? a.text).trim();
-  // После слова «ДОПОЛНЕНО» и задания модель могла ещё раз пересчитать кодом: тогда в хвосте только заметка, а задание в основном тексте
-  const more = added(last) ?? added(a.text.trim());
-  if (more !== null) return whole(more) ? { fix: more } : null;
+  // После слова «ДОПОЛНЕНО» и задания модель могла ещё раз пересчитать кодом: тогда в хвосте только заметка, а задание в основном тексте.
+  // Если в хвосте сказано об ошибке или о том, что дополнять нечего, основной текст уже не итог: решает обычный разбор ниже.
+  const more = added(last) ?? (last !== a.text.trim() && neutral(last) ? added(a.text.trim()) : null);
+  if (more !== null && whole(more)) return { fix: more };
   const pure = last.split("\n").some((l) => /^[\s*]*вс[её]\s+верно[\s.!*]*$/i.test(l)); // отдельная строка «ВСЁ ВЕРНО»
   if (!pure && whole(last) && fresh(last, body).length) {
     return { fix: last.split("\n").filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim() };

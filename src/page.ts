@@ -362,13 +362,23 @@ export const PAGINATE = `(() => {
   for (const f of flow.querySelectorAll(".f")) if (f.getBoundingClientRect().width > room(f) + 1) f.classList.add("brk");
   for (const fx of flow.querySelectorAll(".fx")) if (fx.getBoundingClientRect().width > room(fx) + 1) fx.classList.add("wide");
   // Формула с приклеенным хвостом («кДж.») шире строки: хвост отпускаем на следующую строку, иначе край листа его обрежет
+  // Хвост из одного знака препинания один на строку не уходит: он остаётся при формуле, а место под него учитывается при её ужатии.
   for (const g of flow.querySelectorAll(".glue")) if (g.getBoundingClientRect().width > room(g) + 1) {
+    const tail = [...g.childNodes].filter((t) => t.nodeType === 3);
+    if (/^[\\s\u00a0]*[.,;:!?)»]+$/.test(tail.map((t) => t.data).join(""))) {
+      const r = document.createRange();
+      r.setStartBefore(tail[0]);
+      r.setEndAfter(tail[tail.length - 1]);
+      g.dataset.tail = String(Math.ceil(r.getBoundingClientRect().width) + 1);
+      continue;
+    }
     g.classList.add("loose");
-    for (const t of g.childNodes) if (t.nodeType === 3) t.data = t.data.replace(/\u00a0/g, " ");
+    for (const t of tail) t.data = t.data.replace(/\u00a0/g, " ");
   }
   // Дробь, корень или матрицу перенести нельзя: если такой кусок шире строки, уменьшаем формулу, чтобы её не обрезало краем листа
   for (const k of flow.querySelectorAll(".katex")) {
-    const avail = room(k);
+    const kept = k.closest(".glue:not(.loose)");
+    const avail = room(k) - Number((kept && kept.dataset.tail) || 0);
     let w = 0;
     for (const b of k.querySelectorAll(".base")) w = Math.max(w, b.getBoundingClientRect().width);
     if (w > avail && avail > 0) k.style.fontSize = Math.max(0.45, Math.floor((1.08 * avail / w) * 100) / 100) + "em";
@@ -623,12 +633,13 @@ export const PAGINATE = `(() => {
       pages[pages.length - 1].push({ b, task, first: b === task.firstElementChild });
     }
   }
-  // Лист-огрызок (две-три строки и рамка ответа) не идёт отдельной картинкой, если помещается под предыдущим листом
+  // Лист-огрызок (две-три строки и рамка ответа) не идёт отдельной картинкой, если помещается под предыдущим листом.
+  // Мерка та же, что у обычного листа (H - 60), с небольшим допуском: шапка продолжения, поля и номер листа добавляются сверх неё.
   const edge = (p, last) => p[last ? p.length - 1 : 0].b.getBoundingClientRect();
   for (let i = pages.length - 1; i > 0; i--) {
     const cur = pages[i], prev = pages[i - 1];
     if (!cur.length || !prev.length) continue;
-    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= H + 15) {
+    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= H - 45) {
       prev.push(...cur);
       pages.splice(i, 1);
     }
