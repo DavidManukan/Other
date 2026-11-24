@@ -322,10 +322,13 @@ export function card(parts: string[], title = "✅ Ответы"): string {
     // несколько ответов идут через «;», точка в конце каждого перед ним не нужна
     let answer = answers.length > 1 ? answers.map((a, k) => (k < answers.length - 1 ? a.replace(/[.;]+$/, "") : a)).join("; ") : answers[0]
       ?? (rows.some((l) => /^Не видно:/.test(l)) ? "не видно условия, пересними ближе" : rows.some((l) => /решено выше/i.test(l)) ? "решено выше" : "см. решение");
+    // «уравнения 1)–4) в решении.» в списке ничего не говорит: читатель и так знает, где решение
+    if (/в решении\.?$/i.test(answer) && !/[;,]/.test(answer)) answer = "см. решение";
     if (answer.length > 140) {
+      // режем по смыслу: после целого пункта, иначе после запятой, и только потом по слову
       const cut = answer.slice(0, 139);
-      const at = Math.max(cut.lastIndexOf("; "), cut.lastIndexOf(" "));
-      answer = (at > 70 ? cut.slice(0, at) : cut) + "…";
+      const at = [cut.lastIndexOf("; "), cut.lastIndexOf(", "), cut.lastIndexOf(" ")].find((i) => i > 70) ?? -1;
+      answer = (at > 0 ? cut.slice(0, at) : cut).replace(/[;,]$/, "") + "…";
     }
     return `${head}: ${answer}`;
   });
@@ -359,10 +362,30 @@ function pieces(block: string, max: number): string[] {
 // Собирает ответ в одно сообщение: сверху список ответов, ниже решения по порядку.
 // Если всё не помещается в max знаков, делит на несколько сообщений по границам заданий.
 // title: свой заголовок списка ответов («Исправление…»); с ним список стоит сверху, даже если задание одно.
+// Текст, который переписывают в тетрадь: служебная строка ответа в нём мешает.
+// «Ответ: сочинение, 250 слов.» уходит в заголовок («№27 · 250 слов»), «Ответ: уравнения 1)–4) в решении.» убирается совсем.
+export function tidy(part: string): string {
+  const rows = part.split("\n");
+  const at = rows.findLastIndex((r) => /^\s*Ответ:/.test(r));
+  if (at < 0 || rows.slice(at + 1).some((r) => r.trim()) || part.includes("```")) return part;
+  const line = rows[at].trim();
+  const size = /^Ответ:\s*(?:сочинение|эссе|письмо|изложение)[^\d\n]{0,20}(\d+)\s*слов[оа]?\.?$/i.exec(line);
+  if (!size && !/^Ответ:[^;\n]*в решении\.?$/i.test(line)) return part;
+  const rest = rows.slice(0, at);
+  while (rest.length && !rest[rest.length - 1].trim()) rest.pop();
+  if (rest.filter((r) => r.trim()).length < 2) return part; // кроме заголовка ничего нет: строку оставляем
+  if (size) {
+    const head = rest.findIndex((r) => HEAD.test(r) && r.trim().length <= 60);
+    if (head >= 0) rest[head] = `${rest[head].trimEnd()} · ${size[1]} слов`;
+    else rest.push(`(${size[1]} слов)`);
+  }
+  return rest.join("\n");
+}
+
 export function compose(parts: string[], max: number, title?: string): string[] {
   if (!parts.length) return [];
   // краткие задания (тест) целиком видны в списке ответов: отдельными блоками их не повторяем
-  const blocks = parts.length > 1 || title ? [card(parts, title), ...parts.filter((p) => !brief(p))] : [...parts];
+  const blocks = parts.length > 1 || title ? [card(parts, title), ...parts.filter((p) => !brief(p)).map(tidy)] : parts.map(tidy);
   const whole = blocks.join(`\n${RULE}\n`);
   if (whole.length <= max) return [whole];
   const out: string[] = [];

@@ -5,10 +5,10 @@ import Anthropic from "@anthropic-ai/sdk";
 import { Busy, Fatal, activeModel, allText, answerText, claudeProblem, tasks, unavailable } from "../src/claude.ts";
 import { config, hider, hookKey, logKey, lower, publicOrigin } from "../src/config.ts";
 import { Green, GreenError, permanent } from "../src/green.ts";
-import { assign, chunks, figureLabel, inline, pageHtml, taskHtml } from "../src/page.ts";
+import { assign, chunks, figureLabel, inline, pageHtml, taskHtml, tex } from "../src/page.ts";
 import { fixSvg } from "../src/svg.ts";
 import { mathSpans, plainMath, texToPlain } from "../src/tex.ts";
-import { RULE, card, compose, plainText, prettyMath, seam, splitAnswer } from "../src/text.ts";
+import { RULE, card, compose, plainText, prettyMath, seam, splitAnswer, tidy } from "../src/text.ts";
 import { base64, fingerprint, imageSize, imageType, sameSecret } from "../src/util.ts";
 
 test("степени и индексы: то, что модель написала через ^ и _, становится маленькими цифрами", () => {
@@ -211,12 +211,13 @@ test("формулы LaTeX переводятся в обычный текст �
 test("страница решения: формулы набраны, «Дано» блоком, пометки справа, ответ в рамке", () => {
   const html = taskHtml("№2\nДано:\n$AB = 6$ см\nНайти: $SO$\nРешение:\n$x^2 = 4$ | $\\cdot 2$\n|x − 1| = 3\nОтвет: $\\dfrac{4}{3}$.", []);
   assert.match(html, /<section class="task" data-title="№2"><h2 class="b">№2<\/h2>/);
-  assert.match(html, /<div class="b given"><div class="lbl">Дано:<\/div><div><span class="f"><span class="fx"><span class="katex">/);
+  // единица после формулы склеена с ней: «6 см» не разорвётся по строкам
+  assert.match(html, /<div class="b given"><div class="lbl">Дано:<\/div><div><span class="glue"><span class="f"><span class="fx"><span class="katex">.*<\/span>\u00a0см<\/span><\/div>/);
   assert.match(html, /<div class="find"><span class="lbl">Найти:<\/span> <span class="f"><span class="fx"><span class="katex">/);
   assert.match(html, /<div class="b lbl">Решение:<\/div>/);
   assert.match(html, /<div class="b row"><div class="main"><span class="f"><span class="fx"><span class="katex">.*<div class="note"><span class="f"><span class="fx"><span class="katex">/);
   assert.match(html, /<div class="b line">\|x − 1\| = 3<\/div>/); // модуль это не пометка
-  assert.match(html, /<div class="b ans"><span class="lbl">Ответ:<\/span> <span class="f"><span class="fx"><span class="katex">.*mfrac/);
+  assert.match(html, /<div class="b ans"><span class="lbl">Ответ:<\/span> <span class="glue"><span class="f"><span class="fx"><span class="katex">.*mfrac.*<\/span>\.<\/span><\/div>/);
   // цепочка равенств делится на куски по знакам верхнего уровня: на странице она переносится перед знаком, а не посреди скобки
   assert.deepEqual(chunks("S = \\dfrac{a = b}{2} = \\left(x = 1\\right) \\le 54"), ["S ", "= \\dfrac{a = b}{2} ", "= \\left(x = 1\\right) ", "\\le 54"]);
   assert.deepEqual(chunks("P(X = 2) = 0{,}3"), ["P(X = 2) ", "= 0{,}3"]); // внутри скобок не режем
@@ -231,7 +232,7 @@ test("страница решения: формулы набраны, «Дано
   assert.match(taskHtml("№1\nMn⁺⁷ + 5e⁻ → Mn⁺² | 2\nОтвет: 1", []), /<div class="main">Mn⁺⁷ \+ 5e⁻ → Mn⁺²<\/div><div class="note">2<\/div>/);
   // «Найти:» отдельной строкой: искомое не попадает в данные; решение без строки «Решение:» не попадает в блок «Дано»
   const bare = taskHtml("№3\nДано:\n$m = 1$ кг\nНайти:\n$F$ — ?\nОбоснование:\nтело точка\n$F = ma$ | закон\nОтвет: 1", []);
-  assert.match(bare, /Дано:<\/div><div><span class="f"><span class="fx">[^]*?<\/div><div class="find"><span class="lbl">Найти:<\/span> <span class="f"><span class="fx">[^]*? — \?<\/div><\/div><div class="b lbl">Обоснование:<\/div><div class="b line">тело точка<\/div><div class="b row">/);
+  assert.match(bare, /Дано:<\/div><div><span class="glue"><span class="f"><span class="fx">[^]*?<\/div><div class="find"><span class="lbl">Найти:<\/span> <span class="f"><span class="fx">[^]*? — \?<\/div><\/div><div class="b lbl">Обоснование:<\/div><div class="b line">тело точка<\/div><div class="b row">/);
   const noLabel = taskHtml("№3\nДано: $v = 2$\nНайти: $t$\nРешение.\n$t = 1$ | делим\nОтвет: 1", []);
   assert.match(noLabel, /<\/div><\/div><div class="b line">Решение\.<\/div><div class="b row">/);
   // формула с опечаткой показывается текстом, страница не ломается; разметка из текста не исполняется
@@ -479,4 +480,28 @@ test("картинка: после таймаута загрузки по ссы
   } finally {
     globalThis.fetch = real;
   }
+});
+
+test("знак процента и разряды числа в формуле не пропадают на странице; единица не отрывается от формулы", () => {
+  const text = (html: string) => html.replace(/<[^>]+>/g, "").replace(/\s+/g, "");
+  assert.equal(text(tex("12% + 3 = 15")), "12%+3=15"); // без черты перед % KaTeX счёл бы остаток комментарием
+  assert.equal(text(tex("r = 10\\%")), "r=10%"); // уже с чертой: вторая не добавляется
+  assert.equal((tex("S = 1 320 000").match(/margin-right:0\.1667em/g) ?? []).length, 2); // между разрядами стоит тонкий пробел
+  assert.equal((tex("S = 1320000").match(/margin-right:0\.1667em/g) ?? []).length, 0);
+  assert.equal(text(tex("x = 5 + 3")), "x=5+3"); // обычные пробелы в формуле по-прежнему ничего не значат
+  assert.match(inline("Итого $AC = 12$ см."), /<span class="glue"><span class="f">.*<\/span>\u00a0см\.<\/span>$/);
+  assert.ok(!inline("Здесь $x = 5$ получается при подстановке.").includes('class="glue"')); // длинное слово не приклеивается
+  assert.ok(!inline("$x = 5$ и $y = 6$").includes('class="glue"') || inline("$x = 5$ и $y = 6$").includes("\u00a0и")); // союз из одной буквы можно приклеить, формулы при этом целы
+});
+
+test("текст для тетради: строка «Ответ: сочинение, N слов» уходит в заголовок, отсылка «в решении» убирается", () => {
+  assert.equal(tidy("№27\nТекст сочинения. Второе предложение.\nОтвет: сочинение, 250 слов."), "№27 · 250 слов\nТекст сочинения. Второе предложение.");
+  assert.equal(tidy("№1\n1) CH₃–CH₃ + Cl₂ → CH₃–CH₂Cl + HCl\n2) ещё уравнение\nОтвет: уравнения 1)–2) в решении."), "№1\n1) CH₃–CH₃ + Cl₂ → CH₃–CH₂Cl + HCl\n2) ещё уравнение");
+  // обычный ответ, ответ с полезным хвостом и код остаются как есть
+  for (const p of ["№3\nx = 5\nОтвет: 5", "№9\nтекст\nОтвет: программа в решении; нужен файл 17.txt.", "№2\n```\nprint(1)\n```\nОтвет: программа в решении."]) assert.equal(tidy(p), p);
+  assert.deepEqual(compose(["№1\nРешение первого.\nОтвет: 4", "№27\nТекст сочинения. Ещё.\nОтвет: сочинение, 250 слов."], 12_000), ["✅ Ответы\n№1: 4\n№27: сочинение, 250 слов.\n——————————\n№1\nРешение первого.\nОтвет: 4\n——————————\n№27 · 250 слов\nТекст сочинения. Ещё."]);
+  assert.equal(card(["№1\n1) уравнение\nОтвет: уравнения 1)–4) в решении."]), "✅ Ответы\n№1: см. решение");
+  // длинный ответ в списке режется после целого пункта, а не посреди слова
+  const long = card([`№2\nОтвет: ${"да, действует; "}${"невесомость возникает потому что космонавт и станция свободно падают вместе с одинаковым ускорением, ".repeat(2)}конец`]);
+  assert.ok(/[а-яё]…$/.test(long) && !/[,;]…$/.test(long) && long.length < 170, long);
 });

@@ -39,11 +39,14 @@ export interface Spent {
   in: number;
   out: number;
   read: number; // прочитано из кэша
-  write: number; // записано в кэш
+  write: number; // записано в кэш (всего)
+  write1h?: number; // из них на час: такая запись вдвое дороже обычного входа
+  think?: number; // токены размышлений (они входят в out): главная статья расхода
   usd: number;
   approx?: boolean; // цена или выход посчитаны примерно: модель с неизвестной ценой или поток оборвался до итога
 }
 // Цена за миллион токенов, доллары: вход, выход, чтение кэша, запись в кэш на 5 минут. Fast-режим вдвое дороже.
+// Запись в кэш на час стоит вдвое дороже обычного входа (на 5 минут в 1,25 раза).
 // claude-opus-5 и claude-opus-4-8 сами не заказываем: на них Anthropic переводит запрос, если основная модель его отклонит.
 const PRICES: Record<string, [number, number, number, number]> = {
   "claude-fable-5-2": [8, 40, 0.2, 10],
@@ -52,12 +55,13 @@ const PRICES: Record<string, [number, number, number, number]> = {
   "claude-opus-5": [5, 25, 0.5, 6.25],
   "claude-opus-4-8": [5, 25, 0.5, 6.25],
 };
-type Usage = { in: number; out: number; read: number; write: number };
+type Usage = { in: number; out: number; read: number; write: number; write1h?: number };
 // Сначала точное имя, потом самое длинное известное начало («claude-fable-5-2-20261001»): «claude-opus-5» не должен оценить «claude-opus-5-5»
 export function price(model: string, u: Usage, fast: boolean): number | null {
   const key = model in PRICES ? model : Object.keys(PRICES).filter((k) => model.startsWith(k + "-")).sort((a, b) => b.length - a.length)[0];
   const p = key ? PRICES[key] : undefined;
-  return p ? ((u.in * p[0] + u.out * p[1] + u.read * p[2] + u.write * p[3]) / 1e6) * (fast ? 2 : 1) : null;
+  const hour = Math.min(u.write, u.write1h ?? 0); // часть записи с часовым сроком
+  return p ? ((u.in * p[0] + u.out * p[1] + u.read * p[2] + (u.write - hour) * p[3] + hour * p[0] * 2) / 1e6) * (fast ? 2 : 1) : null;
 }
 // Цена для дневного лимита. Оплаченный запрос не может стоить $0: модель с неизвестной ценой считаем по цене заказанной,
 // а если неизвестна и та, по самой дорогой из известных. Такая сумма помечается как примерная.
@@ -73,7 +77,7 @@ type Content = Anthropic.Beta.BetaMessage["content"];
 
 // Необязательные параметры запроса. Если модель из MODEL какой-то из них не знает (ошибка 400),
 // бот отключает именно его и запоминает, чтобы не ошибаться на каждом фото.
-type Feature = "speed" | "fallbacks" | "effort" | "tools" | "thinking";
+type Feature = "speed" | "fallbacks" | "effort" | "tools" | "thinking" | "ttl";
 const disabled = new Map<string, Set<Feature>>();
 export const featureOff = (model: string, f: Feature) => disabled.get(model)?.has(f) ?? false;
 
@@ -151,7 +155,9 @@ export async function inputTokens(c: Cfg, messages: Anthropic.Beta.BetaMessagePa
 function blamed(e: unknown, o: AskOptions, c: Cfg, off: Set<Feature>): Feature | undefined {
   if (!(e instanceof Anthropic.BadRequestError)) return undefined;
   const msg = String(e.apiMessage ?? e.message ?? "");
-  const f: Feature | undefined = /speed|fast/i.test(msg)
+  const f: Feature | undefined = /\bttl\b|cache_control/i.test(msg)
+    ? "ttl"
+    : /speed|fast/i.test(msg)
     ? "speed"
     : /fallback|anthropic-beta/i.test(msg)
     ? "fallbacks"
@@ -286,9 +292,16 @@ function fresh(text: string, body: string): string[] {
   return answersOf(text).filter((x) => !body || !sent.some((y) => same(x, y)));
 }
 
+// 5. Ответ прежний, но в решении не хватало обязательного элемента (рисунка, обоснования): модель пишет строку «ДОПОЛНЕНО»
+//    и задание целиком. Это тоже исправление, хотя новых ответов в нём нет.
+const ADDED = /^[\s*]*ДОПОЛНЕНО[\s.:!*]*$/im;
 export function judgeReply(a: Pick<Answer, "text" | "tail" | "all" | "cut" | "refused">, body = ""): { ok: true } | { fix: string } | null {
   if (a.cut || a.refused) return null;
   const last = (a.tail ?? a.text).trim();
+  if (ADDED.test(last)) {
+    const rest = last.split("\n").filter((r) => !ADDED.test(r)).join("\n").trim();
+    return whole(rest) ? { fix: rest } : null;
+  }
   const pure = last.split("\n").some((l) => /^[\s*]*вс[её]\s+верно[\s.!*]*$/i.test(l)); // отдельная строка «ВСЁ ВЕРНО»
   if (!pure && whole(last) && fresh(last, body).length) {
     return { fix: last.split("\n").filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim() };
@@ -384,9 +397,12 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
     model,
     // размышления тоже идут в счёт max_tokens, на высоких ступенях им нужно больше места
     max_tokens: o.effort === "xhigh" || o.effort === "max" ? 128_000 : 64_000,
-    // инструкция одна и та же для всех фото: кэшируем, следующие запросы дешевле и быстрее
-    system: [{ type: "text", text: o.system ?? PROMPT, cache_control: { type: "ephemeral" } }],
-    // и разговор тоже: при добавлении фото, продолжении и уточнениях старые фото читаются из кэша
+    // Инструкция одна и та же для всех фото и всех чатов: кэшируем её на час. Фото приходят с перерывами в 10–30 минут,
+    // и с пятиминутным кэшем каждое решение заново платило бы за запись всей инструкции (это была заметная часть счёта).
+    // Запись на час дороже, но окупается уже вторым фото за час; каждое чтение продлевает срок.
+    system: [{ type: "text", text: o.system ?? PROMPT, cache_control: off.has("ttl") ? { type: "ephemeral" } : { type: "ephemeral", ttl: "1h" } }],
+    // Разговор кэшируется на 5 минут: при добавлении фото, продолжении и разборе замечаний фото читаются из кэша.
+    // (часовая отметка стоит раньше пятиминутной: такой порядок API разрешает)
     cache_control: { type: "ephemeral" },
     messages,
   };
@@ -416,19 +432,21 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   let fresh = false;
   let opened = false; // поток открылся: модель приняла запрос и начала работать
   // Расход считаем по ходу потока: если он оборвётся, уже потраченное всё равно попадёт в учёт
-  const used = { in: 0, out: 0, read: 0, write: 0 };
+  const used = { in: 0, out: 0, read: 0, write: 0, write1h: 0, think: 0 };
   let served = model;
   // Точный выход приходит только в конце потока. Если поток оборвётся раньше, выход оцениваем по написанному
   // (текст, размышления, код для песочницы): около 3 знаков русского текста на токен. Иначе лимит видел бы почти $0.
   let streamed = 0;
   let exact = false;
-  const count = (u: { input_tokens?: number | null; output_tokens?: number | null; cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null } | undefined, final = false) => {
+  const count = (u: { input_tokens?: number | null; output_tokens?: number | null; cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null; cache_creation?: { ephemeral_1h_input_tokens?: number | null } | null; output_tokens_details?: { thinking_tokens?: number | null } | null } | undefined, final = false) => {
     if (!u) return;
     if (final) exact = true;
     used.in = Math.max(used.in, u.input_tokens ?? 0);
     used.out = Math.max(used.out, u.output_tokens ?? 0);
     used.read = Math.max(used.read, u.cache_read_input_tokens ?? 0);
     used.write = Math.max(used.write, u.cache_creation_input_tokens ?? 0);
+    used.write1h = Math.max(used.write1h, u.cache_creation?.ephemeral_1h_input_tokens ?? 0);
+    used.think = Math.max(used.think, u.output_tokens_details?.thinking_tokens ?? 0);
   };
   try {
     const stream = client(c).beta.messages.stream(params, { signal: ctrl.signal });

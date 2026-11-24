@@ -60,3 +60,15 @@ test("исправление с заголовком «Исправляю №2»
   const body = "№1\nОтвет: 4\n\n№2\nОтвет: 5";
   assert.deepEqual(judgeReply({ text: "Исправляю №2\n3 + 4 = 7\nОтвет: 7", cut: false, refused: false }, body), { fix: "Исправляю №2\n3 + 4 = 7\nОтвет: 7" });
 });
+
+test("«ДОПОЛНЕНО»: ответ прежний, но в решение добавлен обязательный элемент: это исправление", () => {
+  const body = "№1\nx = 4\nОтвет: 4\n\n№2\nF = ma\nОтвет: 5 Н";
+  const fix = "№2\nОбоснование:\nсистема отсчёта инерциальная\nF = ma\nОтвет: 5 Н";
+  assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, cut: false, refused: false }, body), { fix });
+  assert.deepEqual(judgeReply({ text: `**ДОПОЛНЕНО.**\n\n${fix}`, cut: false, refused: false }, body), { fix });
+  // без этой строки переписанное задание с прежним ответом исправлением не считается, как и раньше
+  assert.deepEqual(judgeReply({ text: fix, cut: false, refused: false }, body), { ok: true });
+  // одно слово без задания ничего не значит; оборванный ответ тоже
+  assert.equal(judgeReply({ text: "ДОПОЛНЕНО", cut: false, refused: false }, body), null);
+  assert.equal(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, cut: true, refused: false }, body), null);
+});

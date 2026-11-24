@@ -64,7 +64,11 @@ export function chunks(src: string): string[] {
 // Формула: KaTeX пишет готовый HTML. Не разобралась (опечатка модели): показываем её обычным текстом.
 export function tex(src: string): string {
   const clean = src.replace(/\\tag\*?\{[^{}]*\}/g, "") // номера формул на странице не нужны
-    .replace(/\\(?:sfrac|nicefrac)(?![A-Za-z])/g, "\\frac"); // таких дробей KaTeX не знает, рисуем обычной
+    .replace(/\\(?:sfrac|nicefrac)(?![A-Za-z])/g, "\\frac") // таких дробей KaTeX не знает, рисуем обычной
+    // знак % в формуле для KaTeX начинает комментарий: без черты перед ним остаток формулы пропал бы («r = 10% годовых» -> «r = 10»)
+    .replace(/(^|[^\\])%/g, "$1\\%")
+    // пробел между разрядами числа в формуле не рисуется: «1 320 000» слиплось бы в «1320000»
+    .replace(/(\d) (?=\d{3}(?!\d))/g, "$1\\,");
   const one = (s: string) => sound(katex.renderToString(`\\displaystyle ${s}`, KATEX));
   try {
     // .f: формула целиком. Она не рвётся, пока помещается в строку; не помещается: переносится между кусками .fx
@@ -86,7 +90,24 @@ export function tex(src: string): string {
 // Строка с формулами $…$ -> HTML
 export function inline(text: string): string {
   // вне формул разметки быть не должно: что осталось (знак $ без пары, команда без $), переводится в обычные знаки
-  return mathSpans(text).map((s) => (s.math ? tex(s.body) : s.lit ? esc(s.body) : esc(prettyMath(stripTex(s.body), sheet || undefined)))).join("");
+  const segs = mathSpans(text);
+  const out: string[] = [];
+  const words = (t: string) => esc(prettyMath(stripTex(t), sheet || undefined));
+  for (let k = 0; k < segs.length; k++) {
+    const s = segs[k];
+    if (!s.math) {
+      out.push(s.lit ? esc(s.body) : words(s.body));
+      continue;
+    }
+    // Короткий хвост сразу за формулой (единица «см.», «Н,», знак препинания) не уходит на новую строку один
+    const next = segs[k + 1];
+    const m = next && !next.math && !next.lit ? /^(\s?)([^\s$]{1,4})(?=\s|$)/.exec(next.body) : null;
+    if (m && /^[\p{L}]{0,3}[.,;:!?)»]*$/u.test(m[2])) {
+      out.push(`<span class="glue">${tex(s.body)}${m[1] ? "\u00a0" : ""}${words(m[2])}</span>`);
+      segs[k + 1] = { ...next, body: next.body.slice(m[0].length) };
+    } else out.push(tex(s.body));
+  }
+  return out.join("");
 }
 
 // Пометка справа от преобразования: «выражение | что сделали». Черту ищем только вне формул.
@@ -284,7 +305,9 @@ body{width:${PAGE_W}px;color:#fff;font:21px/1.5 'DejaVu Sans',sans-serif;-webkit
 .task{padding:0 0 14px}.task+.task{border-top:2px solid #555;padding-top:10px}
 h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .cont{font-size:17px;margin:0 0 6px}
-.b{margin:6px 0;overflow-wrap:anywhere}
+.b{margin:6px 0;overflow-wrap:anywhere}.b:has(.mfrac){margin:11px 0}
+.b.line{padding-left:.9em;text-indent:-.9em}.b.line.more{text-indent:0}.b.line,.row .main,.ans,.given>div{text-wrap:pretty}
+.glue{white-space:nowrap}
 .lbl{font-weight:bold}
 .given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
 .given .tbl{margin:4px 0}.given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}.given .find+.find{border-top:0;margin-top:2px;padding-top:0}
@@ -514,6 +537,7 @@ export const PAGINATE = `(() => {
         if (c.off < 0) range.setStartBefore(c.node); else range.setStart(c.node, c.off);
         range.setEndAfter(b.lastChild);
         nb.appendChild(range.extractContents());
+        if (!pre) nb.classList.add("more"); // продолжение абзаца, а не новый шаг: первая строка без выступа
         if (pre) {
           // перевод строки на стыке остался в конце первой части: в листинге он дал бы пустую строку
           const t = b.lastChild;
@@ -588,6 +612,16 @@ export const PAGINATE = `(() => {
         start = (moved.length ? moved[0].b.getBoundingClientRect().top : br.top) - top;
       }
       pages[pages.length - 1].push({ b, task, first: b === task.firstElementChild });
+    }
+  }
+  // Лист-огрызок (две-три строки и рамка ответа) не идёт отдельной картинкой, если помещается под предыдущим листом
+  const edge = (p, last) => p[last ? p.length - 1 : 0].b.getBoundingClientRect();
+  for (let i = pages.length - 1; i > 0; i--) {
+    const cur = pages[i], prev = pages[i - 1];
+    if (!cur.length || !prev.length) continue;
+    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= H + 30) {
+      prev.push(...cur);
+      pages.splice(i, 1);
     }
   }
   const total = pages.filter((p) => p.length).length;

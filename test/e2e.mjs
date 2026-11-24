@@ -132,7 +132,7 @@ try {
   if (OUT && img?.body) (mkdirSync(OUT, { recursive: true }), writeFileSync(`${OUT}/drawing.png`, img.body));
   const first = claude[0];
   ok(first.model === "claude-fable-5-2" && first.output_config?.effort === "high" && first.fallbacks === "default" && first.stream === true && first.thinking?.type === "adaptive", "запрос к Claude: Fable 5.2, effort high, размышления, запасная модель при отказе", JSON.stringify({ ...first, messages: undefined, system: undefined }));
-  ok(first.tools?.[0]?.type === "code_execution_20260521" && first.cache_control?.type === "ephemeral" && first.system?.[0]?.cache_control?.type === "ephemeral", "пересчёт кодом включён, инструкция и разговор кэшируются");
+  ok(first.tools?.[0]?.type === "code_execution_20260521" && first.cache_control?.type === "ephemeral" && !first.cache_control.ttl && first.system?.[0]?.cache_control?.type === "ephemeral" && first.system[0].cache_control.ttl === "1h", "пересчёт кодом включён, инструкция кэшируется на час, разговор на 5 минут");
   ok(first.messages[0].content[0]?.source?.media_type === "image/jpeg" && lastText(first) === "Реши задания с фото." && first.max_tokens === 64000 && !("temperature" in first), "фото ушло картинкой, без устаревших параметров");
 
   // --- память чата: следующий вопрос видит прошлое фото и ответ ---
@@ -199,14 +199,14 @@ try {
   // --- Claude перегружен: пауза и повтор без участия пользователя ---
   await photo("333", "S_BUSY");
   ok(await until(() => answers("333").some((t) => t.includes("Ответ: 5")), 30_000), "Claude занят: бот сам повторил и решил", JSON.stringify(texts("333")));
-  ok(answers("333")[0] === "⏳ Claude занят, пробую ещё раз…" && answers("333").length === 2, "Claude занят: одно уведомление", JSON.stringify(texts("333")));
+  ok(answers("333")[0] === "⏳ Сервер занят, повторяю…" && answers("333").length === 2, "Claude занят: одно уведомление", JSON.stringify(texts("333")));
 
   // --- модель думает дольше куска: следующая попытка на ступень проще ---
   await photo("444", "S_SLOW");
-  ok(await until(() => answers("444").some((t) => t.includes("Ответ: 5")), 40_000), "долгие размышления: решено со второй попытки", JSON.stringify(texts("444")));
+  ok(await until(() => answers("444").some((t) => t.includes("Ответ: 5")), 70_000), "долгие размышления: решено с третьей попытки", JSON.stringify(texts("444")));
   const slow = reqs("S_SLOW");
-  ok(slow.length === 2 && slow[0].output_config.effort === "high" && slow[1].output_config.effort === "medium", "долгие размышления: effort понижен на ступень", JSON.stringify(slow.map((b) => b.output_config)));
-  ok(answers("444")[0].startsWith("⏳ Ещё решаю") && answers("444")[1].startsWith("⏳ Долго думаю") && answers("444").length === 3, "долгие размышления: пользователь видит, что бот жив", JSON.stringify(texts("444")));
+  ok(slow.map((b) => b.output_config.effort).join() === "high,high,medium", "долгие размышления: вторая попытка на том же режиме, и только третья на ступень проще", JSON.stringify(slow.map((b) => b.output_config)));
+  ok(answers("444")[0].startsWith("⏳ Ещё решаю") && answers("444").filter((t) => t === "⏳ Задание тяжёлое, продолжаю решать.").length === 1 && answers("444").length === 3, "долгие размышления: пользователь видит, что бот жив, без слов про «быстрее»", JSON.stringify(texts("444")));
 
   // --- модель не знает необязательный параметр: бот убирает именно его и запоминает ---
   await photo("555", "S_400");
@@ -217,12 +217,13 @@ try {
 
   // --- ошибка не в параметрах: настройки не портятся, пользователь видит причину ---
   await photo("666", "S_BADIMG");
-  ok(await until(() => answers("666").some((t) => t.startsWith("⚠️ Ошибка Claude 400"))), "ошибка 400 не из-за параметров: показана причина", JSON.stringify(texts("666")));
+  ok(await until(() => answers("666").includes("⚠️ Сбой, решение не пришло. Пришли фото ещё раз.")), "ошибка 400 не из-за параметров: человеку короткое сообщение без сырого текста ошибки", JSON.stringify(texts("666")));
+  ok(await until(async () => (await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text()).includes("Ошибка Claude 400")), "сама ошибка видна в журнале");
   ok(reqs("S_BADIMG").length === 1, "ошибка 400 не из-за параметров: без лишних запросов");
 
   // --- отказ модели, неверный ключ ---
   await photo("888", "S_REFUSE");
-  ok(await until(() => answers("888").includes("Модель не стала это решать. Пересними задание.")), "отказ модели: понятное сообщение", JSON.stringify(texts("888")));
+  ok(await until(() => answers("888").includes("Не получилось решить. Пересними задание.")), "отказ модели: понятное сообщение", JSON.stringify(texts("888")));
   await photo("889", "S_NOKEY");
   ok(await until(() => answers("889").includes("⚠️ Неверный ключ Claude. Проверь ANTHROPIC_API_KEY.")), "неверный ключ: понятное сообщение", JSON.stringify(texts("889")));
   ok(await quiet("889"), "неверный ключ: без повторов");
@@ -231,7 +232,7 @@ try {
   for (const [chat, sc2] of [["890", "S_SSEERR"], ["891", "S_EARLYDROP"]]) {
     await photo(chat, sc2);
     ok(await until(() => answers(chat).some((t) => t.includes("Ответ: 5")), 30_000), `${sc2}: бот сам повторил и решил`, JSON.stringify(texts(chat)));
-    ok(answers(chat)[0] === "⏳ Claude занят, пробую ещё раз…" && !texts(chat).some((t) => t.startsWith("⚠️")), `${sc2}: без сообщения об ошибке`, JSON.stringify(texts(chat)));
+    ok(answers(chat)[0] === "⏳ Сервер занят, повторяю…" && !texts(chat).some((t) => t.startsWith("⚠️")), `${sc2}: без сообщения об ошибке`, JSON.stringify(texts(chat)));
   }
 
   // --- лимит трат, заданный в консоли Claude: одна попытка и понятный текст ---
@@ -241,7 +242,7 @@ try {
 
   // --- фильтр остановил модель посреди ответа: готовое доставлено, есть подсказка ---
   await photo("894", "S_REFMID");
-  ok(await until(() => answers("894").some((t) => t.startsWith("(модель остановилась"))), "отказ посреди ответа: есть подсказка", JSON.stringify(texts("894")));
+  ok(await until(() => answers("894").some((t) => t.startsWith("(дорешал не всё"))), "отказ посреди ответа: есть подсказка", JSON.stringify(texts("894")));
   ok(answers("894").length === 2 && answers("894")[0].includes("№1: 5"), "отказ посреди ответа: написанное доставлено", JSON.stringify(texts("894")));
 
   // --- пересчёт кодом затянулся (pause_turn): ход продолжается тем же сообщением ---
@@ -533,9 +534,9 @@ try {
   await text("111", "лимит 0,01");
   ok(await until(() => texts("111").some((t) => t.startsWith("Дневной лимит: $0.01 ✅"))), "лимит: задан командой");
   await photo("974", "S_LIMA");
-  ok(await until(() => answers("974").includes("На сегодня бот закончил работу. Пришли задание завтра.")), "лимит исчерпан: чужому чату короткий отказ", JSON.stringify(texts("974")));
+  ok(await until(() => answers("974").includes("На сегодня всё. Пришли задание после 03:00 по Москве.")), "лимит исчерпан: чужому чату короткий отказ", JSON.stringify(texts("974")));
   await photo("111", "S_LIMB");
-  ok(await until(() => answers("111").some((t) => /^Дневной лимит расходов исчерпан: потрачено \$\d+\.\d\d из \$0\.01\./.test(t))), "лимит исчерпан: хозяину сумма и подсказка", JSON.stringify(texts("111").slice(-2)));
+  ok(await until(() => answers("111").some((t) => /^⛔ Дневной лимит расходов исчерпан: потрачено \$\d+\.\d\d из \$0\.01\. Пришли фото после 03:00 по Москве\.$/.test(t))), "лимит исчерпан: хозяину сумма и подсказка", JSON.stringify(texts("111").slice(-2)));
   ok(reqs("S_LIMA").length === 0 && reqs("S_LIMB").length === 0, "лимит исчерпан: запросов к Claude нет");
   await text("111", "лимит выкл");
   ok(await until(() => texts("111").includes("Дневной лимит снят ✅")), "лимит: снят командой");
@@ -558,9 +559,9 @@ try {
   ok(await until(() => texts("111").some((t) => t.startsWith(`Дневной лимит: $${capSum} ✅`))), "лимит чуть выше сегодняшнего расхода", JSON.stringify(texts("111").slice(-1)));
   const capFrom = texts("111").length;
   await photo("111", "S_CAPCUT");
-  ok(await until(() => texts("111").slice(capFrom).some((t) => t.startsWith("Дневной лимит расходов исчерпан"))), "лимит посреди ответа: хозяину сказано про лимит", JSON.stringify(texts("111").slice(capFrom)));
+  ok(await until(() => texts("111").slice(capFrom).some((t) => t.startsWith("⛔ Дневной лимит расходов исчерпан"))), "лимит посреди ответа: хозяину сказано про лимит", JSON.stringify(texts("111").slice(capFrom)));
   const capMsgs = texts("111").slice(capFrom).filter((t) => !ACK.test(t));
-  ok(capMsgs.length === 2 && capMsgs[0].includes("x² = 16") && capMsgs[0].includes("Ответ: 4") && capMsgs[1].startsWith("Дневной лимит расходов исчерпан"), "лимит посреди ответа: уже написанное начало доставлено, потом причина", JSON.stringify(capMsgs));
+  ok(capMsgs.length === 2 && capMsgs[0].includes("x² = 16") && capMsgs[0].includes("Ответ: 4") && capMsgs[1].startsWith("⛔ Дневной лимит расходов исчерпан"), "лимит посреди ответа: уже написанное начало доставлено, потом причина", JSON.stringify(capMsgs));
   ok(reqs("S_CAPCUT").length === 1 && !reqs("S_CAPCUT").some((b) => lastText(b) === CONT), "лимит посреди ответа: продолжение у Claude не заказано");
   await text("111", "лимит выкл");
   ok(await until(() => texts("111").filter((t) => t === "Дневной лимит снят ✅").length === 2), "лимит снят снова");
@@ -592,7 +593,8 @@ try {
   const isJudge = (b) => lastText(b).startsWith("Независимая перепроверка");
   const isSolve = (b) => !isCheck(b) && !isJudge(b);
   const CHECKING = "✍️ Решение готово. Перепроверяю, чтобы быть уверенным на 100%.";
-  const UNCHECKED = "(перепроверить не получилось: это первое решение, без второй проверки)";
+  const UNCHECKED = "⚠️ Вторая проверка не прошла, ответ выше без неё.";
+  const RECHECK = "⏳ Перепроверяю ещё раз, скоро пришлю.";
   const solved = (chat) => texts(chat).filter((t) => t.startsWith("✅ Ответы"));
   const noFix = (chat) => !texts(chat).some((t) => /Исправлени|Перепроверил решение/.test(t));
   await text("111", "проверка вкл");
@@ -612,13 +614,13 @@ try {
   await sleep(1500);
   const fx = solved("982")[0];
   ok(fx === `✅ Ответы\n№1: 4 см²\n№2: 7\n${RULE}\n№1\nДано: v₀ = 5 м/с, H₂SO₄\nx² + 2x = 8\nОтвет: 4 см²\n${RULE}\n№2\nПересчёт: 3 + 4 = 7\nОтвет: 7`, "человеку приходит уже исправленный ответ: №2 заменён целиком, №1 не тронут", fx);
-  ok(texts("982").length === 3 && texts("982")[1] === CHECKING && noFix("982"), "исправлений вдогонку нет: одно «перепроверяю» и один ответ", JSON.stringify(texts("982").map((t) => t.slice(0, 40))));
+  ok(texts("982").length === 4 && texts("982")[1] === CHECKING && texts("982")[2] === RECHECK && noFix("982"), "исправлений вдогонку нет: «перепроверяю», знак жизни перед разбором замечаний и один ответ", JSON.stringify(texts("982").map((t) => t.slice(0, 40))));
   const judge = reqs("S_CHKFIX").filter(isJudge);
   ok(judge.length === 1 && judge[0].model === "claude-fable-5-2" && judge[0].messages.length === 3 && imgs(judge[0].messages[0]) === 1 && judge[0].messages[1].content.includes("Ответ: 5") && lastText(judge[0]).includes("№2: в решении 5, а получается 7"), "спорное задание разбирает основная модель: фото, своё решение и замечания", JSON.stringify(judge.map((b) => [b.model, b.messages.length])));
   const bm = claude.length;
   await text("982", "объясни №2");
   ok(await until(() => claude.length > bm) && claude[bm].messages[1].content.includes("Ответ: $7$") && !claude[bm].messages[1].content.includes("Ответ: 5"), "в памяти чата лежит исправленный ответ", JSON.stringify(claude[bm]?.messages[1]).slice(0, 300));
-  ok(await until(() => texts("982").length === 4, 20_000), "ответ на вопрос пришёл", JSON.stringify(texts("982").map((t) => t.slice(0, 30))));
+  ok(await until(() => texts("982").length === 5, 20_000), "ответ на вопрос пришёл", JSON.stringify(texts("982").map((t) => t.slice(0, 30))));
   page = await (await fetch(`${BASE}/?k=${LOG_KEY}`)).text();
   ok(page.includes("вторая проверка нашла ошибку, ответ исправлен до отправки: №2"), "исправление до отправки видно в журнале", page.split("Последние события")[1]?.slice(0, 500));
   // 3. ложная тревога: основная модель перепроверила и осталась при своём, ответ прежний
