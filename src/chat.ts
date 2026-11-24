@@ -20,7 +20,7 @@ import { CHECK_PROMPT, judgeText } from "./prompt.ts";
 import { CAPTION_MAX, Green, GreenError, permanent, TooBig } from "./green.ts";
 import { renderPng } from "./render.ts";
 import { type SelfTest, SAMPLE_PARTS, SAMPLE_SVG, status } from "./status.ts";
-import { type Look, brief, card, compose, lookLine, lookOf, mergeFix, plainText, seam, splitAnswer, tableAt, verdict } from "./text.ts";
+import { type Look, brief, card, compose, figureLabel, headKey, headOf, lookLine, lookOf, mergeFix, plainText, seam, splitAnswer, tableAt, verdict } from "./text.ts";
 import { type FileType, base64, clock, fileType, fingerprint, imageSize, imageType } from "./util.ts";
 
 const SEGMENT = 13 * 60_000; // столько работает один кусок (потолок будильника 15 минут)
@@ -673,11 +673,11 @@ export class Chat extends DurableObject<Env> {
       if (e instanceof Timeout && retry) {
         // модель думала весь кусок и ничего не написала: следующая попытка на ступень проще
         job.effort = lower(job.effort);
-        if (!job.done) job.asked = undefined; // решение начнётся заново: новое фото к нему добавится без потерь
+        if (!job.done && !job.acc) job.asked = undefined; // решение начнётся заново: новое фото к нему добавится без потерь (если оплаченного начала ответа ещё нет)
         await this.db.put(key, job);
         await this.say(chatId, "⏳ Долго думаю, решаю быстрее…");
       } else if (e instanceof Busy && retry) {
-        if (!job.done) job.asked = undefined; // ответа нет, выбрасывать нечего: пауза перед повтором окно добавления не тратит
+        if (!job.done && !job.acc) job.asked = undefined; // ответа нет, выбрасывать нечего: пауза перед повтором окно добавления не тратит
         job.after = Date.now() + (BACKOFF[job.tries - 1] ?? BACKOFF[0]) / this.k;
         await this.db.put(key, job);
         if (job.tries === 1) await this.say(chatId, "⏳ Claude занят, пробую ещё раз…");
@@ -862,7 +862,10 @@ export class Chat extends DurableObject<Env> {
     const parts = job.parts ?? [];
     const plain = parts.map(plainText);
     const { look } = await this.options();
-    const full = parts.filter((p) => !brief(p)); // краткие задания целиком видны в списке ответов: на страницы их не ставим
+    // краткие задания целиком видны в списке ответов: на страницы их не ставим. Кроме тех, к которым есть рисунок:
+    // без своего задания он встал бы внутрь чужого решения
+    const drawn = new Set(job.svgs.map((s) => headKey(figureLabel(s))).filter(Boolean));
+    const full = parts.filter((p) => !brief(p) || drawn.has(headOf(p)));
     const solved = parts.some((p) => /^Ответ:/m.test(p)) || job.svgs.length > 0;
     // на странице есть что набирать: формулы, рисунок или таблица
     const rich = full.some((p) => /\$[^$\n]+\$/.test(p)) || job.svgs.length > 0 || full.some(tabled);
@@ -1304,6 +1307,7 @@ export class Chat extends DurableObject<Env> {
         // Claude занят, время куска вышло или ответ не по форме: пауза и ещё попытка (их число ограничено)
         if (chk.tries >= CHECK_TRIES) continue;
         job.after = Date.now() + (BACKOFF[chk.tries - 1] ?? BACKOFF[BACKOFF.length - 1]) / this.k;
+        await this.bill(job, bills.splice(0)); // до сохранения: иначе цена этой попытки не попала бы в запись работы
         await save();
         return false;
       } finally {

@@ -121,6 +121,9 @@ export function tableAt(lines: string[], i: number): { rows: string[][]; end: nu
   for (let k = i + 2; k < lines.length; k++) {
     const row = cells(lines[k]);
     if (!row) break;
+    // следом за этой строкой стоит черта: это шапка следующей таблицы, а не строка нашей
+    const next = cells(lines[k + 1] ?? "");
+    if (!ruleRow(row) && next && ruleRow(next)) break;
     if (!ruleRow(row)) rows.push(row);
     end = k;
   }
@@ -151,7 +154,8 @@ export function plainText(text: string): string {
   // признак задания про электронную таблицу считаем один раз по всему тексту: слово «ячейка» стоит до таблицы,
   // а адреса A1 и C2 в ней самой и после неё
   const sheet = sheetContext(text);
-  const plain = (t: string) => prettyMath(stripTex(plainMath(t)), sheet);
+  // В строке-заголовке задания («№A1», «Часть 2 – B1 (C3)») буква с цифрой это номер, а не формула: индексы там не ставим
+  const plain = (t: string) => t.split("\n").map((l) => prettyMath(stripTex(plainMath(l)), sheet || (HEAD.test(l) && l.trim().length <= 60))).join("\n");
   return text.split(/(```[\s\S]*?```)/).map((piece, i) => {
     if (i % 2) return piece;
     if (!/^[ \t]*\|.*\|[ \t]*$/m.test(piece)) return plain(piece);
@@ -260,7 +264,9 @@ export function mergeFix(parts: string[], svgs: string[], fix: { parts: string[]
       });
     }
     let at = hit.length === 1 ? hit[0] : -1;
-    if (at < 0 && out.length === 1 && fix.parts.length === 1) at = 0; // задание одно: заменяется и без совпадения заголовка
+    // задание одно: заменяется и без совпадения заголовка, но не когда у исправления явно другой номер (это пропущенное задание)
+    const only = out.length === 1 && fix.parts.length === 1 ? taskId(out[0]) : null;
+    if (at < 0 && out.length === 1 && fix.parts.length === 1 && !(id && only && id.num !== only.num)) at = 0;
     if (at < 0 && (hit.length > 1 || !k)) {
       lost.push(name);
       continue;

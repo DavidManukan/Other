@@ -203,3 +203,22 @@ test("номер задания с буквой остаётся как на л�
   assert.ok(given < prove && prove < find && find < fig && fig < proof, html);
   assert.equal(html.split('class="find"').length, 3); // обе строки внутри блока «Дано»
 });
+
+test("две таблицы подряд остаются двумя; таблица в «Дано» рисуется таблицей; пропущенное задание не затирает единственное", () => {
+  const lines = ["| a | b |", "| --- | --- |", "| 1 | 2 |", "| x | y |", "| --- | --- |", "| 3 | 4 |"];
+  assert.deepEqual(tableAt(lines, 0), { rows: [["a", "b"], ["1", "2"]], end: 2 });
+  assert.deepEqual(tableAt(lines, 3), { rows: [["x", "y"], ["3", "4"]], end: 5 });
+  assert.equal(plainText(lines.join("\n")), "```\na | b\n--+--\n1 | 2\n```\n```\nx | y\n--+--\n3 | 4\n```");
+  const html = taskHtml("№1\nДано:\n$m = 2$ кг\n| $t$, с | 0 | 1 |\n| --- | --- | --- |\n| $v$, м/с | 0 | 5 |\nНайти: $a$\nРешение:\n$a = 5$\nОтвет: 5", []);
+  assert.ok(/class="b given">.*<table class="tbl">.*<\/table><div class="find">/.test(html) && !html.includes("---") && !html.includes("| 0"), html);
+  // исправление с другим номером при единственном задании: это пропущенное задание, решённое остаётся
+  assert.deepEqual(mergeFix(["№1\nx = 4\nОтвет: 4"], [], { parts: ["№2\nОтвет: 7"], svgs: [] }).parts, ["№1\nx = 4\nОтвет: 4", "№2\nОтвет: 7"]);
+  assert.deepEqual(mergeFix(["№1\nx = 4\nОтвет: 4"], [], { parts: ["Пересчитал.\nОтвет: 7"], svgs: [] }).parts, ["Пересчитал.\nОтвет: 7"]);
+});
+
+test("в заголовке задания индексы не ставятся нигде, в решении ставятся как раньше", () => {
+  assert.equal(plainText("Задание B1 (C3)\nточка A1\nОтвет: 1"), "Задание B1 (C3)\nточка A₁\nОтвет: 1");
+  assert.equal(plainText("Вариант 2 · №A1\nH2O\nОтвет: 1"), "Вариант 2 · №A1\nH₂O\nОтвет: 1");
+  const html = taskHtml("№B1 (C3)\nточка A1\nОтвет: 4", []);
+  assert.ok(html.includes('<h2 class="b">№B1 (C3)</h2>') && html.includes('data-title="№B1 (C3)"') && html.includes("точка A₁"), html);
+});

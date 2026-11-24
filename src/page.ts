@@ -107,6 +107,12 @@ function annotated(line: string): [string, string] | null {
   return [left, right];
 }
 
+// Таблица: настоящая, с линиями; формулы в ячейках набраны
+const table = (rows: string[][]): string => {
+  const tr = (r: string[], tag: string) => `<tr>${r.map((c) => `<${tag}>${inline(c)}</${tag}>`).join("")}</tr>`;
+  return `<table class="tbl">${tr(rows[0], "th")}${rows.slice(1).map((r) => tr(r, "td")).join("")}</table>`;
+};
+
 const row = (line: string): string => {
   const a = annotated(line);
   return a ? `<div class="b row"><div class="main">${inline(a[0])}</div><div class="note">${inline(a[1])}</div></div>` : `<div class="b line">${inline(line)}</div>`;
@@ -147,7 +153,11 @@ function taskBody(part: string, figs: Fig[]): string {
   }
   if (i < lines.length && HEAD.test(lines[i]) && lines[i].length <= 60) {
     title = lines[i].trim();
+    // в заголовке буква с цифрой это номер задания («№B1»), а не формула: индексы в нём не ставим
+    const was = sheet;
+    sheet = true;
     out.push(`<h2 class="b">${inline(title)}</h2>`);
+    sheet = was;
     i++;
   }
   let placed = false;
@@ -167,14 +177,13 @@ function taskBody(part: string, figs: Fig[]): string {
     }
     const tb = tableAt(lines, i);
     if (tb) { // таблица: настоящая, с линиями; формулы в ячейках набраны
-      const tr = (r: string[], tag: string) => `<tr>${r.map((c) => `<${tag}>${inline(c)}</${tag}>`).join("")}</tr>`;
-      out.push(`<div class="b"><table class="tbl">${tr(tb.rows[0], "th")}${tb.rows.slice(1).map((r) => tr(r, "td")).join("")}</table></div>`);
+      out.push(`<div class="b">${table(tb.rows)}</div>`);
       i = tb.end;
       continue;
     }
     const m = LABEL.exec(line.trim());
     if (m?.[1] === "Дано") { // «Дано» с чертой справа и «Найти» под чертой, как в тетради
-      const given: string[] = m[2] ? [m[2]] : [];
+      const given: string[] = m[2] ? [`<div>${inline(m[2])}</div>`] : []; // строки блока уже в HTML: среди них бывает таблица с данными опыта
       // под чертой стоит «Найти» или «Доказать», а в задаче из двух пунктов обе строки подряд: чертёж встаёт после них, а не между ними
       const finds: { label: string; lines: string[] }[] = [];
       for (i++; i < lines.length; i++) {
@@ -182,17 +191,23 @@ function taskBody(part: string, figs: Fig[]): string {
         const n = LABEL.exec(l);
         const cur = finds.at(-1);
         if (/^\s*```/.test(l)) break;
+        const tbl = cur ? null : tableAt(lines, i);
+        if (tbl) {
+          given.push(table(tbl.rows));
+          i = tbl.end;
+          continue;
+        }
         if (n) {
           if ((n[1] !== "Найти" && n[1] !== "Доказать") || finds.some((f) => f.label === n[1]) || (cur && !cur.lines.length)) break; // любая другая метка закрывает блок
           finds.push({ label: n[1], lines: n[2] ? [n[2]] : [] });
         } else if (!l) continue;
-        else if (!cur) given.push(l);
+        else if (!cur) given.push(`<div>${inline(l)}</div>`);
         else if (!cur.lines.length) cur.lines.push(l); // «Найти:» отдельной строкой: искомое стоит на следующей
         else break; // дальше уже решение, даже если строки «Решение:» нет
       }
       i--;
       out.push(
-        `<div class="b given"><div class="lbl">Дано:</div>${given.map((g) => `<div>${inline(g)}</div>`).join("")}` +
+        `<div class="b given"><div class="lbl">Дано:</div>${given.join("")}` +
           finds.map((f) => `<div class="find"><span class="lbl">${f.label}:</span> ${f.lines.map(inline).join("<br>")}</div>`).join("") + `</div>`,
       );
       place(); // чертёж сразу под «Дано», до решения
@@ -220,7 +235,7 @@ function taskBody(part: string, figs: Fig[]): string {
   }
   place();
   // заголовок продолжения на следующих листах PAGINATE пишет текстом: формулы в нём уже переведены в обычные знаки
-  return `<section class="task" data-title="${esc(prettyMath(stripTex(texToPlain(title)), sheet || undefined))}">${out.join("")}</section>`;
+  return `<section class="task" data-title="${esc(prettyMath(stripTex(texToPlain(title)), true))}">${out.join("")}</section>`;
 }
 
 export interface Fig {
@@ -271,7 +286,7 @@ h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .b{margin:6px 0;overflow-wrap:anywhere}
 .lbl{font-weight:bold}
 .given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
-.given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}.given .find+.find{border-top:0;margin-top:2px;padding-top:0}
+.given .tbl{margin:4px 0}.given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}.given .find+.find{border-top:0;margin-top:2px;padding-top:0}
 .row{display:flex;flex-wrap:wrap;gap:2px 14px;align-items:center}
 .row .main{flex:0 1 auto;min-width:0;max-width:100%}
 .row .note{flex:0 1 auto;min-width:0;max-width:100%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
