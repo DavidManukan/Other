@@ -258,7 +258,7 @@ const agrees = (s: string) => s.split("\n").some((l) => {
   const m = PHRASE.exec(l);
   return !!m && !HEDGE.test(l.slice(0, m.index));
 });
-const TASK = /^\s*(?:[^·\n]{1,30}·\s*){0,2}(?:№\s*\S+|(?:Задание|Задача|Вариант)\s+\d\S*)/; // заголовок задания, а не фраза «Вариант с ошибкой проверен»
+const TASK = /^\s*(?:Исправляю\s+)?(?:[^·\n]{1,30}·\s*){0,2}(?:№\s*\S+|(?:Задание|Задача|Вариант)\s+\d\S*|[A-ZА-ЯЁ]\d{1,2}[.)]?\s*$)/; // заголовок задания, а не фраза «Вариант с ошибкой проверен»
 const whole = (text: string) => text.split(/^[ \t]*@@@.*$/m).some((t) => {
   const rows = t.split("\n");
   const head = rows.findIndex((r) => TASK.test(r));

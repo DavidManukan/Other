@@ -23,7 +23,7 @@ const t0 = Date.now();
 let got = [];
 while (Date.now() - t0 < 150_000) {
   got = calls.filter((c) => c.chatId === "700@c.us" && c.method !== "sendMessage");
-  const txt = calls.filter((c) => c.chatId === "700@c.us" && c.method === "sendMessage" && !/^(📥|➕)/.test(c.text));
+  const txt = calls.filter((c) => c.chatId === "700@c.us" && c.method === "sendMessage" && !/^(📥|➕|✍️)/.test(c.text)); // «принял» и «перепроверяю» это ещё не ответ
   if (got.length || txt.length) { await sleep(4000); break; }
   await sleep(300);
 }

@@ -2,12 +2,16 @@
 // Вебхук только кладёт задание в очередь и сразу отвечает шлюзу. Решает будильник объекта:
 // у него до 15 минут на кусок работы, а длинный ответ продолжается следующим будильником.
 //
-// Одно задание = одна работа: одно или несколько фото. Решение начинается сразу после первого фото.
-// Фото, пришедшее, пока ответ ещё не отправлен, добавляется к тому же заданию: решение начинается
-// заново со всеми фото, и ответ приходит один, по порядку заданий.
+// Одно задание = одна работа: одно или несколько фото. Решение начинается почти сразу после первого фото.
+// Фото, пришедшее в первую минуту решения, добавляется к тому же заданию: решение начинается заново со всеми фото,
+// и ответ приходит один. Фото, пришедшее позже, становится следующей работой: уже оплаченное решение не выбрасывается.
 //
-// Ответ уходит картинками-страницами «как в тетради» (формулы набраны, рисунок рядом с задачей),
-// короткие ответы стоят подписью к первой странице. Если браузер Cloudflare недоступен, ответ уходит текстом.
+// Готовое решение до отправки перепроверяет вторая модель; найденную ошибку исправляет основная, и человеку
+// приходит один, уже проверенный ответ. Исправлений вдогонку нет.
+//
+// Чем отправить ответ, решает его содержание: математика и физика уходят картинками-страницами «как в тетради»
+// (формулы набраны, рисунок рядом с задачей), остальное текстом, рисунки к тексту отдельными картинками.
+// Если браузер Cloudflare недоступен, страницы тоже уходят текстом.
 import { DurableObject } from "cloudflare:workers";
 import type Anthropic from "@anthropic-ai/sdk";
 import { type Cfg, type Effort, type Env, chatStub, config, hider, isEffort, logKey, lower } from "./config.ts";
@@ -16,7 +20,7 @@ import { CHECK_PROMPT, judgeText } from "./prompt.ts";
 import { CAPTION_MAX, Green, GreenError, permanent, TooBig } from "./green.ts";
 import { renderPng } from "./render.ts";
 import { type SelfTest, SAMPLE_PARTS, SAMPLE_SVG, status } from "./status.ts";
-import { card, compose, plainText, seam, splitAnswer, verdict } from "./text.ts";
+import { type Look, brief, card, compose, figureLabel, headKey, headOf, lookLine, lookOf, mergeFix, plainText, seam, splitAnswer, tableAt, verdict } from "./text.ts";
 import { type FileType, base64, clock, fileType, fingerprint, imageSize, imageType } from "./util.ts";
 
 const SEGMENT = 13 * 60_000; // столько работает один кусок (потолок будильника 15 минут)
@@ -26,11 +30,15 @@ const WATCHDOG = 150_000; // пульс пропал (площадка пере�
 const HELLO = 180_000; // столько молчим после «принял», прежде чем написать, что работа идёт
 const BACKOFF = [15_000, 45_000, 120_000]; // паузы перед повтором, когда Claude занят
 const GATEWAY_WAIT = [20_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000]; // ждём шлюз около часа, Claude при этом не трогаем
+const FIRST_WAIT = 2_500; // после первого фото: несколько фото, отправленных разом, приходят одно за другим с разницей в секунду
+const MERGE = 60_000; // столько с начала решения новое фото ещё добавляется к работе; позже оно становится следующей работой
+const MAX_REDO = 3; // столько раз работа, которая уже решалась, начинается заново из-за нового фото или уточнения: каждый раз это оплаченный и выброшенный запрос
 const ADD_MIN = 8_000; // после добавленного фото ждём следующее: не меньше этого...
 const ADD_MAX = 40_000; // ...и не больше этого (пауза подстраивается под темп, с которым идут фото)
 const NOTE_WAIT = 3_000; // после текстового уточнения к фото
 const HISTORY_TTL = 2 * 3600_000; // через 2 часа без сообщений чат начинается заново
 const HISTORY_MAX = 12; // последние 6 вопросов и ответов
+const PHOTO_HIST_TTL = 10 * 60_000; // работа по фото видит только прошлую работу, и только если та была недавно: старые фото в каждом запросе стоят денег
 const TURN_MAX = 50_000; // длиннее в памяти не храним
 const MAX_TRIES = 4; // попыток на один кусок
 const MAX_DRAWINGS = 12;
@@ -45,14 +53,12 @@ const PHOTO_BUDGET = 12_000_000; // столько байт фото уходи�
 const MAX_FETCHES = 3; // столько раз заново пробуем скачать фото, если шлюз временно не отдаёт
 const IMG_TTL = 86_400_000; // рисунки храним сутки
 const LOG_MAX = 12;
-const CHECK_TRIES = 3; // столько раз пробуем вторую проверку, если Claude занят или ответил не по форме
-const CHECK_TTL = 86_400_000; // вторую проверку ждём не дольше суток
+const CHECK_TRIES = 3; // столько раз пробуем каждый шаг второй проверки, если Claude занят или ответил не по форме
+const CHECK_MIN = (SEGMENT - SEGMENT_TAIL) / 2; // в куске осталось меньше половины: шаг проверки начинает следующий будильник со свежим запасом времени, иначе оплаченный запрос оборвётся по сроку
 const GATE_TTL = 30_000; // столько чат помнит общие настройки (доступ, лимит), не спрашивая служебный объект
 const SPEND_DAYS = 40; // за столько дней хранится расход
-// Исправление приходит позже, часто уже после ответа на следующее фото, а номера заданий в разных работах повторяются:
-// в заголовке и в памяти чата стоит начало исправляемого ответа, чтобы было видно, к какой работе оно относится
-const fixTitle = (of?: string) => (of ? `⚠️ Исправление к ответу «${of}»` : "⚠️ Исправление после перепроверки");
-const fixTurn = (of?: string) => (of ? `(бот сам перепроверил свой ответ «${of}» и прислал к нему исправление)` : "(бот сам перепроверил своё решение и прислал исправление)");
+const CHECKING = "✍️ Решение готово. Перепроверяю, чтобы быть уверенным на 100%.";
+const UNCHECKED = "(перепроверить не получилось: это первое решение, без второй проверки)";
 const CUT_NOTE = "(ответ получился слишком длинным и оборван: пришли оставшиеся задания отдельным фото)";
 const CONT = "Ответ оборвался. Продолжай со следующей строки после уже написанного: написанное не повторяй, незаконченный рисунок начни заново целиком.";
 export const STATUS = "__status"; // имя служебного объекта: журнал, страница проверки, хозяин бота
@@ -72,7 +78,8 @@ interface Meta {
 interface Opts {
   effort?: Effort;
   fast?: boolean;
-  pages?: boolean; // решение картинкой (страницы) или текстом
+  look?: "auto" | "pages" | "text"; // вид ответа: по содержанию, всегда страницами или всегда текстом
+  pages?: boolean; // прежняя запись настройки: false значило «текстом»
 }
 // Расход за сутки (UTC). Лежит в служебном объекте.
 interface Day {
@@ -90,34 +97,11 @@ interface Gate {
   owner: string | null;
   check: boolean; // вторая проверка решений: одна на весь бот, как лимит и доступ, иначе «выкл» у хозяина не спасает от трат в чужих чатах
 }
-// Вторая проверка. В объекте чата лежит то, что нужно проверить; очередь проверок ведёт отдельный объект «чат#check»,
-// чтобы проверка шла параллельно со следующими заданиями и не задерживала их.
-interface CheckInput {
-  turn: Block[];
-  body: string;
-  effort: Effort;
-  at: number;
-  label?: string; // начало списка ответов («№1: 4 см²; №2: 5»): по нему человек узнаёт, к какой работе исправление
-}
+// Вторая проверка готового решения: идёт до отправки, внутри той же работы
 interface Check {
-  ref: string;
-  chatId: string;
-  phase: "check" | "judge"; // проверяющая модель, затем (если она нашла ошибку) арбитраж основной модели
-  tries: number;
+  phase: "check" | "judge"; // проверяющая модель, затем (если она нашла ошибку) основная модель разбирает замечания
+  tries: number; // попытки текущего шага
   issues?: string;
-  result?: CheckResult; // итог уже получен, осталось передать его чату: платные запросы повторять не нужно
-  after?: number;
-}
-// То, что получает объект проверок: вопрос с фото в виде запроса к Claude и отправленное решение
-interface CheckWork {
-  question: Anthropic.Beta.BetaContentBlockParam[];
-  body: string;
-  effort: Effort;
-}
-interface CheckResult {
-  ok?: boolean;
-  fix?: string; // исправленное решение заданий, где была ошибка
-  failed?: string;
 }
 const day = (t: number) => new Date(t).toISOString().slice(0, 10);
 const money = (x: number) => `$${x.toFixed(2)}`;
@@ -144,13 +128,13 @@ interface Outcome {
   refused: boolean;
   empty: boolean;
   noted?: boolean; // пометки «оборван» и «не дорешала» уже отправлены
+  unchecked?: boolean; // сказано, что вторая проверка не состоялась
   capped?: string; // ответ оборван дневным лимитом: это сообщение уходит после него
 }
 interface Job {
   id: string;
   at: number;
-  kind: "image" | "text" | "fix"; // fix: готовое исправление после второй проверки, его нужно только доставить
-  fixOf?: string; // у исправления: начало ответа, который оно исправляет
+  kind: "image" | "text";
   text?: string;
   fwd?: boolean; // текст переслан из другого чата
   shots: Shot[]; // фото этой работы по порядку
@@ -162,6 +146,13 @@ interface Job {
   tries: number; // попытки текущего куска
   effort: Effort;
   acc: string; // начало ответа из прошлых кусков (если ответ обрезало и он продолжается)
+  told?: number; // о скольких фото этой работы человеку уже сказано
+  redo?: number; // сколько раз начатое решение выбрасывали из-за нового фото или уточнения
+  asked?: number; // когда начался первый запрос к Claude по этой работе: в первую минуту новое фото ещё добавляется к ней
+  past?: number; // отметка памяти чата, из которой в запросы этой работы взята прошлая работа (0: не взята)
+  look?: Look; // чем отправить ответ, по мнению модели: страницами или текстом
+  check?: Check; // вторая проверка идёт
+  verified?: "ok" | "fixed" | "skip" | "failed"; // чем она кончилась; failed: не состоялась, об этом скажем после ответа
   body?: string; // готовый ответ целиком: уйдёт в память чата после доставки
   parts?: string[]; // он же по заданиям (формулы ещё в LaTeX)
   turn?: Block[]; // вопрос, на который это ответ: в память чата пара уходит после доставки
@@ -208,6 +199,16 @@ function count(shots: Shot[]): string {
   if (files < n) return `${n} (фото и файлы)`;
   return `${n} ${n % 10 === 1 && n % 100 !== 11 ? "файл" : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? "файла" : "файлов"}`;
 }
+
+// В задании есть таблица
+const tabled = (part: string): boolean => {
+  const lines = part.split("\n");
+  return lines.some((_, i) => tableAt(lines, i) !== null);
+};
+// Модель не назвала вид ответа: страница нужна, если в задании есть формулы, которые в строку читаются плохо
+// (дробь, корень, интеграл, система, вектор), или оно оформлено через «Дано» с формулами
+const heavy = (part: string): boolean =>
+  /\\(?:d?frac|sqrt|int|sum|prod|lim|begin|vec|overline|binom)(?![A-Za-z])/.test(part) || (/^Дано:/m.test(part) && /\$[^$\n]+\$/.test(part));
 
 class Delivery extends Error {} // ответ готов, но шлюз его сейчас не принимает: Claude не переспрашиваем, ждём шлюз
 class Added extends Error {} // к заданию добавили фото или уточнение: решение начинается заново со всем сразу
@@ -287,17 +288,20 @@ export class Chat extends DurableObject<Env> {
     }
   }
 
-  // Последнее задание в очереди, если это работа с фото, ответ на которую ещё не начал уходить: к ней можно добавлять.
-  // Ответ мог быть уже готов (шлюз лежал, или страницы ещё снимаются): он выбрасывается, работа решается заново со всеми фото.
-  // Исправления после второй проверки встают в очередь сами, без участия человека: на то, к какой работе
-  // относится его следующее фото или уточнение, они не влияют.
+  // Последнее задание в очереди, если к нему ещё можно добавить фото: работа ждёт или решается не дольше минуты.
+  // Позже добавлять нельзя: решение, на которое модель уже потратила минуты, пришлось бы выбросить и оплатить заново.
+  // Готовый ответ (идёт вторая проверка, шлюз лежит, снимаются страницы) тоже не трогаем: новое фото станет следующей работой,
+  // а прошлую работу и её решение модель увидит в памяти чата и сама поймёт, продолжение это или новое задание.
   private async openJob(): Promise<{ key: string; job: Job; live: boolean } | null> {
     const all = await this.db.list<Job>({ prefix: "job:" });
-    const last = [...all].reverse().find(([, j]) => j.kind !== "fix");
+    const last = [...all].at(-1);
     if (!last) return null;
     const live = this.cur?.key === last[0];
     const job = live ? this.cur!.job : last[1];
-    const open = job.kind === "image" && job.phase === "solve" && !job.sent && !job.unsure && !(live && this.posting === last[0]);
+    // пока запрос к Claude не начат, добавление ничего не стоит; начатое решение выбрасываем только в его первую минуту и не больше MAX_REDO раз
+    // (нижняя граница окна нужна только в локальных проверках, где время ускорено)
+    const early = !job.asked || (Date.now() - job.asked < Math.max(MERGE / this.k, 3000) && (job.redo ?? 0) < MAX_REDO);
+    const open = job.kind === "image" && job.phase === "solve" && !job.done && early && !job.sent && !job.unsure && !(live && this.posting === last[0]);
     return open ? { key: last[0], job, live } : null;
   }
 
@@ -305,6 +309,11 @@ export class Chat extends DurableObject<Env> {
   private rewind(job: Job, wait: number) {
     job.acc = "";
     job.lean = undefined;
+    job.asked = undefined;
+    job.past = undefined;
+    job.look = undefined;
+    job.check = undefined;
+    job.verified = undefined;
     job.body = undefined;
     job.parts = undefined;
     job.turn = undefined;
@@ -330,14 +339,22 @@ export class Chat extends DurableObject<Env> {
       // если идёт серия, следующее фото придёт в том же темпе, и решать лучше один раз всё сразу.
       const { key, job, live } = open;
       const gap = (shot.at - (job.shots.at(-1)?.at ?? shot.at)) * this.k;
+      const started = !!job.asked; // решение уже шло: его придётся начать заново
       job.shots.push(shot);
-      this.rewind(job, Math.min(ADD_MAX, Math.max(ADD_MIN, gap * 1.5)));
+      // Работа ещё не начата (несколько фото отправлены разом): ждём недолго. Уже решалась: ждём дольше, каждый перезапуск стоит денег.
+      this.rewind(job, Math.min(ADD_MAX, Math.max(started ? ADD_MIN : FIRST_WAIT, gap * 1.5)));
+      if (started) {
+        job.told = job.shots.length;
+        job.redo = (job.redo ?? 0) + 1;
+      }
       await this.db.put({ ...mark, [key]: job });
       if (live) this.stop?.abort(new Added("добавлено фото"));
       await this.db.setAlarm(job.after!);
-      return await this.say(chatId, `➕ Добавил к прошлому: теперь ${count(job.shots)}. Решение пришлю одним ответом.`);
+      // о фото, которые пришли до начала решения, скажем одним сообщением, когда оно начнётся
+      if (started) await this.say(chatId, `➕ Добавил к прошлому: теперь ${count(job.shots)}. Решение пришлю одним ответом.`);
+      return;
     }
-    const busy = await this.enqueue({ kind: "image", id: shot.id, shots: [shot] }, mark);
+    const busy = await this.enqueue({ kind: "image", id: shot.id, shots: [shot] }, mark, FIRST_WAIT);
     const what = shot.pdf ? "файл" : "фото";
     await this.say(chatId, busy ? `📥 Принял ${what}, решу сразу после текущего.` : `📥 Принял ${what}, решаю.`);
   }
@@ -348,6 +365,7 @@ export class Chat extends DurableObject<Env> {
       // сообщение пришло, пока решается работа с фото: считаем его уточнением к ней
       const { key, job, live } = open;
       (fwd ? (job.quotes ??= []) : job.notes).push(text.slice(0, 2000));
+      if (job.asked) job.redo = (job.redo ?? 0) + 1;
       this.rewind(job, NOTE_WAIT);
       await this.db.put({ ...mark, [key]: job });
       if (live) this.stop?.abort(new Added("добавлено уточнение"));
@@ -363,9 +381,11 @@ export class Chat extends DurableObject<Env> {
     await this.db.put({ seen: id ? [...seen.filter((x) => x !== id), id].slice(-200) : seen, meta });
   }
 
-  private async options(): Promise<{ effort: Effort; fast: boolean; pages: boolean; check: boolean }> {
+  private async options(): Promise<{ effort: Effort; fast: boolean; look: "auto" | "pages" | "text"; check: boolean }> {
     const o = (await this.db.get<Opts>("opts")) ?? {};
-    return { effort: o.effort ?? this.c.effort, fast: o.fast ?? this.c.fast, pages: o.pages ?? this.c.pages, check: (await this.gate()).check };
+    // Вид ответа выбирается по содержанию, пока чат не попросил другое. PAGES=0 делает видом по умолчанию текст.
+    const look = o.look ?? (o.pages === false || !this.c.pages ? "text" : "auto");
+    return { effort: o.effort ?? this.c.effort, fast: o.fast ?? this.c.fast, look, check: (await this.gate()).check };
   }
 
   // Общие настройки (доступ, дневной лимит, сегодняшний расход) лежат в служебном объекте; чат помнит их полминуты
@@ -424,10 +444,10 @@ export class Chat extends DurableObject<Env> {
       const mine = await this.isOwner(chatId);
       await this.green.send(
         chatId,
-        `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}, пересчёт кодом ${this.c.code ? "вкл" : "выкл"}, вторая проверка ${o.check ? "вкл" : "выкл"}, решение: ${o.pages ? "картинкой" : "текстом"}${queue ? `, в работе: ${queue}` : ""}\n` +
+        `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}, пересчёт кодом ${this.c.code ? "вкл" : "выкл"}, вторая проверка ${o.check ? "вкл" : "выкл"}, решение: ${o.look === "auto" ? "авто (математика и физика картинкой, остальное текстом)" : o.look === "pages" ? "картинкой" : "текстом"}${queue ? `, в работе: ${queue}` : ""}\n` +
           (mine
-            ? `Команды: решай, стоп, сброс, картинкой / текстом, быстро / средне / умно / макс, fast вкл / fast выкл, проверка вкл / выкл, расход, лимит 3 / лимит выкл, доступ закрыть / открыть\nЖурнал: ${origin}/?k=${await logKey(this.c)}`
-            : "Команды: решай, стоп, сброс, картинкой / текстом") +
+            ? `Команды: решай, стоп, сброс, авто / картинкой / текстом, быстро / средне / умно / макс, fast вкл / fast выкл, проверка вкл / выкл, расход, лимит 3 / лимит выкл, доступ закрыть / открыть\nЖурнал: ${origin}/?k=${await logKey(this.c)}`
+            : "Команды: решай, стоп, сброс, авто / картинкой / текстом") +
           // хозяин по первому сообщению это временно: постоянным его делает переменная
           (mine && !this.c.owners.length ? `\nСовет: добавь в Cloudflare переменную OWNER со значением ${chatId}, тогда хозяином не сможет стать никто другой.` : ""),
       );
@@ -435,7 +455,6 @@ export class Chat extends DurableObject<Env> {
     }
     if (/^(сброс|новое|reset)$/.test(t)) {
       await this.forget();
-      await this.dropChecks(chatId);
       await this.green.send(chatId, "Память чата очищена ✅");
       return true;
     }
@@ -443,7 +462,6 @@ export class Chat extends DurableObject<Env> {
       const jobs = await this.db.list({ prefix: "job:" });
       await this.db.delete([...jobs.keys()]);
       this.stop?.abort(new Stopped("стоп"));
-      await this.dropChecks(chatId);
       await this.green.send(chatId, jobs.size ? "Остановил ✅" : "Сейчас ничего не решаю.");
       return true;
     }
@@ -464,11 +482,11 @@ export class Chat extends DurableObject<Env> {
       return true;
     }
     // вид ответа: расходов не меняет, поэтому доступен любому чату
-    const look = t.match(/^(картинкой|картинки|текстом)$/);
-    if (look) {
-      const pages = look[1] !== "текстом";
-      await this.db.put<Opts>("opts", { ...((await this.db.get<Opts>("opts")) ?? {}), pages });
-      await this.green.send(chatId, pages ? "Решения присылаю картинкой ✅" : "Решения присылаю текстом ✅");
+    const lk = t.match(/^(картинкой|картинки|текстом|авто|сам)$/);
+    if (lk) {
+      const look = lk[1] === "текстом" ? "text" : lk[1].startsWith("картин") ? "pages" : "auto";
+      await this.db.put<Opts>("opts", { ...((await this.db.get<Opts>("opts")) ?? {}), look, pages: undefined });
+      await this.green.send(chatId, look === "pages" ? "Решения присылаю картинкой ✅" : look === "text" ? "Решения присылаю текстом ✅" : "Вид ответа выбираю сам ✅ Математика и физика картинкой, остальное текстом.");
       return true;
     }
     // расходы, лимит, доступ и вторая проверка: всё это про деньги хозяина, поэтому только ему
@@ -507,7 +525,7 @@ export class Chat extends DurableObject<Env> {
         const check = chk[1] === "вкл" || chk[1] === "on";
         await hub.setGate({ check });
         this.gateAt = 0;
-        await this.green.send(chatId, check ? `Вторая проверка включена ✅ Во всех чатах после ответа решение перепроверяет ${this.c.checkModel}; найдёт ошибку, пришлю исправление.` : "Вторая проверка выключена ✅ Во всех чатах.");
+        await this.green.send(chatId, check ? `Вторая проверка включена ✅ Во всех чатах готовое решение до отправки перепроверяет ${this.c.checkModel}; ошибку исправляю сразу, приходит один проверенный ответ.` : "Вторая проверка выключена ✅ Во всех чатах.");
       }
       return true;
     }
@@ -546,14 +564,17 @@ export class Chat extends DurableObject<Env> {
   }
 
   // Ставит задание в очередь. Возвращает true, если перед ним уже есть другие
-  private async enqueue(j: Pick<Job, "kind" | "id" | "text" | "fwd" | "shots">, mark: Record<string, unknown>): Promise<boolean> {
+  // wait: сколько подождать перед началом (не придёт ли следом ещё фото этой же работы)
+  private async enqueue(j: Pick<Job, "kind" | "id" | "text" | "fwd" | "shots">, mark: Record<string, unknown>, wait = 0): Promise<boolean> {
     const queue = (await this.db.list({ prefix: "job:", limit: MAX_QUEUE })).size;
     if (queue >= MAX_QUEUE) throw new Error("Слишком много заданий в очереди. Подожди ответов или напиши «стоп».");
     const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
     const { effort } = await this.options();
     const job: Job = { ...j, at: Date.now(), notes: [], quotes: [], fetches: 0, phase: "solve", step: 0, tries: 0, effort, acc: "", sent: 0, outbox: [], shot: 0, pages: 0, down: 0, svgs: [], drawn: 0, msgs: 0, tokens: 0, checks: 0 };
+    // (нижняя граница нужна только в локальных проверках, где время ускорено: в работе ожидание и так дольше)
+    if (wait > 0) job.after = Date.now() + Math.max(wait / this.k, 300);
     await this.db.put({ ...mark, seq, [`job:${String(seq).padStart(9, "0")}`]: job });
-    if (!queue) await this.db.setAlarm(Date.now());
+    if (!queue) await this.db.setAlarm(job.after ?? Date.now());
     return queue > 0;
   }
 
@@ -571,13 +592,11 @@ export class Chat extends DurableObject<Env> {
       const [key, job] = [...first][0] ?? [];
       const watch = () => this.db.setAlarm(Date.now() + WATCHDOG / this.k).catch((e) => console.log("watchdog:", String(e)));
       if (!key || !job) {
-        // заданий нет: это либо объект второй проверки со своей очередью, либо служебный объект с самопроверкой
-        const [ckey, chk] = [...(await this.db.list<Check>({ prefix: "chkq:", limit: 1 }))][0] ?? [];
-        if (!ckey || !chk) return await this.selfTest();
-        if (chk.after && chk.after > Date.now()) return;
-        await watch();
-        beat = setInterval(watch, BEAT / this.k);
-        return await this.runCheck(ckey, chk);
+        // заданий нет: это служебный объект с самопроверкой. Очередь проверок прошлой версии (проверка шла после ответа,
+        // в отдельном объекте) больше не нужна: её записи убираем
+        const old = await this.db.list({ prefix: "chkq:", limit: 64 });
+        if (old.size) return void (await this.db.delete([...old.keys()]));
+        return await this.selfTest();
       }
       if (job.after && job.after > Date.now()) return; // пауза перед повтором или ожидание следующего фото ещё не прошли
       await watch();
@@ -592,9 +611,7 @@ export class Chat extends DurableObject<Env> {
       this.posting = null;
       const next = await this.db.list<Job>({ prefix: "job:", limit: 1 });
       const job = [...next.values()][0];
-      const chk = job ? undefined : [...(await this.db.list<Check>({ prefix: "chkq:", limit: 1 })).values()][0];
       if (job) await this.db.setAlarm(Math.max(Date.now(), job.after ?? 0));
-      else if (chk) await this.db.setAlarm(Math.max(Date.now(), chk.after ?? 0));
       else await this.db.deleteAlarm();
     }
   }
@@ -605,6 +622,8 @@ export class Chat extends DurableObject<Env> {
     const { chatId, origin } = meta;
     const end = Date.now() + SEGMENT / this.k;
     if (!(await this.db.get(key))) return; // «стоп» успел удалить задание
+    // исправление вдогонку из прошлой версии бота: таких сообщений больше нет
+    if ((job.kind as string) === "fix") return void (await this.db.delete(key));
     const stop = new AbortController();
     this.stop = stop;
     this.cur = { key, job };
@@ -654,9 +673,11 @@ export class Chat extends DurableObject<Env> {
       if (e instanceof Timeout && retry) {
         // модель думала весь кусок и ничего не написала: следующая попытка на ступень проще
         job.effort = lower(job.effort);
+        if (!job.done && !job.acc) job.asked = undefined; // решение начнётся заново: новое фото к нему добавится без потерь (если оплаченного начала ответа ещё нет)
         await this.db.put(key, job);
         await this.say(chatId, "⏳ Долго думаю, решаю быстрее…");
       } else if (e instanceof Busy && retry) {
+        if (!job.done && !job.acc) job.asked = undefined; // ответа нет, выбрасывать нечего: пауза перед повтором окно добавления не тратит
         job.after = Date.now() + (BACKOFF[job.tries - 1] ?? BACKOFF[0]) / this.k;
         await this.db.put(key, job);
         if (job.tries === 1) await this.say(chatId, "⏳ Claude занят, пробую ещё раз…");
@@ -702,6 +723,12 @@ export class Chat extends DurableObject<Env> {
       }
       const content = await this.question(key, job, chatId);
       if (!content) return;
+      // несколько фото пришли до начала решения: одно сообщение о том, сколько их взято в работу
+      if (job.kind === "image" && job.shots.length > 1 && job.told !== job.shots.length && !job.acc && !capped) {
+        job.told = job.shots.length;
+        await save();
+        await this.say(chatId, `➕ Всего ${count(job.shots)}, решаю одним ответом.`);
+      }
 
       let a: Answer;
       let full: string;
@@ -711,12 +738,13 @@ export class Chat extends DurableObject<Env> {
         a = { text: "", cut: true, refused: false, tokens: { in: 0, out: 0 }, model: job.model ?? this.c.model, checks: 0 };
         full = job.acc;
       } else {
-        const turns: Turn[] = [...(await this.history()), { role: "user", content }];
+        const turns: Turn[] = [...(await this.past(job)), { role: "user", content }];
         // если ответ обрезало, продолжаем его: уже написанное модель видит как свой текст
         if (job.acc) turns.push({ role: "assistant", content: job.acc }, { role: "user", content: [{ type: "text", text: CONT }] });
 
         // Попытка засчитывается до сборки запроса: если объект упадёт на ней (фото и PDF в памяти) или посреди запроса, счётчик это запомнит
         job.tries++;
+        job.asked ??= Date.now();
         await save();
         // lean: в первом куске решено не брать файлы прошлых работ; продолжение ответа собирается так же
         let messages = await this.toApi(turns, job.lean ? content : undefined);
@@ -767,7 +795,10 @@ export class Chat extends DurableObject<Env> {
       }
 
       // 2. Ответ готов. С этой записи Claude по этой работе больше не спрашиваем: дальше только доставка
-      const { text, svgs } = splitAnswer(full);
+      // первая строка ответа служебная: модель называет, чем его отправить (страницами или текстом)
+      const seen = lookOf(full);
+      job.look = seen.look ?? undefined;
+      const { text, svgs } = splitAnswer(seen.text);
       job.parts = tasks(text);
       job.svgs = [...new Set(svgs)].slice(0, MAX_DRAWINGS);
       job.body = job.parts.join("\n\n");
@@ -776,26 +807,26 @@ export class Chat extends DurableObject<Env> {
       job.packed = false;
       job.done = { cut: a.cut, refused: a.refused, empty: !job.parts.length, ...(capped ? { capped: capText } : {}) };
       job.acc = "";
+      job.tries = 0; // попытки считались для запроса к Claude: готовый ответ, который ждёт проверку или шлюз, из-за них сниматься не должен
       await save();
     }
 
-    // 3. Раскладываем ответ по сообщениям (страницы-картинки или текст) и отправляем
+    // 3. Вторая проверка: до отправки. Пока она не закончена, ответ не уходит; ошибка исправляется здесь же
+    if (!job.verified && !(await this.verify(job, chatId, end, stop, save))) return;
+
+    // 4. Раскладываем ответ по сообщениям (страницы-картинки или текст) и отправляем
     if (!job.packed) await this.pack(job, stop, save);
     await this.flush(key, job, chatId, origin, stop);
     // Память чата и задание без вопроса пишем одной записью: после перезапуска пара не добавится второй раз
     const turn = job.turn;
-    const parts = job.parts ?? [];
-    const solved = parts.some((p) => /^Ответ:/m.test(p));
     job.turn = undefined;
     job.parts = undefined;
     if (turn && epoch === this.epoch && (job.body || job.svgs.length)) {
-      await this.db.put({ hist: this.trimHistory([...(await this.history()), { role: "user", content: turn }, { role: "assistant", content: job.body || "[рисунок]" }]), [key]: job });
-      // Ответ у человека. Теперь его независимо перепроверяет вторая модель: в фоне, следующие задания это не задерживает
-      const done = job.done;
-      if (job.kind === "image" && solved && job.body && done && !done.cut && !done.refused && (await this.options()).check) await this.startCheck(job, turn, parts, chatId);
+      // в памяти ответ лежит таким, каким его написала модель: со служебной строкой вида
+      await this.db.put({ hist: this.trimHistory([...(await this.history()), { role: "user", content: turn }, { role: "assistant", content: lookLine(job.look) + (job.body || "[рисунок]") }]), [key]: job });
     }
 
-    // 4. Итог
+    // 5. Итог
     const a = job.done!;
     job.tries = 0;
     if (a.empty && !job.svgs.length) {
@@ -807,6 +838,12 @@ export class Chat extends DurableObject<Env> {
       if (a.refused) await this.say(chatId, "(модель остановилась и не дорешала. Пересними оставшиеся задания.)");
       if (a.cut) await this.say(chatId, a.capped ?? CUT_NOTE); // оборван лимитом: прислать остальное отдельно сейчас не выйдет, поэтому говорим про лимит
     }
+    if (job.verified === "failed" && !a.unchecked) {
+      // человеку обещали перепроверку, а она не состоялась: говорим об этом один раз
+      a.unchecked = true;
+      await this.db.put(key, job);
+      await this.say(chatId, UNCHECKED);
+    }
     if (job.svgs.length) {
       job.done = undefined;
       job.phase = "draw";
@@ -816,23 +853,33 @@ export class Chat extends DurableObject<Env> {
     await this.sweep();
   }
 
-  // Готовый ответ -> сообщения. Сначала пробуем страницы «как в тетради»: формулы набраны, рисунок стоит в своей задаче,
-  // короткие ответы идут подписью к первой странице. Не вышло (нет браузера, кончились его бесплатные минуты): текст.
+  // Готовый ответ -> сообщения: страницы «как в тетради» или текст.
+  // Страницы нужны там, где формулы плохо читаются в строку (математика, физика) или рисунок должен стоять внутри решения.
+  // Остальное быстрее и дешевле отправить текстом: тест и краткие ответы списком, химию и гуманитарные предметы сообщением,
+  // рисунки к ним отдельными картинками. Предмет видит модель, поэтому вид ответа называет она (служебная строка «ВИД»);
+  // без этой строки решает содержание. Не вышло снять страницы (нет браузера, кончились его бесплатные минуты): текст.
   private async pack(job: Job, stop: AbortSignal, save: () => Promise<void>) {
     const parts = job.parts ?? [];
     const plain = parts.map(plainText);
-    const { pages } = await this.options();
-    // Страницы нужны решению. Разговор без формул и служебный ответ («Не разобрал фото. Пересними ближе.») остаются текстом
+    const { look } = await this.options();
+    // краткие задания целиком видны в списке ответов: на страницы их не ставим. Кроме тех, к которым есть рисунок:
+    // без своего задания он встал бы внутрь чужого решения
+    const drawn = new Set(job.svgs.map((s) => headKey(figureLabel(s))).filter(Boolean));
+    const full = parts.filter((p) => !brief(p) || drawn.has(headOf(p)));
     const solved = parts.some((p) => /^Ответ:/m.test(p)) || job.svgs.length > 0;
-    const worth = solved && (job.kind !== "text" || job.svgs.length > 0 || parts.some((p) => /\$[^$\n]+\$/.test(p)));
-    const title = job.kind === "fix" ? fixTitle(job.fixOf) : undefined; // исправление после второй проверки подписано так, чтобы его не спутали с новым решением
+    // на странице есть что набирать: формулы, рисунок или таблица
+    const rich = full.some((p) => /\$[^$\n]+\$/.test(p)) || job.svgs.length > 0 || full.some(tabled);
+    // Служебный ответ («Не разобрал фото. Пересними ближе.») и тест из одних кратких ответов страницей не становятся никогда.
+    // «картинкой»: страницей идёт любое решение по фото, а ответ на вопрос текстом только если в нём есть что набирать.
+    // «авто»: страницу называет модель (без её строки решает содержание), и только когда на ней есть что набирать.
+    const page = solved && full.length > 0 && (look === "pages" ? job.kind !== "text" || rich : look === "auto" && rich && (job.look ? job.look === "page" : full.some(heavy)));
     let shots: Uint8Array[] | null = null;
-    if (pages && worth && parts.length && job.shot < 2 && (this.env.BROWSER || this.env.SHOT) && Date.now() >= ((await this.db.get<number>("nobrowser")) ?? 0)) {
+    if (page && job.shot < 2 && (this.env.BROWSER || this.env.SHOT) && Date.now() >= ((await this.db.get<number>("nobrowser")) ?? 0)) {
       job.shot++; // попытка засчитывается заранее: если снимок уронит объект, во второй раз не пробуем
       await save();
       const began = Date.now();
       try {
-        shots = await this.snap(parts, job.svgs);
+        shots = await this.snap(full, job.svgs);
       } catch (e: any) {
         if (typeof e?.until === "number") await this.db.put("nobrowser", e.until); // бесплатные минуты браузера на сегодня кончились
         console.log("pages:", this.hide(e?.stack ?? e));
@@ -843,7 +890,7 @@ export class Chat extends DurableObject<Env> {
       if (stop.aborted) throw stop.reason; // пока снимали, пришло ещё фото или «стоп»
     }
     if (shots?.length) {
-      const summary = card(plain, title);
+      const summary = card(plain);
       const items: Out[] = summary.length > CAPTION_MAX ? compose([summary], MSG_MAX) : []; // длинный список ответов идёт отдельным сообщением перед страницами
       for (const [i, bytes] of shots.entries()) {
         const id = imageId();
@@ -855,7 +902,7 @@ export class Chat extends DurableObject<Env> {
       job.pages = shots.length;
       job.svgs = []; // рисунки уже стоят на страницах
     } else {
-      job.outbox = compose(plain, MSG_MAX, title);
+      job.outbox = compose(plain, MSG_MAX);
     }
     job.packed = true;
     await save();
@@ -973,8 +1020,8 @@ export class Chat extends DurableObject<Env> {
     const lead = n === 1
       ? files ? "Реши задания из файла PDF." : "Реши задания с фото."
       : files
-      ? `Реши задания из этих материалов: их ${n}, фото и файлы PDF. Это одна работа, материалы идут в том порядке, в котором их прислали.`
-      : `Реши задания с этих ${n} фото. Это одна работа, фото идут в том порядке, в котором их сняли.`;
+      ? `Реши задания из этих материалов: их ${n}, фото и файлы PDF. Они идут в том порядке, в котором их прислали. Одна это работа, снятая частями, или разные, определи по содержанию.`
+      : `Реши задания с этих ${n} фото. Они идут в том порядке, в котором их прислали. Одна это работа, снятая частями, или разные, определи по содержанию.`;
     content.push({
       type: "text",
       // чужое идёт раньше слов владельца и в тегах: строка «Сообщения владельца» внутри пересланного останется пересланным
@@ -1040,9 +1087,9 @@ export class Chat extends DurableObject<Env> {
       const cutoff = (Date.now() - IMG_TTL).toString(16).padStart(12, "0");
       const old = await this.db.list({ prefix: "img:", end: `img:${cutoff}`, limit: 16 });
       if (old.size) await this.db.delete([...old.keys()]);
-      // проверка, которая так и не закончилась (её объект не ответил за сутки)
-      const stale = [...(await this.db.list<CheckInput>({ prefix: "chkin:", limit: 16 }))].filter(([, v]) => Date.now() - v.at > CHECK_TTL).map(([k]) => k);
-      if (stale.length) await this.db.delete(stale);
+      // записи второй проверки из прошлой версии бота (она шла после ответа): больше не нужны
+      const stale = await this.db.list({ prefix: "chkin:", limit: 16 });
+      if (stale.size) await this.db.delete([...stale.keys()]);
     } catch (e) {
       console.log("sweep:", this.hide(e));
     }
@@ -1060,7 +1107,7 @@ export class Chat extends DurableObject<Env> {
     const sec = Math.round((Date.now() - (job.started ?? job.at)) / 1000);
     const photos = job.shots.length ? `, фото ${job.shots.length}${job.shots[0].size ? ` (${job.shots[0].size})` : ""}` : "";
     await this.note(
-      `${message ? "без ответа" : "решено"} за ${sec} с${photos}: сообщений ${job.msgs}, страниц ${job.pages ?? 0}, рисунков ${job.drawn}, пересчётов кодом ${job.checks}, режим ${job.effort}, модель ${job.model ?? this.c.model}, токенов ${job.tokens}${job.usd ? `, примерно ${money(job.usd)}` : ""}`,
+      `${message ? "без ответа" : "решено"} за ${sec} с${photos}: сообщений ${job.msgs}, страниц ${job.pages ?? 0}, рисунков ${job.drawn}, пересчётов кодом ${job.checks}, вторая проверка: ${job.verified === "ok" ? "подтвердила" : job.verified === "fixed" ? "исправила до отправки" : job.verified === "failed" ? "не состоялась" : "не было"}, режим ${job.effort}, модель ${job.model ?? this.c.model}, токенов ${job.tokens}${job.usd ? `, примерно ${money(job.usd)}` : ""}`,
     );
   }
 
@@ -1073,6 +1120,20 @@ export class Chat extends DurableObject<Env> {
   private async history(): Promise<Turn[]> {
     const h = await this.db.get<{ at: number; turns: Turn[] }>("hist");
     return h && Date.now() - h.at < HISTORY_TTL && Array.isArray(h.turns) ? h.turns : [];
+  }
+
+  // Что из памяти чата идёт в запросы этой работы. Вопрос текстом видит весь разговор. Работа по фото видит только
+  // прошлую работу, и только если та закончилась недавно: по ней модель понимает, продолжение это или новое задание.
+  // Старые фото и решения в каждом запросе стоили бы денег, а человеку, который шлёт задание за заданием, они не нужны.
+  // Выбор делается один раз на работу (job.past): продолжения ответа и вторая проверка видят то же самое.
+  private async past(job: Job): Promise<Turn[]> {
+    const h = await this.db.get<{ at: number; turns: Turn[] }>("hist");
+    const live = h && Array.isArray(h.turns) && Date.now() - h.at < HISTORY_TTL ? h : null;
+    if (job.kind !== "image") return live?.turns ?? [];
+    job.past ??= live && Date.now() - live.at < PHOTO_HIST_TTL / this.k ? live.at : 0;
+    if (!live || !job.past || live.at !== job.past) return [];
+    const from = live.turns.findLastIndex((t) => t.role === "user");
+    return from >= 0 ? live.turns.slice(from) : [];
   }
 
   // Запись для памяти чата: последние ходы, слишком длинные ответы обрезаны
@@ -1144,170 +1205,114 @@ export class Chat extends DurableObject<Env> {
     }));
   }
 
-  // ---------- вторая проверка: сторона чата ----------
-  // Готовый ответ уже у человека. Кладём рядом то, что нужно проверить, и будим объект проверок этого чата.
-  private async startCheck(job: Job, turn: Block[], parts: string[], chatId: string) {
-    try {
-      const ref = imageId();
-      const list = card(parts.map(plainText)).split("\n").slice(1, 4).join("; ");
-      const label = list.length > 80 ? `${list.slice(0, 79).trimEnd()}…` : list;
-      await this.db.put<CheckInput>(`chkin:${ref}`, { turn, body: job.body ?? "", effort: job.effort, at: Date.now(), label });
-      await chatStub(this.env, `${chatId}#check`).enqueueCheck(ref, chatId);
-    } catch (e) {
-      console.log("check:", this.hide(e)); // проверка это дополнение: её сбой ответу не мешает
-    }
-  }
-
-  // «стоп» и «сброс»: начатые проверки больше не нужны
-  private async dropChecks(chatId: string) {
-    try {
-      const pending = await this.db.list({ prefix: "chkin:" });
-      if (!pending.size) return;
-      await this.db.delete([...pending.keys()]);
-      await chatStub(this.env, `${chatId}#check`).cancelChecks();
-    } catch (e) {
-      console.log("check:", this.hide(e));
-    }
-  }
-
-  // Что проверять: вопрос с фото в том виде, в каком его получает Claude, и отправленное решение. null: проверка отменена или фото уже нет
-  async checkInput(ref: string): Promise<CheckWork | null> {
-    const inp = await this.db.get<CheckInput>(`chkin:${ref}`);
-    if (!inp) return null;
-    const content = (await this.toApi([{ role: "user", content: inp.turn }]))[0]?.content;
-    const question = Array.isArray(content) ? content : [];
-    if (!question.some((b) => b.type === "image" || b.type === "document")) {
-      await this.db.delete(`chkin:${ref}`);
-      return null;
-    }
-    return { question, body: inp.body, effort: inp.effort };
-  }
-
-  // Итог второй проверки. Ошибок нет: короткое подтверждение. Есть: исправление встаёт в очередь как готовый ответ.
-  async checked(ref: string, r: CheckResult): Promise<void> {
-    const inp = await this.db.get<CheckInput>(`chkin:${ref}`);
-    const meta = await this.db.get<Meta>("meta");
-    if (!inp || !meta) return; // «стоп» или «сброс» пришли раньше: результат уже не нужен
-    if (r.failed) {
-      await this.db.delete(`chkin:${ref}`);
-      return await this.note(`вторая проверка не состоялась: ${this.hide(r.failed).slice(0, 140)}`);
-    }
-    if (r.fix) {
-      const { text, svgs } = splitAnswer(r.fix);
-      const parts = tasks(text);
-      if (parts.length) {
-        const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
-        const job: Job = {
-          kind: "fix", fixOf: inp.label, id: `fix${ref}`, at: Date.now(), shots: [], notes: [], quotes: [], fetches: 0, phase: "solve", step: 0, tries: 0, effort: inp.effort, acc: "",
-          body: parts.join("\n\n"), parts, turn: [{ type: "text", text: fixTurn(inp.label) }], done: { cut: false, refused: false, empty: false },
-          sent: 0, outbox: [], shot: 0, pages: 0, down: 0, svgs: [...new Set(svgs)].slice(0, MAX_DRAWINGS), drawn: 0, msgs: 0, tokens: 0, checks: 0,
-        };
-        // одной записью: исправление в очереди и отметка, что проверка закрыта (повторный вызов не поставит его второй раз)
-        const queued = this.db.put({ seq, [`job:${String(seq).padStart(9, "0")}`]: job });
-        const closed = this.db.delete(`chkin:${ref}`);
-        await Promise.all([queued, closed]);
-        await this.note("вторая проверка нашла ошибку: отправляю исправление");
-        if (!this.running) await this.db.setAlarm(Date.now());
-        return;
-      }
-    }
-    await this.db.delete(`chkin:${ref}`);
-    await this.note("вторая проверка: решение подтверждено");
-    await this.say(meta.chatId, "✅ Перепроверил решение: всё сходится.");
-  }
-
-  // ---------- вторая проверка: объект «чат#check» со своей очередью ----------
-  async enqueueCheck(ref: string, chatId: string): Promise<void> {
-    const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
-    await this.db.put({ seq, [`chkq:${String(seq).padStart(9, "0")}`]: { ref, chatId, phase: "check", tries: 0 } satisfies Check });
-    if (!this.running) await this.db.setAlarm(Date.now());
-  }
-
-  async cancelChecks(): Promise<void> {
-    const all = await this.db.list({ prefix: "chkq:" });
-    if (all.size) await this.db.delete([...all.keys()]);
-    this.stop?.abort(new Stopped("стоп"));
-  }
-
-  // Одна проверка. Сначала решение смотрит вторая модель. Нашла ошибку: спорные задания перерешивает основная модель,
-  // и только если она согласна, человеку уходит исправление. Так случайная придирка проверяющего не портит верный ответ.
-  private async runCheck(key: string, q: Check) {
-    const main = chatStub(this.env, q.chatId);
-    const stop = new AbortController();
-    this.stop = stop;
-    // Итог сначала записываем, потом передаём чату: если передача сорвётся, следующий запуск повторит только её
-    const close = async (r: CheckResult) => {
-      if (stop.signal.aborted) return;
-      q.result = r;
-      await this.db.put(key, q);
-      await main.checked(q.ref, r);
-      await this.db.delete(key);
+  // ---------- вторая проверка: до отправки ----------
+  // Решение готово, но человеку ещё не ушло. Его независимо перепроверяет вторая модель по тем же фото.
+  // Сошлось: ответ уходит как есть. Нашла ошибку: спорные задания заново решает основная модель; согласна с замечанием,
+  // и её исправленные задания встают на место прежних. Не согласна: решение остаётся. Человеку приходит один ответ.
+  // Сбой проверки ответу не мешает: он уходит без неё, и об этом сказано отдельной строкой.
+  // Возвращает false, если проверку продолжит следующий будильник (нужен свежий кусок времени или пауза перед повтором).
+  private async verify(job: Job, chatId: string, end: number, stop: AbortSignal, save: () => Promise<void>): Promise<boolean> {
+    const done = job.done!;
+    const close = async (state: NonNullable<Job["verified"]>, why: string) => {
+      job.verified = state;
+      job.check = undefined;
+      if (why) await this.note(why);
+      await save();
+      return true;
     };
-    try {
-      if (q.result) {
-        if (++q.tries > 8) return void (await this.db.delete(key)); // чат так и не принял итог: дальше пробовать незачем
-        return await close(q.result);
-      }
-      if (q.tries >= CHECK_TRIES) return await close({ failed: "не получилось после нескольких попыток" });
-      q.tries++;
-      delete q.after;
-      await this.db.put(key, q);
-      const input = (await main.checkInput(q.ref)) as unknown as CheckWork | null;
-      if (!input) return void (await this.db.delete(key)); // проверку отменили («стоп», «сброс») или фото уже не хранится
+    const failed = (why: string) => close("failed", `вторая проверка не состоялась: ${this.hide(why).slice(0, 140)}`);
+    if (!job.check) {
+      // Ответ уже разложен по сообщениям или уходит (работа, начатая до обновления бота): проверять поздно, исправление в него не попало бы
+      if (job.packed || job.sent > 0 || job.unsure) return await close("skip", "");
+      // Проверять есть что: решение по фото, целое, с ответами. Разговор, отказ и оборванный ответ идут как есть
+      const apt = job.kind === "image" && !!job.turn && !!job.body && !done.cut && !done.refused && !done.capped && (job.parts ?? []).some((p) => /^Ответ:/m.test(p));
+      if (!apt || !(await this.options()).check) return await close("skip", "");
+      job.check = { phase: "check", tries: 0 };
+      await save();
+      await this.say(chatId, CHECKING);
+    }
+    const chk = job.check!;
+    for (;;) {
+      if (stop.aborted) throw stop.reason;
+      // «сброс» пришёл, пока шла проверка: память и фото очищены, проверять уже не по чему
+      if (!job.turn) return await failed("память чата очищена");
       const gate = await this.gate(true);
-      // доступ закрыт: проверку чужого чата снимаем без запросов и без сообщения ему
-      if (gate.closed && !this.mine(q.chatId, gate)) return await close({ failed: "доступ закрыт, проверка чужого чата снята" });
-      if (gate.cap !== null && gate.today >= gate.cap) return await close({ failed: "дневной лимит расходов исчерпан" });
-      const until = Date.now() + (SEGMENT - SEGMENT_TAIL) / this.k;
+      // доступ закрыли, пока шла работа чужого чата: на её проверку деньги хозяина больше не тратим, уже оплаченный ответ уходит как есть
+      if (gate.closed && !this.mine(chatId, gate)) return await close("skip", "доступ закрыт: вторая проверка чужого чата снята");
+      if (gate.cap !== null && gate.today >= gate.cap) return await failed("дневной лимит расходов исчерпан");
+      // хозяин выключил проверку, пока она шла: дальше на неё не тратимся
+      if (!gate.check) return await failed("проверка выключена хозяином");
+      if (chk.tries >= CHECK_TRIES) return await failed(chk.phase === "check" ? "проверяющая модель не ответила по форме" : "основная модель не дописала разбор замечаний");
+      const until = end - SEGMENT_TAIL / this.k;
+      if (until - Date.now() < CHECK_MIN / this.k) return false;
+      chk.tries++;
+      await save();
+      const body = job.body ?? "";
       const bills: Spent[] = [];
-      const spent = (s: Spent) => void bills.push(s);
+      const spent = (x: Spent) => void bills.push(x);
       try {
-        if (q.phase === "check") {
+        // тот же материал, что видела основная модель: фото этой работы и, если была, прошлая работа чата
+        const msgs = await this.toApi([...(await this.past(job)), { role: "user", content: job.turn }], job.lean ? job.turn : undefined);
+        const before = msgs.slice(0, -1);
+        const last = msgs.at(-1)!.content;
+        const question = Array.isArray(last) ? last : [];
+        if (!question.some((b) => b.type === "image" || b.type === "document")) return await failed("фото этой работы уже не хранится");
+        const { fast } = await this.options();
+        if (chk.phase === "check") {
           const a = await ask(this.c, {
-            messages: [{ role: "user", content: [...input.question, { type: "text", text: `Решение, которое нужно проверить:\n\n${input.body}` }] }],
-            effort: this.c.effort, fast: false, until, stop: stop.signal, system: CHECK_PROMPT, model: this.c.checkModel, spent,
+            messages: [...before, { role: "user", content: [...question, { type: "text", text: `Решение, которое нужно проверить:\n\n${body}` }] }],
+            effort: job.effort, fast, until, stop, system: CHECK_PROMPT, model: this.c.checkModel, spent,
           });
           // вердикт ищем во всём ходе: проверяющий пересчитывает кодом, и итоговая строка стоит после заметок со своими «Ответ:»
           const all = a.all ?? a.text;
           const v = verdict(all);
           if (!v) {
             // вердикт написан, но без замечаний: оплаченный ответ получен, повтор дал бы то же самое
-            if (/ВЕРДИКТ:\s*(ВЕРНО|ОШИБКА)/i.test(all)) return await close({ failed: "проверяющая модель не назвала ошибки" });
+            if (/ВЕРДИКТ:\s*(ВЕРНО|ОШИБКА)/i.test(all)) return await failed("проверяющая модель не назвала ошибки");
             throw new Busy("проверяющая модель ответила не по форме");
           }
-          if (v.ok) return await close({ ok: true });
-          q.phase = "judge";
-          q.issues = v.issues.slice(0, 4000);
-          // Проверяющий занял большую часть куска: основной модели нужен свой полный срок, иначе её оплаченный запрос
-          // оборвётся по времени. Следующий будильник начнёт её попытки с нуля, так что их снова не больше CHECK_TRIES.
-          if (until - Date.now() < (SEGMENT - SEGMENT_TAIL) / 2 / this.k) {
-            q.tries = 0;
-            return void (await this.db.put(key, q));
-          }
-          q.tries = 1;
-          await this.db.put(key, q);
+          if (v.ok) return await close("ok", "вторая проверка: решение подтверждено");
+          chk.phase = "judge";
+          chk.issues = v.issues.slice(0, 4000);
+          chk.tries = 0;
+          await save();
+          continue;
         }
         const a = await ask(this.c, {
-          messages: [{ role: "user", content: input.question }, { role: "assistant", content: input.body }, { role: "user", content: judgeText(q.issues ?? "") }],
-          effort: input.effort, fast: false, until, stop: stop.signal, spent,
+          messages: [...before, { role: "user", content: question }, { role: "assistant", content: lookLine(job.look) + body }, { role: "user", content: judgeText(chk.issues ?? "") }],
+          effort: job.effort, fast, until, stop, spent,
         });
-        const r = judgeReply(a, input.body);
+        job.checks += a.checks;
+        const r = judgeReply(a, body);
         if (!r) throw new Busy("основная модель не дописала разбор замечаний");
-        return await close(r);
+        if ("fix" in r) {
+          const fixed = splitAnswer(lookOf(r.fix).text);
+          const merged = mergeFix(job.parts ?? [], job.svgs, { parts: tasks(fixed.text), svgs: [...new Set(fixed.svgs)] });
+          // непонятно, какое задание заменять: вставить исправление рядом с ошибочным решением хуже, чем спросить ещё раз
+          if (merged.lost.length) throw new Busy(`исправление не удалось поставить на место: ${merged.lost.join(", ")}`);
+          if (merged.changed.length) {
+            job.parts = merged.parts;
+            job.svgs = merged.svgs.slice(0, MAX_DRAWINGS);
+            job.body = merged.parts.join("\n\n");
+            done.empty = false;
+            return await close("fixed", `вторая проверка нашла ошибку, ответ исправлен до отправки: ${merged.changed.join(", ")}`);
+          }
+        }
+        return await close("ok", "вторая проверка: замечание не подтвердилось, решение оставлено");
+      } catch (e: any) {
+        if (stop.aborted) throw stop.reason;
+        if (e instanceof Stopped) throw e;
+        console.log("check:", this.hide(e?.stack ?? e));
+        if (e instanceof Fatal) return await failed(e.message);
+        // Claude занят, время куска вышло или ответ не по форме: пауза и ещё попытка (их число ограничено)
+        if (chk.tries >= CHECK_TRIES) continue;
+        job.after = Date.now() + (BACKOFF[chk.tries - 1] ?? BACKOFF[BACKOFF.length - 1]) / this.k;
+        await this.bill(job, bills.splice(0)); // до сохранения: иначе цена этой попытки не попала бы в запись работы
+        await save();
+        return false;
       } finally {
-        await this.bill(null, bills);
+        await this.bill(job, bills);
       }
-    } catch (e: any) {
-      if (e instanceof Stopped || stop.signal.aborted) return;
-      console.log("check:", this.hide(e?.stack ?? e));
-      if (e instanceof Fatal) return await close({ failed: e.message }).catch((x) => console.log("check:", this.hide(x)));
-      // Claude занят, время вышло или связь оборвалась: подождём и попробуем ещё раз
-      if (await this.db.get(key)) {
-        q.after = Date.now() + (BACKOFF[q.tries - 1] ?? BACKOFF[BACKOFF.length - 1]) / this.k;
-        await this.db.put(key, q);
-      }
-    } finally {
-      if (this.stop === stop) this.stop = null;
     }
   }
 

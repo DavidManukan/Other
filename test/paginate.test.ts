@@ -105,3 +105,74 @@ test("листинг с одной очень длинной строкой то
   const body = r.text.replace(/Информатика · №5 \(продолжение\)/g, "").replace(/\d+ \/ \d+/g, "");
   assert.ok(body.replace(/\s+/g, "").includes(data.replace(/\s+/g, "")), "числа из листинга потерялись");
 });
+
+test("пометка «| ·4» стоит сразу за своим преобразованием; не помещается рядом: встаёт прямо под ним, формула остаётся целой", { skip }, async () => {
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  await page.setContent(pageHtml(["№1\n$x^2 = 9$ | $\\cdot 4$\n$4x^2 = 36$ | делим на 4\n$\\dfrac{x}{x-2} - \\dfrac{7}{x+2} = \\dfrac{8}{(x-2)(x+2)} + \\dfrac{1}{x^2-4}$ | $\\cdot (x-2)(x+2)$, $x \\ne \\pm 2$\nОтвет: $3$"], [], "", ""));
+  await page.evaluate(PAGINATE);
+  const rows = await page.evaluate(() => [...document.querySelectorAll(".row")].map((r) => {
+    const main = (r.querySelector(".main") as HTMLElement).getBoundingClientRect(), note = (r.querySelector(".note") as HTMLElement).getBoundingClientRect(), all = r.getBoundingClientRect();
+    return { gap: Math.round(note.left - main.right), free: Math.round(all.right - note.right), inside: note.right <= all.right + 1 && main.right <= all.right + 1, under: r.classList.contains("under"), drop: Math.round(note.top - main.bottom), indent: Math.round(note.left - main.left), broken: r.querySelectorAll(".f.brk").length };
+  }));
+  await page.close();
+  assert.equal(rows.length, 3);
+  for (const r of rows.slice(0, 2)) assert.ok(!r.under && r.gap >= 8 && r.gap <= 20 && r.inside, JSON.stringify(rows));
+  assert.ok(rows[0].free > 150, JSON.stringify(rows)); // у короткой формулы пометка рядом с ней: справа остаётся пустое место
+  // длинная формула с длинной пометкой: пометка под формулой с отступом, формула не разорвана
+  assert.ok(rows[2].under && rows[2].drop >= 0 && rows[2].drop <= 8 && rows[2].indent >= 20 && rows[2].inside && rows[2].broken === 0, JSON.stringify(rows));
+});
+
+test("таблица шире листа ужимается и не выходит за его край", { skip }, async () => {
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  const head = "| " + Array.from({ length: 9 }, (_, i) => `Столбец ${i + 1}`).join(" | ") + " |";
+  const rule = "| " + Array.from({ length: 9 }, () => "---").join(" | ") + " |";
+  const row = "| " + Array.from({ length: 9 }, (_, i) => `$\\dfrac{${i + 1}}{7}$`).join(" | ") + " |";
+  await page.setContent(pageHtml([`№1\n${head}\n${rule}\n${row}\n${row}\nОтвет: 1`], [], "", ""));
+  await page.evaluate(PAGINATE);
+  const box = await page.evaluate(() => {
+    const t = (document.querySelector(".tbl") as HTMLElement).getBoundingClientRect(), s = (document.querySelector(".sheet") as HTMLElement).getBoundingClientRect();
+    return { right: Math.round(t.right), sheet: Math.round(s.right), cells: document.querySelectorAll(".tbl td, .tbl th").length };
+  });
+  await page.close();
+  assert.equal(box.cells, 27);
+  assert.ok(box.right <= box.sheet, JSON.stringify(box));
+});
+
+test("таблица выше листа режется по строкам, шапка повторяется, строки не теряются", { skip }, async () => {
+  const rows = Array.from({ length: 70 }, (_, i) => `| ${i + 1} | $x_{${i + 1}} = \\dfrac{${i + 1}}{3}$ | строка ${i + 1} |`).join("\n");
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  await page.setContent(pageHtml([`№1\n| n | значение | заметка |\n| --- | --- | --- |\n${rows}\nОтвет: 70 строк`], [], "", ""));
+  const total = Number(await page.evaluate(PAGINATE));
+  const out = await page.evaluate(() => ({
+    heights: [...document.querySelectorAll(".sheet")].map((s) => Math.round(s.getBoundingClientRect().height)),
+    tables: document.querySelectorAll(".tbl").length,
+    heads: [...document.querySelectorAll(".tbl")].map((t) => (t as HTMLTableElement).rows[0].cells[0].textContent),
+    text: [...document.querySelectorAll(".sheet")].map((s) => (s as HTMLElement).innerText).join(" "),
+    widths: [...document.querySelectorAll(".tbl")].map((t) => Math.round((t as HTMLTableElement).rows[0].cells[1].getBoundingClientRect().width)),
+  }));
+  await page.close();
+  assert.ok(total >= 3 && Math.max(...out.heights) <= PAGE_H + 120, JSON.stringify(out.heights));
+  assert.ok(out.tables >= 3 && out.heads.every((h) => h === "n"), JSON.stringify(out.heads));
+  for (let i = 1; i <= 70; i++) assert.ok(out.text.includes(`строка ${i}`), `пропала строка ${i}`);
+  assert.ok(Math.max(...out.widths) - Math.min(...out.widths) <= 2, JSON.stringify(out.widths)); // столбцы на всех частях одной ширины
+});
+
+test("широкая таблица со словами: слова и числа не рвутся посреди, таблица остаётся на листе", { skip }, async () => {
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  await page.setContent(pageHtml(["№1\n| Вещество | Молярная масса | Количество | Температура | Давление | Объём |\n| --- | --- | --- | --- | --- | --- |\n| кислород | 32 г/моль | 0,25 моль | 273,15 К | 101325 Па | 5,6 л |\n| водород | 2 г/моль | 1,5 моль | 298,15 К | 101325 Па | 36,7 л |\nОтвет: 5,6 л"], [], "", ""));
+  await page.evaluate(PAGINATE);
+  const out = await page.evaluate(() => {
+    const t = document.querySelector(".tbl") as HTMLElement, s = document.querySelector(".sheet") as HTMLElement;
+    // ячейка с числом 101325 занимает одну строку: число не разорвано
+    const cell = [...t.querySelectorAll("td")].find((c) => c.textContent === "101325 Па") as HTMLElement;
+    const r = document.createRange();
+    r.selectNodeContents(cell.firstChild as Node);
+    const digits = cell.firstChild as Text;
+    const one = document.createRange();
+    one.setStart(digits, 0);
+    one.setEnd(digits, 6);
+    return { right: Math.round(t.getBoundingClientRect().right), sheet: Math.round(s.getBoundingClientRect().right), lines: one.getClientRects().length, font: parseFloat(getComputedStyle(t).fontSize) };
+  });
+  await page.close();
+  assert.ok(out.right <= out.sheet && out.lines === 1 && out.font >= 11, JSON.stringify(out));
+});

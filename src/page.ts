@@ -5,14 +5,16 @@ import katex from "katex";
 import "katex/contrib/mhchem"; // химическая запись \ce{…}, если модель всё же напишет формулу так
 import { fixSvg } from "./svg.ts";
 import { mathSpans, stripTex, texToPlain } from "./tex.ts";
-import { answerAt, HEAD as TASK_HEAD, prettyMath, sheetContext } from "./text.ts";
+import { answerAt, figureLabel, HEAD as TASK_HEAD, prettyMath, sheetContext, tableAt } from "./text.ts";
+export { figureLabel };
 import { esc } from "./util.ts";
 
 export const PAGE_W = 560; // ширина страницы в точках CSS
 export const PAGE_DPR = 3; // плотность снимка: 1680 пикселей в ширину, мелкие индексы читаются и при увеличении
 export const PAGE_H = 1000; // выше этого страницу делим: 9:16 занимает экран телефона целиком
 
-const HEAD = /^\s*(([^·\n]{1,30}·\s*){0,2}(№|Задание|Задача)\s*\S*|Исправляю\b.*|Вариант\s+\S+.*)$/;
+// (после номера допускается короткая пометка в скобках: «№1 (2 балла)»; номер с буквой без знака №: «A1», «В2.»)
+const HEAD = /^\s*(([^·\n]{1,30}·\s*){0,2}(№|Задание|Задача)\s*\S*(\s*\([^()\n]{1,30}\))?[.:]?|Исправляю\b.*|Вариант\s+\S+.*|[A-ZА-ЯЁ]\d{1,2}[.)]?)\s*$/;
 const LABEL = /^(Дано|Найти|Доказать|Решение|Доказательство|Обоснование|Проверка|ОДЗ|Ответ)\s*:\s*(.*)$/;
 
 // errorColor: свой цвет-метка. Команду, которой нет (или запрещённую trust: false, вроде \url), KaTeX не бросает,
@@ -106,17 +108,18 @@ function annotated(line: string): [string, string] | null {
   return [left, right];
 }
 
+// Таблица: настоящая, с линиями; формулы в ячейках набраны
+const table = (rows: string[][]): string => {
+  const tr = (r: string[], tag: string) => `<tr>${r.map((c) => `<${tag}>${inline(c)}</${tag}>`).join("")}</tr>`;
+  return `<table class="tbl">${tr(rows[0], "th")}${rows.slice(1).map((r) => tr(r, "td")).join("")}</table>`;
+};
+
 const row = (line: string): string => {
   const a = annotated(line);
   return a ? `<div class="b row"><div class="main">${inline(a[0])}</div><div class="note">${inline(a[1])}</div></div>` : `<div class="b line">${inline(line)}</div>`;
 };
 
-// Номер задачи, для которой сделан рисунок: первая подпись в левом верхнем углу («№3», «Вариант 2 · №1»)
-export function figureLabel(svg: string): string {
-  const m = /<text\b[^>]*>([\s\S]*?)<\/text>/i.exec(svg);
-  return (m?.[1] ?? "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-}
-const key = (s: string) => s.toLowerCase().replace(/[\s.:]/g, "");
+const key = (s: string) => s.toLowerCase().replace(/\s/g, "").replace(/[.:]+$/, ""); // точка внутри номера остаётся: «№1.2» это не «№12»
 
 // own: рисунок стоит в своём задании, номер в его углу повторять незачем
 function figure(svg: string, own: boolean): string {
@@ -151,7 +154,11 @@ function taskBody(part: string, figs: Fig[]): string {
   }
   if (i < lines.length && HEAD.test(lines[i]) && lines[i].length <= 60) {
     title = lines[i].trim();
+    // в заголовке буква с цифрой это номер задания («№B1»), а не формула: индексы в нём не ставим
+    const was = sheet;
+    sheet = true;
     out.push(`<h2 class="b">${inline(title)}</h2>`);
+    sheet = was;
     i++;
   }
   let placed = false;
@@ -169,28 +176,40 @@ function taskBody(part: string, figs: Fig[]): string {
       out.push(`<pre class="b">${esc(code.join("\n"))}</pre>`);
       continue;
     }
+    const tb = tableAt(lines, i);
+    if (tb) { // таблица: настоящая, с линиями; формулы в ячейках набраны
+      out.push(`<div class="b">${table(tb.rows)}</div>`);
+      i = tb.end;
+      continue;
+    }
     const m = LABEL.exec(line.trim());
     if (m?.[1] === "Дано") { // «Дано» с чертой справа и «Найти» под чертой, как в тетради
-      const given: string[] = m[2] ? [m[2]] : [];
-      const find: string[] = [];
-      let label = "";
+      const given: string[] = m[2] ? [`<div>${inline(m[2])}</div>`] : []; // строки блока уже в HTML: среди них бывает таблица с данными опыта
+      // под чертой стоит «Найти» или «Доказать», а в задаче из двух пунктов обе строки подряд: чертёж встаёт после них, а не между ними
+      const finds: { label: string; lines: string[] }[] = [];
       for (i++; i < lines.length; i++) {
         const l = lines[i].trim();
         const n = LABEL.exec(l);
+        const cur = finds.at(-1);
         if (/^\s*```/.test(l)) break;
+        const tbl = cur ? null : tableAt(lines, i);
+        if (tbl) {
+          given.push(table(tbl.rows));
+          i = tbl.end;
+          continue;
+        }
         if (n) {
-          if ((n[1] !== "Найти" && n[1] !== "Доказать") || label) break; // любая другая метка закрывает блок
-          label = n[1];
-          if (n[2]) find.push(n[2]);
+          if ((n[1] !== "Найти" && n[1] !== "Доказать") || finds.some((f) => f.label === n[1]) || (cur && !cur.lines.length)) break; // любая другая метка закрывает блок
+          finds.push({ label: n[1], lines: n[2] ? [n[2]] : [] });
         } else if (!l) continue;
-        else if (!label) given.push(l);
-        else if (!find.length) find.push(l); // «Найти:» отдельной строкой: искомое стоит на следующей
+        else if (!cur) given.push(`<div>${inline(l)}</div>`);
+        else if (!cur.lines.length) cur.lines.push(l); // «Найти:» отдельной строкой: искомое стоит на следующей
         else break; // дальше уже решение, даже если строки «Решение:» нет
       }
       i--;
       out.push(
-        `<div class="b given"><div class="lbl">Дано:</div>${given.map((g) => `<div>${inline(g)}</div>`).join("")}` +
-          (label ? `<div class="find"><span class="lbl">${label}:</span> ${find.map(inline).join("<br>")}</div>` : "") + `</div>`,
+        `<div class="b given"><div class="lbl">Дано:</div>${given.join("")}` +
+          finds.map((f) => `<div class="find"><span class="lbl">${f.label}:</span> ${f.lines.map(inline).join("<br>")}</div>`).join("") + `</div>`,
       );
       place(); // чертёж сразу под «Дано», до решения
       continue;
@@ -217,7 +236,7 @@ function taskBody(part: string, figs: Fig[]): string {
   }
   place();
   // заголовок продолжения на следующих листах PAGINATE пишет текстом: формулы в нём уже переведены в обычные знаки
-  return `<section class="task" data-title="${esc(prettyMath(stripTex(texToPlain(title)), sheet || undefined))}">${out.join("")}</section>`;
+  return `<section class="task" data-title="${esc(prettyMath(stripTex(texToPlain(title)), true))}">${out.join("")}</section>`;
 }
 
 export interface Fig {
@@ -268,16 +287,20 @@ h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .b{margin:6px 0;overflow-wrap:anywhere}
 .lbl{font-weight:bold}
 .given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
-.given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}
-.row{display:flex;gap:12px;align-items:center}
-.row .main{flex:1 1 auto;min-width:0}
-.row .note{flex:0 1 auto;max-width:44%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
+.given .tbl{margin:4px 0}.given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}.given .find+.find{border-top:0;margin-top:2px;padding-top:0}
+.row{display:flex;flex-wrap:wrap;gap:2px 14px;align-items:center}
+.row .main{flex:0 1 auto;min-width:0;max-width:100%}
+.row .note{flex:0 1 auto;min-width:0;max-width:100%;border-left:2px solid #fff;padding-left:10px;font-size:18px;line-height:1.35}
+.row.under{margin-bottom:14px}.row.under .note{margin-left:30px;max-width:calc(100% - 30px)}
+.tbl{border-collapse:collapse;font-size:18px;line-height:1.35}.tbl th,.tbl td{border:1.5px solid #fff;padding:4px 9px;text-align:left;vertical-align:top;overflow-wrap:normal;word-break:normal}.tbl th{font-weight:bold}
+.tbl.tight th,.tbl.tight td{overflow-wrap:anywhere;padding:3px 5px}
 .ans{margin:12px 0 4px;padding:8px 12px;border:2px solid #fff;border-radius:8px}
 pre{font:17px/1.4 'DejaVu Sans Mono','Liberation Mono',monospace;border:1px solid #666;padding:10px 12px;border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}
 pre.go{border-bottom:0;border-radius:6px 6px 0 0;padding-bottom:0;margin-bottom:0}pre.on{border-top:0;border-radius:0 0 6px 6px;padding-top:0;margin-top:0}pre.go.on{border-radius:0}
 .fig{margin:10px 0}.fig svg{display:block;width:100%;height:auto}
 .raw{font-family:'DejaVu Sans',sans-serif}
 .f{white-space:nowrap}.f wbr{display:none}.f.brk{white-space:normal}.f.brk wbr{display:inline}.fx{white-space:nowrap}.fx.wide{white-space:normal}
+.f.brk .base{margin:4px 0}
 .katex{font-size:1.08em;-webkit-text-stroke:.35px #fff}.katex svg{stroke:#fff;stroke-width:14px}
 .katex .frac-line,.katex .overline-line,.katex .underline-line{border-bottom-width:.06em}.katex-display{margin:0;text-align:left}.katex-display>.katex{text-align:left}
 .foot{font-size:14px;text-align:right;margin-top:6px}`;
@@ -295,9 +318,16 @@ export function pageHtml(parts: string[], svgs: string[], fonts: string, css: st
 export const PAGINATE = `(() => {
   const H = ${PAGE_H};
   const flow = document.getElementById("flow");
+  // 0. Таблица шире листа: уменьшаем её шрифт, пока не поместится (иначе правый край обрежется). Слова и числа в ячейках
+  // при этом не рвутся. Не помогло и самое мелкое читаемое письмо: тогда разрешаем перенос внутри слова.
+  for (const t of flow.querySelectorAll(".tbl")) {
+    const avail = t.parentElement.clientWidth;
+    for (let k = 0; k < 4 && t.offsetWidth > avail + 1; k++) t.style.fontSize = Math.max(11, Math.floor(parseFloat(getComputedStyle(t).fontSize) * avail / t.offsetWidth * 0.98)) + "px";
+    if (t.offsetWidth > avail + 1) t.classList.add("tight");
+  }
   // 1. Формула шире строки: разрешаем перенос между её кусками (перед знаком отношения), а слишком широкому куску и внутри него
   const room = (el) => {
-    const box = el.closest(".main, .note, .ans, .given, .b");
+    const box = el.closest("td, th, .main, .note, .ans, .given, .b");
     if (!box) return 0;
     const cs = getComputedStyle(box);
     return box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
@@ -311,12 +341,12 @@ export const PAGINATE = `(() => {
     for (const b of k.querySelectorAll(".base")) w = Math.max(w, b.getBoundingClientRect().width);
     if (w > avail && avail > 0) k.style.fontSize = Math.max(0.45, Math.floor((1.08 * avail / w) * 100) / 100) + "em";
   }
-  // 2. Пометки справа в одном задании стоят одной колонкой: черта на одной вертикали
-  for (const task of flow.querySelectorAll(".task")) {
-    const notes = [...task.querySelectorAll(".row > .note")];
-    if (notes.length < 2) continue;
-    const w = Math.ceil(Math.max(...notes.map((n) => n.getBoundingClientRect().width)));
-    for (const n of notes) n.style.flex = "0 0 " + w + "px";
+  // 2. Пометка «| ·4» стоит сразу за своим преобразованием (так её пишут в тетради), а не колонкой у правого края.
+  //    Не помещается рядом: встаёт строкой ниже, прямо под ним, а формула остаётся целой. Это делает сама вёрстка строки (.row);
+  //    здесь пометке под формулой добавляется отступ, чтобы её не приняли за пометку к следующей строке.
+  for (const r of flow.querySelectorAll(".row")) {
+    const main = r.querySelector(".main"), note = r.querySelector(".note");
+    if (main && note && note.getBoundingClientRect().top >= main.getBoundingClientRect().bottom - 2) r.classList.add("under");
   }
   // 3. Подписи на рисунке. Буква, которая легла на линию или на соседнюю подпись, сдвигается на ближайшее свободное место.
   for (const svg of flow.querySelectorAll(".fig svg")) {
@@ -492,6 +522,39 @@ export const PAGINATE = `(() => {
           nb.classList.add("on");
         }
       }
+    } catch (e) {}
+  }
+  // 5а. Таблица выше листа режется между строками, шапка повторяется на каждой части, ширина столбцов сохраняется
+  for (const t of [...flow.querySelectorAll(".task > .b > table.tbl")]) {
+    try {
+      const limit = H - 160;
+      if (t.getBoundingClientRect().height <= limit) continue;
+      const rows = [...t.rows];
+      if (rows.length < 3) continue;
+      const head = rows[0], headH = head.getBoundingClientRect().height;
+      const widths = [...head.cells].map((c) => c.getBoundingClientRect().width);
+      const heights = rows.map((r) => r.getBoundingClientRect().height);
+      const groups = [[]]; // строки каждой части, без шапки
+      let used = headH;
+      for (let i = 1; i < rows.length; i++) {
+        if (used + heights[i] > limit && groups[groups.length - 1].length) { groups.push([]); used = headH; }
+        groups[groups.length - 1].push(rows[i]);
+        used += heights[i];
+      }
+      if (groups.length < 2) continue;
+      const fix = (table) => { [...table.rows[0].cells].forEach((c, j) => { c.style.width = widths[j] + "px"; }); table.style.width = t.getBoundingClientRect().width + "px"; };
+      let after = t.parentElement;
+      for (const g of groups.slice(1)) {
+        const box = after.cloneNode(false), nt = t.cloneNode(false), body = document.createElement("tbody");
+        body.appendChild(head.cloneNode(true));
+        for (const r of g) body.appendChild(r);
+        nt.appendChild(body);
+        box.appendChild(nt);
+        after.after(box);
+        after = box;
+        fix(nt);
+      }
+      fix(t);
     } catch (e) {}
   }
   // 6. Делим поток на листы

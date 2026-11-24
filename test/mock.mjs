@@ -150,7 +150,7 @@ function anthropic(req, res, body) {
   if (scenario === "S_LONG" || (scenario === "S_CRASH" && n === 1)) return send("№1\nОтвет: 1\n@@@\n" + "очень длинное решение ".repeat(400), { gap: 40 });
   if (scenario === "S_CRASH") return send("№1\nОтвет: 9");
   if (scenario === "S_MANY") return send(Array.from({ length: 45 }, (_, i) => `№${i + 1}\nОтвет: ${i}`).join("\n@@@\n"), { gap: 1 });
-  if (scenario === "S_LONGCARD") return send(Array.from({ length: 30 }, (_, i) => `№${i + 1}\nОтвет: значение номер ${i} получилось таким, как и ожидалось`).join("\n@@@\n"), { gap: 1 });
+  if (scenario === "S_LONGCARD") return send(Array.from({ length: 30 }, (_, i) => `№${i + 1}\nСчитаем по формуле.\nОтвет: значение номер ${i} получилось таким, как и ожидалось`).join("\n@@@\n"), { gap: 1 });
   if (scenario === "S_HUGE") return send(Array.from({ length: 30 }, (_, i) => `№${i + 1}\n${"строка решения с выкладками\n".repeat(22)}Ответ: ${i}`).join("\n@@@\n"), { gap: 1 });
   if (scenario === "S_PAUSE") {
     // пересчёт затянулся: ход приходит с pause_turn, его нужно продолжить тем же сообщением и в том же контейнере
@@ -168,7 +168,12 @@ function anthropic(req, res, body) {
     return setTimeout(() => res.destroy(), 200);
   }
   if (scenario === "S_DROP") return send("половина решена\nОтвет: 20");
-  if (scenario === "S_TEX") return send("№1\nДано:\n$AB = 6$ см\nНайти: $x$\nРешение:\n$x^2 = \\dfrac{9}{4}$ | $\\cdot 4$\n$x = \\pm \\dfrac{3}{2}$\nОтвет: $x = \\pm \\dfrac{3}{2}$.\n@@@\n№2\nH2SO4 и $v_0 = 5$ м/с\nОтвет: $\\sqrt{34}$ см\n@@@\n№3\nОтвет: $x \\in (2; 4]$\n@@@\n" + SVG);
+  if (scenario === "S_TEX") return send("№1\nДано:\n$AB = 6$ см\nНайти: $x$\nРешение:\n$x^2 = \\dfrac{9}{4}$ | $\\cdot 4$\n$x = \\pm \\dfrac{3}{2}$\nОтвет: $x = \\pm \\dfrac{3}{2}$.\n@@@\n№2\nH2SO4 и $v_0 = 5$ м/с\nОтвет: $\\sqrt{34}$ см\n@@@\n№3\nМетод интервалов.\nОтвет: $x \\in (2; 4]$\n@@@\n" + SVG);
+  // вид ответа называет модель: страница, текст с рисунком, тест из одних ответов, таблица
+  if (scenario === "S_LOOKP") return send("ВИД: страница\n№1\nРешение:\n$x^2 = \\dfrac{9}{4}$ | $\\cdot 4$\n$x = \\pm \\dfrac{3}{2}$\nОтвет: $x = \\pm \\dfrac{3}{2}$.\n@@@\n" + SVG);
+  if (scenario === "S_LOOKT") return send("ВИД: текст\n№1\nДано:\nm(BaCl2) = 20,8 г\nРешение:\nn(BaCl2) = $\\dfrac{20{,}8}{208} = 0{,}1$ моль\nОтвет: 23,3 г\n@@@\n" + SVG);
+  if (scenario === "S_QUIZ") return send("ВИД: страница\n№1\nОтвет: Б) 12\n@@@\n№2\nОтвет: $x \\in (2; 5]$\n@@@\n№3\nОтвет: 3214");
+  if (scenario === "S_TBL") return send("ВИД: текст\n№1\nТаблица истинности:\n| A | B | F |\n| --- | --- | --- |\n| 0 | 1 | 1 |\n| 1 | 1 | 0 |\nОтвет: F = 1 в одной строке");
   if (scenario === "S_NOSHOT") return send("№1\nSHOT_FAIL\n$x^2 = 9$\nОтвет: $3$\n@@@\n" + SVG);
   if (scenario === "S_SHOTQ") return send("№1\nSHOT_QUOTA\nОтвет: $\\dfrac{1}{2}$");
   if (scenario === "S_NOTES") return send("Проверю вычисления в песочнице.", { blocks: CHECK, after: "№1\nОтвет: 31" });
