@@ -274,11 +274,13 @@ const whole = (text: string) => text.split(/^[ \t]*@@@.*$/m).some((t) => {
 });
 // Ответ в виде, удобном для сравнения: без разметки и пробелов, десятичная запятая как точка, без «S =» в начале
 const squeeze = (s: string) => plainText(s).replace(/\s/g, "").replace(/(\d),(\d)/g, "$1.$2").replace(/−/g, "-").replace(/[.;]+$/, "").toLowerCase().replace(/^[a-zа-яё][a-zа-яё0-9₀-₉()]*=/, "");
+// Множитель или знак сразу за числом («4π», «2i», «1/π»), в отличие от единицы («4 см», «20%», «8 bit»)
+const FACTOR = /[π√∞^]|^i(?![a-z])|^\//;
 // Число в начале ответа и единица после него: «0.5м/с» -> [0.5, «м/с»], «1/2» -> [0.5, «»]. Не число: null
 function value(x: string): [number, string] | null {
   const m = /^(-?\d+(?:\.\d+)?)(?:\/(\d+(?:\.\d+)?))?/.exec(x);
   // после числа стоит множитель или знак, а не единица («4π», «2i», «6%», «1/π»): это уже не просто число
-  if (!m || /\d/.test(x.slice(m[0].length)) || /[π√∞%^i]|^\//.test(x.slice(m[0].length))) return null;
+  if (!m || /\d/.test(x.slice(m[0].length)) || FACTOR.test(x.slice(m[0].length))) return null;
   return [m[2] ? Number(m[1]) / Number(m[2]) : Number(m[1]), x.slice(m[0].length)];
 }
 function same(a: string, b: string): boolean {
@@ -287,7 +289,7 @@ function same(a: string, b: string): boolean {
   // Тот же ответ, у одного дописана единица («4» и «4 см») или пояснение после знака («да» и «да, действует»).
   // Дописанная буква, индекс, множитель или второй вариант это уже другой ответ: «CO» и «CO₂», «А» и «АБ», «4» и «4π», «А» и «А, В».
   const more = long.slice(short.length);
-  const unit = /\d$/.test(short) && !/[π√∞%^i]|^\//.test(more);
+  const unit = /\d$/.test(short) && !FACTOR.test(more);
   const note = /^[,;:(]/.test(more) && !/^[,;][a-zа-яё](?:\)|[,;]|$)/.test(more);
   if (short && long.startsWith(short) && !/[\d¹²³⁰-⁹₀-₉]/.test(more) && (unit || note)) return true;
   const x = value(a), y = value(b);
@@ -316,7 +318,9 @@ function fresh(text: string, body: string): string[] {
   return pieces(text).flatMap((t) => {
     const k = headOf(t);
     const mine = k ? own.filter(([h]) => h === k) : [];
-    const sent = answersOf(mine.length === 1 ? mine[0][1] : body);
+    // в куске своего задания ответа может не оказаться (решение разрезано строкой «Вариант 2: …»): тогда сравниваем со всем решением
+    const own1 = mine.length === 1 ? answersOf(mine[0][1]) : [];
+    const sent = own1.length ? own1 : answersOf(body);
     return answersOf(t).filter((x) => !sent.some((y) => same(x, y)));
   });
 }

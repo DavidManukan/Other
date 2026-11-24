@@ -412,10 +412,12 @@ function valueOf(answer: string): string | null {
   const a = answer.trim();
   if (!/в решении\)?\.?$/i.test(a)) return answer;
   if (REFER.test(a) || BARE.test(a)) return null;
-  // разделитель перед хвостом: тире, запятая, скобка или конец предложения («…вдвое. Расчёт в решении.»); точка после «см» не конец
-  const m = /(?:\s+[—–-]\s+|[,;]\s+|(?<!см)[.!?]\s+|\s*\()((?:[^\d=<>≈—–\-(),;.!?]|(?<=см)\.)*?)в решении\)?(\.?)$/i.exec(a);
+  // разделитель перед хвостом: тире, запятая, скобка или конец предложения («…вдвое. Расчёт в решении.»).
+  // Точка после «см» и после сокращения из одной буквы («т. к.», «г.») концом предложения не считается.
+  const m = /(?:\s+[—–-]\s+|[,;]\s+|(?<!см)(?<![\s.][а-яё]|^[а-яё])[.!?]\s+|\s*\()((?:[^\d=<>≈—–\-(),;.!?]|(?<=см)\.)*?)в решении\)?(\.?)$/i.exec(a);
   if (!m) return STUFF.test(a.replace(/\s+в решении\)?\.?$/i, "")) ? null : answer; // «структурные формулы в решении.»
-  const tail = m[1].trim(), rest = a.slice(0, m.index).trim();
+  // знак конца предложения остаётся при значении: «Where does he live? Перевод в решении.» -> «Where does he live?»
+  const tail = m[1].trim(), rest = a.slice(0, m.index + (/^[.!?]/.test(m[0]) ? 1 : 0)).trim();
   if (!rest) return null;
   if (tail && !POINTER.test(tail)) return answer;
   if (!tail && !VALUE.test(rest) && STUFF.test(rest)) return null; // «электронный баланс и уравнение – в решении.»
