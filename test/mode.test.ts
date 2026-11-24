@@ -141,7 +141,7 @@ test("инструкция: вид ответа, таблицы, тест спи
   }
   assert.ok(!PROMPT.includes("—"), "в инструкции осталось длинное тире");
   assert.ok(CHECK_PROMPT.includes("до того, как его увидит ученик") && CHECK_PROMPT.includes("ВЕРДИКТ: ВЕРНО"));
-  assert.ok(judgeText("№2: 7").includes("заголовок задания тот же") && judgeText("№2: 7").includes("ВСЁ ВЕРНО") && judgeText("№2: 7").includes("«ВИД» не пиши"));
+  assert.ok(judgeText("№2: 7").includes("заголовок задания в точности тот же") && judgeText("№2: 7").includes("ВСЁ ВЕРНО") && judgeText("№2: 7").includes("«ВИД» не пиши"));
 });
 
 test("служебная строка в другой записи тоже читается, если она первая в ответе", () => {
