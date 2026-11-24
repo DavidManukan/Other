@@ -72,3 +72,21 @@ test("«ДОПОЛНЕНО»: ответ прежний, но в решение 
   assert.equal(judgeReply({ text: "ДОПОЛНЕНО", cut: false, refused: false }, body), null);
   assert.equal(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, cut: true, refused: false }, body), null);
 });
+
+test("«ДОПОЛНЕНО» с заметкой, с заголовком на той же строке и с пересчётом кодом после задания: исправление не теряется", () => {
+  const body = "№1\nx = 4\nОтвет: 4\n\n№2\nF = ma\nОтвет: 5 Н";
+  const fix = "№2\nОбоснование:\nсистема отсчёта инерциальная\nF = ma\nОтвет: 5 Н";
+  for (const head of ["ДОПОЛНЕНО: рисунок сил", "ДОПОЛНЕНО – добавлено обоснование", "Дополнено."]) {
+    assert.deepEqual(judgeReply({ text: `${head}\n${fix}`, cut: false, refused: false }, body), { fix }, head);
+  }
+  // заголовок задания на строке со словом остаётся заголовком
+  assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО ${fix}`, cut: false, refused: false }, body), { fix });
+  // после задания модель ещё раз пересчитала кодом: в хвосте только заметка, задание берётся из основного текста
+  for (const tail of ["Проверка кодом подтвердила: всё верно.", "Пересчёт сошёлся."]) {
+    assert.deepEqual(judgeReply({ text: `ДОПОЛНЕНО\n${fix}`, tail, cut: false, refused: false }, body), { fix }, tail);
+  }
+  // слово в середине решения меткой не считается: стоит после заголовка задания
+  assert.deepEqual(judgeReply({ text: "№2\nДополнено условие: m = 1 кг\nF = ma\nОтвет: 5 Н", cut: false, refused: false }, body), { ok: true });
+  // «Дополненоe» внутри другого слова тоже не метка
+  assert.deepEqual(judgeReply({ text: `Дополненное решение проверил.\nВСЁ ВЕРНО`, cut: false, refused: false }, body), { ok: true });
+});

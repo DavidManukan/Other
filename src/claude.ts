@@ -114,7 +114,9 @@ export function claudeProblem(c: Cfg, e: unknown, model = c.model): Error {
   }
   if (e instanceof Anthropic.ContentTooLargeError) return new Fatal("Фото слишком большое. Пришли обычное фото.");
   if (e instanceof Anthropic.PermissionDeniedError) {
-    return new Fatal(`Claude отказал в доступе (403): ${String(e.apiMessage ?? "").slice(0, 120)}`);
+    // сырой текст API человеку в чате ни к чему: он остаётся в логах воркера
+    console.log("403:", String(e.apiMessage ?? "").slice(0, 300));
+    return new Fatal(`Ключ Claude не даёт доступа к модели ${model} (403). Проверь ключ и MODEL.`);
   }
   if (e instanceof Anthropic.APIConnectionError) return new Busy("нет связи с Claude");
   if (e instanceof Anthropic.APIError) {
@@ -294,14 +296,22 @@ function fresh(text: string, body: string): string[] {
 
 // 5. Ответ прежний, но в решении не хватало обязательного элемента (рисунка, обоснования): модель пишет строку «ДОПОЛНЕНО»
 //    и задание целиком. Это тоже исправление, хотя новых ответов в нём нет.
-const ADDED = /^[\s*]*ДОПОЛНЕНО[\s.:!*]*$/im;
+//    Слово стоит до первого задания. После него бывает заметка («ДОПОЛНЕНО: рисунок сил») или сразу заголовок («ДОПОЛНЕНО №2»).
+//    (граница слова \b кириллицу не понимает, поэтому конец слова проверяем сами)
+const ADDED = /^[\s*]*ДОПОЛНЕНО(?![а-яё])/i;
+function added(text: string): string | null {
+  const rows = text.split("\n");
+  const at = rows.findIndex((r) => ADDED.test(r));
+  if (at < 0 || rows.slice(0, at).some((r) => TASK.test(r))) return null;
+  const left = rows[at].replace(/^[\s*]*ДОПОЛНЕНО[\s.:!*—–-]*/i, "");
+  return [...(TASK.test(left) ? [left] : []), ...rows.slice(at + 1)].join("\n").trim();
+}
 export function judgeReply(a: Pick<Answer, "text" | "tail" | "all" | "cut" | "refused">, body = ""): { ok: true } | { fix: string } | null {
   if (a.cut || a.refused) return null;
   const last = (a.tail ?? a.text).trim();
-  if (ADDED.test(last)) {
-    const rest = last.split("\n").filter((r) => !ADDED.test(r)).join("\n").trim();
-    return whole(rest) ? { fix: rest } : null;
-  }
+  // После слова «ДОПОЛНЕНО» и задания модель могла ещё раз пересчитать кодом: тогда в хвосте только заметка, а задание в основном тексте
+  const more = added(last) ?? added(a.text.trim());
+  if (more !== null) return whole(more) ? { fix: more } : null;
   const pure = last.split("\n").some((l) => /^[\s*]*вс[её]\s+верно[\s.!*]*$/i.test(l)); // отдельная строка «ВСЁ ВЕРНО»
   if (!pure && whole(last) && fresh(last, body).length) {
     return { fix: last.split("\n").filter((r) => !(PHRASE.test(r) && !/Ответ:/.test(r) && r.length < 80)).join("\n").trim() };
@@ -384,6 +394,11 @@ async function converse(c: Cfg, model: string, o: AskOptions): Promise<Answer> {
   }
 }
 
+// Оценка размышлений оборванного потока по времени молчания. Точной скорости API не сообщает: берём около 50 токенов в секунду
+// (в быстром режиме вдвое больше) и не больше max_tokens. Это оценка для дневного лимита, в журнале она помечена «примерно».
+const PAUSE = 2_000;
+export const thinkGuess = (quietMs: number, fast: boolean, max: number) => Math.min(max, Math.round((quietMs / 1000) * (fast ? 100 : 50)));
+
 interface Attempt {
   text: string; // если поток оборвался: текст, написанный после последней проверки в этом потоке
   fresh?: boolean; // в оборванном потоке была проверка: текст прошлых кругов к ответу уже не относится
@@ -438,6 +453,12 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   // (текст, размышления, код для песочницы): около 3 знаков русского текста на токен. Иначе лимит видел бы почти $0.
   let streamed = 0;
   let exact = false;
+  // Размышления в поток не пишутся (их текст скрыт), но оплачиваются как выход. Пока модель думает, поток молчит:
+  // паузы между событиями считаем временем размышлений. Ожидание песочницы (код уже отправлен, результата ещё нет) не в счёт.
+  let quiet = 0;
+  let seen = 0; // время последнего события потока
+  let sandbox = false;
+  let toolAt = -1; // номер блока с вызовом песочницы: после его конца идёт ожидание результата
   const count = (u: { input_tokens?: number | null; output_tokens?: number | null; cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null; cache_creation?: { ephemeral_1h_input_tokens?: number | null } | null; output_tokens_details?: { thinking_tokens?: number | null } | null } | undefined, final = false) => {
     if (!u) return;
     if (final) exact = true;
@@ -452,6 +473,12 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
     const stream = client(c).beta.messages.stream(params, { signal: ctrl.signal });
     for await (const ev of stream) {
       opened = true;
+      const now = Date.now();
+      if (seen && !sandbox && now - seen > PAUSE) quiet += now - seen;
+      seen = now;
+      if (ev.type === "content_block_start") sandbox = false;
+      else if (ev.type === "content_block_stop" && toolAt === ev.index) sandbox = true;
+      if (ev.type === "content_block_start" && (ev.content_block.type as string) === "server_tool_use") toolAt = ev.index;
       if (ev.type === "message_start") (count(ev.message.usage), (served = ev.message.model || served));
       else if (ev.type === "message_delta") count(ev.usage, true);
       if (ev.type === "content_block_delta") {
@@ -485,9 +512,12 @@ async function attempt(c: Cfg, model: string, o: AskOptions, messages: Anthropic
   } finally {
     clearTimeout(timer);
     o.stop?.removeEventListener("abort", interrupt);
-    const guess = exact ? 0 : Math.ceil(streamed / 3);
+    if (!exact && seen && !sandbox && Date.now() - seen > PAUSE) quiet += Date.now() - seen;
+    const thought = exact ? 0 : thinkGuess(quiet, params.speed === "fast", params.max_tokens);
+    const guess = exact ? 0 : Math.ceil(streamed / 3) + thought;
     const estimated = guess > used.out;
     if (estimated) used.out = guess;
+    if (thought > used.think) used.think = thought;
     if (used.in + used.out + used.read + used.write > 0) {
       try {
         const paid = cost(served, model, used, params.speed === "fast");

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import Anthropic from "@anthropic-ai/sdk";
-import { Busy, Fatal, activeModel, allText, answerText, claudeProblem, tasks, unavailable } from "../src/claude.ts";
+import { Busy, Fatal, activeModel, allText, answerText, claudeProblem, tasks, thinkGuess, unavailable } from "../src/claude.ts";
 import { config, hider, hookKey, logKey, lower, publicOrigin } from "../src/config.ts";
 import { Green, GreenError, permanent } from "../src/green.ts";
 import { assign, chunks, figureLabel, inline, pageHtml, taskHtml, tex } from "../src/page.ts";
@@ -504,4 +504,50 @@ test("текст для тетради: строка «Ответ: сочине�
   // длинный ответ в списке режется после целого пункта, а не посреди слова
   const long = card([`№2\nОтвет: ${"да, действует; "}${"невесомость возникает потому что космонавт и станция свободно падают вместе с одинаковым ускорением, ".repeat(2)}конец`]);
   assert.ok(/[а-яё]…$/.test(long) && !/[,;]…$/.test(long) && long.length < 170, long);
+});
+
+test("ответ со значением не пропадает из-за слов «в решении»: убирается только отсылка", () => {
+  // значение остаётся и в тексте, и в списке ответов
+  assert.equal(tidy("№2\nS = 3 · 4\nОтвет: 12 см² – расчёт в решении."), "№2\nS = 3 · 4\nОтвет: 12 см².");
+  assert.equal(tidy("№3\nD > 0\nОтвет: 2 корня, они найдены в решении."), "№3\nD > 0\nОтвет: 2 корня.");
+  assert.equal(tidy("№4\nподстановка\nОтвет: x = 5 (проверка в решении)"), "№4\nподстановка\nОтвет: x = 5");
+  assert.equal(card(["№1\nОтвет: 4", "№2\nS = 3 · 4\nОтвет: 12 см² – расчёт в решении."]), "✅ Ответы\n№1: 4\n№2: 12 см².");
+  assert.equal(card(["№3\nD > 0\nОтвет: 2 корня, они найдены в решении."]), "✅ Ответы\n№3: 2 корня.");
+  assert.deepEqual(compose(["№3\nD > 0\nОтвет: 2 корня, они найдены в решении."], 12_000), ["№3\nD > 0\nОтвет: 2 корня."]);
+  // чистая отсылка по-прежнему убирается из текста, а в списке стоит «см. решение»
+  assert.equal(tidy("№5\n```python\nprint(1)\n```".replace(/```/g, "'''") + "\nещё строка\nОтвет: программа в решении."), "№5\n'''python\nprint(1)\n'''\nещё строка");
+  assert.equal(card(["№5\nкод\nОтвет: программа в решении."]), "✅ Ответы\n№5: см. решение");
+});
+
+test("объём сочинения в заголовке согласован с числом: слово, слова, слов", () => {
+  const head = (n: number) => tidy(`№27\nТекст сочинения. Ещё предложение.\nОтвет: сочинение, ${n} слов.`).split("\n")[0];
+  assert.equal(head(271), "№27 · 271 слово");
+  assert.equal(head(202), "№27 · 202 слова");
+  assert.equal(head(250), "№27 · 250 слов");
+  assert.equal(head(211), "№27 · 211 слов");
+  assert.equal(head(214), "№27 · 214 слов");
+  assert.equal(head(183), "№27 · 183 слова");
+});
+
+test("403 от Claude: человеку понятная причина без сырого текста API", () => {
+  const raw = "Your organization does not have access to this resource in region X";
+  const e = Anthropic.APIError.generate(403, { type: "error", error: { type: "permission_error", message: raw } }, raw, new Headers());
+  const p = claudeProblem({ model: "claude-fable-5-2" } as any, e);
+  assert.ok(p instanceof Fatal);
+  assert.ok(!p.message.includes("organization") && !/[a-z]{6,} [a-z]{4,} [a-z]{4,}/.test(p.message), p.message);
+  assert.match(p.message, /403/);
+});
+
+test("оборванный поток: размышления оцениваются по времени молчания и не больше max_tokens", () => {
+  assert.equal(thinkGuess(0, true, 64_000), 0);
+  assert.equal(thinkGuess(60_000, false, 64_000), 3_000);
+  assert.equal(thinkGuess(60_000, true, 64_000), 6_000);
+  assert.equal(thinkGuess(780_000, true, 64_000), 64_000); // весь кусок в быстром режиме: упираемся в предел запроса
+});
+
+test("в тексте листа «4-го» не рвётся по дефису, знак между словами не начинает строку", () => {
+  assert.match(inline("среднее 4-го и 5-го членов"), /<span class="nb">4-го<\/span> и <span class="nb">5-го<\/span>/);
+  assert.ok(inline("система пуля + брусок замкнута").includes("пуля\u00a0+ брусок"));
+  assert.ok(!inline("x-ось и y-ось").includes('class="nb"'));
+  assert.ok(!inline("в 1990-х годах").includes("<span class=\"nb\">1990-х годах"));
 });

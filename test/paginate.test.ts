@@ -3,7 +3,8 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { after, test } from "node:test";
-import { PAGE_H, PAGE_W, PAGINATE, pageHtml } from "../src/page.ts";
+import { readFileSync } from "node:fs";
+import { PAGE_H, PAGE_W, PAGINATE, katexCss, pageHtml, textFont } from "../src/page.ts";
 import { texLeak } from "../src/tex.ts";
 import { splitAnswer } from "../src/text.ts";
 
@@ -175,4 +176,36 @@ test("широкая таблица со словами: слова и числ�
   });
   await page.close();
   assert.ok(out.right <= out.sheet && out.lines === 1 && out.font >= 11, JSON.stringify(out));
+});
+
+test("единица, приклеенная к широкой формуле, не вылезает за край листа", { skip }, async () => {
+  // настоящие стили и шрифты формул: без них дробь и корень не имеют своей ширины
+  const dist = new URL("../node_modules/katex/dist/", import.meta.url);
+  const css = katexCss(readFileSync(new URL("katex.min.css", dist), "utf8"), (n) => { try { return readFileSync(new URL(`fonts/${n}.woff2`, dist)).toString("base64"); } catch { return undefined; } });
+  const fonts = textFont(readFileSync(new URL("../node_modules/dejavu-fonts-ttf/ttf/DejaVuSans.ttf", import.meta.url)).toString("base64"));
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  const rows = Array.from({ length: 16 }, (_, i) => `Это $\\dfrac{1}{${"2".repeat(30 + i)}}$ кДж.`);
+  const roots = Array.from({ length: 12 }, (_, i) => `Путь $\\sqrt{${"3".repeat(34 + i)}}$ км.`);
+  await page.setContent(pageHtml([`№1\n${[...rows, ...roots].join("\n")}\nОтвет: $5$ кДж.`], [], fonts, css));
+  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(PAGINATE);
+  const r = await page.evaluate(() => {
+    const out = { over: 0, loose: 0, glued: 0 };
+    for (const g of document.querySelectorAll(".glue")) {
+      const box = (g.closest(".b") as HTMLElement).getBoundingClientRect();
+      for (const rect of g.getClientRects()) if (rect.right > box.right + 1) out.over++;
+      g.classList.contains("loose") ? out.loose++ : out.glued++;
+    }
+    return out;
+  });
+  await page.close();
+  assert.equal(r.over, 0, JSON.stringify(r));
+  assert.ok(r.loose > 0 && r.glued > 0, JSON.stringify(r)); // длинным хвост отпущен, у коротких остался приклеен
+});
+
+test("лист-огрызок присоединяется к предыдущему, только если общий лист не выше обычного предела", { skip }, async () => {
+  for (const n of [38, 41, 43, 45, 47, 50]) {
+    const r = await lay(["№1\n" + Array.from({ length: n }, (_, i) => `$x_{${i + 1}} = \\dfrac{${i + 3}}{${i + 7}}$`).join("\n") + "\nОтвет: $x = \\dfrac{1}{2}$"]);
+    assert.ok(Math.max(...r.heights) <= PAGE_H + 120, `${n}: ${JSON.stringify(r.heights)}`);
+  }
 });

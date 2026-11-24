@@ -92,7 +92,10 @@ export function inline(text: string): string {
   // вне формул разметки быть не должно: что осталось (знак $ без пары, команда без $), переводится в обычные знаки
   const segs = mathSpans(text);
   const out: string[] = [];
-  const words = (t: string) => esc(prettyMath(stripTex(t), sheet || undefined));
+  // «4-го» не рвётся по дефису, а знак между словами («пуля + брусок») не начинает строку
+  const words = (t: string) => esc(prettyMath(stripTex(t), sheet || undefined))
+    .replace(/(?<![\p{L}\d])(\d+-[а-яё]{1,3})(?![а-яё])/giu, '<span class="nb">$1</span>')
+    .replace(/(?<=[\p{L}\d)]) ([+=]) (?=[\p{L}\d(])/gu, "\u00a0$1 ");
   for (let k = 0; k < segs.length; k++) {
     const s = segs[k];
     if (!s.math) {
@@ -307,7 +310,8 @@ h2{font-size:26px;line-height:1.3;margin:6px 0 8px;font-weight:bold}
 .cont{font-size:17px;margin:0 0 6px}
 .b{margin:6px 0;overflow-wrap:anywhere}.b:has(.mfrac){margin:11px 0}
 .b.line{padding-left:.9em;text-indent:-.9em}.b.line.more{text-indent:0}.b.line,.row .main,.ans,.given>div{text-wrap:pretty}
-.glue{white-space:nowrap}
+.glue{white-space:nowrap}.nb{white-space:nowrap}
+.glue.loose{white-space:normal}
 .lbl{font-weight:bold}
 .given{width:fit-content;max-width:100%;border-right:2px solid #fff;padding:0 18px 2px 0;margin:6px 0 10px}
 .given .tbl{margin:4px 0}.given .find{border-top:2px solid #fff;margin-top:8px;padding-top:6px}.given .find+.find{border-top:0;margin-top:2px;padding-top:0}
@@ -357,6 +361,11 @@ export const PAGINATE = `(() => {
   };
   for (const f of flow.querySelectorAll(".f")) if (f.getBoundingClientRect().width > room(f) + 1) f.classList.add("brk");
   for (const fx of flow.querySelectorAll(".fx")) if (fx.getBoundingClientRect().width > room(fx) + 1) fx.classList.add("wide");
+  // Формула с приклеенным хвостом («кДж.») шире строки: хвост отпускаем на следующую строку, иначе край листа его обрежет
+  for (const g of flow.querySelectorAll(".glue")) if (g.getBoundingClientRect().width > room(g) + 1) {
+    g.classList.add("loose");
+    for (const t of g.childNodes) if (t.nodeType === 3) t.data = t.data.replace(/\u00a0/g, " ");
+  }
   // Дробь, корень или матрицу перенести нельзя: если такой кусок шире строки, уменьшаем формулу, чтобы её не обрезало краем листа
   for (const k of flow.querySelectorAll(".katex")) {
     const avail = room(k);
@@ -619,7 +628,7 @@ export const PAGINATE = `(() => {
   for (let i = pages.length - 1; i > 0; i--) {
     const cur = pages[i], prev = pages[i - 1];
     if (!cur.length || !prev.length) continue;
-    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= H + 30) {
+    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= H + 15) {
       prev.push(...cur);
       pages.splice(i, 1);
     }

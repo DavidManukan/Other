@@ -322,8 +322,9 @@ export function card(parts: string[], title = "✅ Ответы"): string {
     // несколько ответов идут через «;», точка в конце каждого перед ним не нужна
     let answer = answers.length > 1 ? answers.map((a, k) => (k < answers.length - 1 ? a.replace(/[.;]+$/, "") : a)).join("; ") : answers[0]
       ?? (rows.some((l) => /^Не видно:/.test(l)) ? "не видно условия, пересними ближе" : rows.some((l) => /решено выше/i.test(l)) ? "решено выше" : "см. решение");
-    // «уравнения 1)–4) в решении.» в списке ничего не говорит: читатель и так знает, где решение
-    if (/в решении\.?$/i.test(answer) && !/[;,]/.test(answer)) answer = "см. решение";
+    // «уравнения 1)–4) в решении.» в списке ничего не говорит: читатель и так знает, где решение.
+    // А «12 см² – расчёт в решении.» значение несёт: у него убираем только хвост-отсылку.
+    answer = valueOf(answer) ?? "см. решение";
     if (answer.length > 140) {
       // режем по смыслу: после целого пункта, иначе после запятой, и только потом по слову
       const cut = answer.slice(0, 139);
@@ -370,16 +371,38 @@ export function tidy(part: string): string {
   if (at < 0 || rows.slice(at + 1).some((r) => r.trim()) || part.includes("```")) return part;
   const line = rows[at].trim();
   const size = /^Ответ:\s*(?:сочинение|эссе|письмо|изложение)[^\d\n]{0,20}(\d+)\s*слов[оа]?\.?$/i.exec(line);
-  if (!size && !/^Ответ:[^;\n]*в решении\.?$/i.test(line)) return part;
+  const answer = line.replace(/^Ответ:\s*/, "");
+  const value = size ? null : valueOf(answer);
+  if (value !== null) {
+    // у ответа со значением убираем только хвост-отсылку: «12 см² – расчёт в решении.» -> «12 см².»
+    if (value !== answer) rows[at] = rows[at].replace(answer, () => value);
+    return rows.join("\n");
+  }
   const rest = rows.slice(0, at);
   while (rest.length && !rest[rest.length - 1].trim()) rest.pop();
   if (rest.filter((r) => r.trim()).length < 2) return part; // кроме заголовка ничего нет: строку оставляем
   if (size) {
+    const n = `${size[1]} ${words(Number(size[1]))}`;
     const head = rest.findIndex((r) => HEAD.test(r) && r.trim().length <= 60);
-    if (head >= 0) rest[head] = `${rest[head].trimEnd()} · ${size[1]} слов`;
-    else rest.push(`(${size[1]} слов)`);
+    if (head >= 0) rest[head] = `${rest[head].trimEnd()} · ${n}`;
+    else rest.push(`(${n})`);
   }
   return rest.join("\n");
+}
+
+// «271 слово», «202 слова», «250 слов»
+const words = (n: number) => (n % 10 === 1 && n % 100 !== 11 ? "слово" : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? "слова" : "слов");
+
+// Строка ответа, которая только отсылает к решению и своего значения не несёт: «уравнения 1)–4) в решении.», «программа в решении.»
+const REFER = /^(?:уравнени[ея]|реакци[ия]|превращени[ея]|цепочка|схема|программа|код|решение|построение|черт[её]ж|рисунок|график|доказательство|таблица|разбор|текст|перевод|план)(?![а-яё])[^=<>≈;]*в решении\.?$/i;
+// Значение ответа без отсылки к решению. null: значения нет, строка только отсылает к решению.
+// «2 корня, они найдены в решении.» -> «2 корня.», «x = 5 (проверка в решении)» -> «x = 5»
+function valueOf(answer: string): string | null {
+  const a = answer.trim();
+  if (!/в решении\)?\.?$/i.test(a)) return answer;
+  if (REFER.test(a)) return null;
+  const cut = a.replace(/\s*(?:[—–-]\s+|[,;]\s*|\()[^—–(),;]*в решении\)?(\.?)$/i, "$1");
+  return cut.replace(/\.$/, "").trim() ? cut : null;
 }
 
 export function compose(parts: string[], max: number, title?: string): string[] {

@@ -1310,6 +1310,9 @@ export class Chat extends DurableObject<Env> {
             throw new Busy("проверяющая модель ответила не по форме");
           }
           if (v.ok) return await close("ok", "вторая проверка: решение подтверждено");
+          // время и цену проверки пишем до сохранения: если куска на разбор не хватит, работа продолжится из записи
+          lap(job, phase, began);
+          await this.bill(job, bills.splice(0));
           chk.phase = "judge";
           chk.issues = v.issues.slice(0, 4000);
           chk.tries = 0;
