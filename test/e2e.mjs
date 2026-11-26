@@ -186,6 +186,19 @@ try {
   await photo("914", "M914C");
   ok(await until(() => reqs("M914C").length >= 1 && texts("914").filter((t) => t === "📥 Принял фото, решаю. Режим: обычный.").length === 2, 30_000) && !reqs("M914C")[0].system[0].text.includes("Включён олимпиадный режим"), "после возврата фото снова решается в обычном режиме", JSON.stringify(texts("914").filter((t) => t.startsWith("📥"))));
   ok(await until(() => answers("914").filter((t) => t.includes("Ответ")).length === 3, 30_000), "режим: третья работа решена");
+  // фото сразу после смены режима не присоединяется к работе, принятой в прежнем режиме: оно решается в новом, отдельной работой
+  await photo("914", "S_WAIT M914D");
+  ok(await until(() => reqs("M914D").length === 1), "смена режима посреди работы: первая работа решается");
+  await text("914", "олимпиадный режим");
+  ok(await until(() => texts("914").filter((t) => t.startsWith("Режим: олимпиадный ✅")).length === 2), "смена режима посреди работы: режим включён");
+  await photo("914", "M914E");
+  ok(await until(() => texts("914").includes("📥 Принял фото, решу сразу после текущего. Режим: олимпиадный."), 5000) && !texts("914").some((t) => t.startsWith("➕")), "фото после смены режима: отдельная работа, бот называет новый режим", JSON.stringify(texts("914").slice(-3)));
+  ok(await until(() => reqs("M914E").length >= 1 && answers("914").filter((t) => t.includes("Ответ")).length === 5, 40_000), "фото после смены режима: обе работы решены", JSON.stringify(texts("914").slice(-4)));
+  ok(!reqs("M914D")[0].system[0].text.includes("Включён олимпиадный режим") && reqs("M914E")[0].system[0].text.includes("Включён олимпиадный режим"), "каждая работа решена в том режиме, в котором принята");
+  await text("914", "режим подробный");
+  ok(await until(() => texts("914").some((t) => t.startsWith("Не понял режим. Запись решения: олимпиадный режим / обычный режим."))), "незнакомый режим: подсказка называет оба режима записи и не требует прав хозяина", JSON.stringify(texts("914").slice(-1)));
+  await text("914", "обычный режим");
+  ok(await until(() => texts("914").filter((t) => t.startsWith("Режим: обычный ✅")).length === 2), "режим возвращён");
   await text("912", "fast вкл");
   await text("912", "ping");
   ok(await until(() => texts("912").some((t) => t.startsWith("pong"))) && texts("912").at(-1).includes("думает: high, fast выкл") && !texts("912").at(-1).includes("Журнал"), "чужой чат: режим прежний, ссылки на журнал нет", texts("912").at(-1));

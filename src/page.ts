@@ -12,6 +12,7 @@ import { esc } from "./util.ts";
 export const PAGE_W = 560; // ширина страницы в точках CSS
 export const PAGE_DPR = 3; // плотность снимка: 1680 пикселей в ширину, мелкие индексы читаются и при увеличении
 export const PAGE_H = 1000; // обычная высота листа: 9:16 занимает экран телефона целиком
+export const MAX_PAGES = 30; // больше страниц картинками не шлём: такой ответ уходит текстом целиком
 export const PAGE_TALL = 1800; // до этой высоты задание остаётся на одном листе: один скрин на одно задание; выше текст на телефоне уже мелкий
 
 // (после номера допускается короткая пометка в скобках: «№1 (2 балла)»; номер с буквой без знака №: «A1», «В2.»)
@@ -351,6 +352,7 @@ export function pageHtml(parts: string[], svgs: string[], fonts: string, css: st
 export const PAGINATE = `(() => {
   const H = ${PAGE_H};
   const TALL = ${PAGE_TALL};
+  const MANY = ${MAX_PAGES};
   const flow = document.getElementById("flow");
   // 0. Таблица шире листа: уменьшаем её шрифт, пока не поместится (иначе правый край обрежется). Слова и числа в ячейках
   // при этом не рвутся. Не помогло и самое мелкое читаемое письмо: тогда разрешаем перенос внутри слова.
@@ -621,6 +623,7 @@ export const PAGINATE = `(() => {
   // 6. Делим поток на листы
   const top = flow.getBoundingClientRect().top;
   const tasks = [...flow.querySelectorAll(".task")];
+  const solo = tasks.length <= MANY;
   const pages = [[]];
   let start = null;
   // строка, после которой сразу идёт её продолжение: заголовок, «Решение:», «3) Площадь через …:»
@@ -630,11 +633,17 @@ export const PAGINATE = `(() => {
     const blocks = [...task.children];
     // Одно задание = один лист: чужое задание на лист не попадает, а своё не уходит на второй, пока оно не выше TALL.
     // Задание выше TALL делится на равные части, а не на полный лист и огрызок.
-    if (pages[pages.length - 1].length) pages.push([]);
-    start = null;
+    // Заданий больше, чем бот шлёт картинок: короткие снова делят лист между собой, иначе весь ответ ушёл бы текстом.
+    if (solo) {
+      if (pages[pages.length - 1].length) pages.push([]);
+      start = null;
+    } else if (start !== null && pages[pages.length - 1].length && r.bottom - top - start > H - 60 && r.height <= H - 90) {
+      pages.push([]);
+      start = null;
+    }
     const count = Math.ceil(r.height / (TALL - 60));
     // (запас сверх равной доли нужен на то, что блоки не делятся: иначе хвост ушёл бы на лишний лист)
-    const limit = count <= 1 ? Infinity : Math.min(TALL - 60, Math.max(H - 60, r.height / count + 160));
+    const limit = !solo ? H - 60 : count <= 1 ? Infinity : Math.min(TALL - 60, Math.max(H - 60, r.height / count + 160));
     for (const b of blocks) {
       const br = b.getBoundingClientRect();
       const page = pages[pages.length - 1];
@@ -660,8 +669,8 @@ export const PAGINATE = `(() => {
   const edge = (p, last) => p[last ? p.length - 1 : 0].b.getBoundingClientRect();
   for (let i = pages.length - 1; i > 0; i--) {
     const cur = pages[i], prev = pages[i - 1];
-    if (!cur.length || !prev.length || cur[0].task !== prev[prev.length - 1].task) continue;
-    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= TALL - 45) {
+    if (!cur.length || !prev.length || (solo && cur[0].task !== prev[prev.length - 1].task)) continue;
+    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= (solo ? TALL : H) - 45) {
       prev.push(...cur);
       pages.splice(i, 1);
     }

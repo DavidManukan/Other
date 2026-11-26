@@ -263,4 +263,9 @@ test("два режима записи: обычный требует тольк
   assert.ok(checkPromptFor().includes("Краткость тоже не ошибка") && !checkPromptFor().includes("решение обязано быть полным"));
   assert.ok(checkPromptFor("olymp") === CHECK_PROMPT_OLYMP && CHECK_PROMPT_OLYMP.includes("решение обязано быть полным") && !CHECK_PROMPT_OLYMP.includes("Краткость тоже не ошибка"));
   assert.ok(!/%РЕЖИМ%/.test(CHECK_PROMPT + CHECK_PROMPT_OLYMP));
+  // в олимпиадном режиме полнота главнее общих послаблений проверяющего; в обычном этой оговорки нет
+  assert.ok(CHECK_PROMPT_OLYMP.includes("главнее правил о недочётах оформления") && !CHECK_PROMPT.includes("главнее правил о недочётах"));
+  // метка формулы в лабораторной нужна только в олимпиадном режиме; обычный важнее и правил олимпиадной задачи
+  assert.ok(!PROMPT.includes("Формулу метода назови меткой") && !PROMPT.includes("формулу метода назови меткой") && PROMPT_OLYMP.includes("формулу метода назови меткой"));
+  assert.ok(PROMPT.includes("и к олимпиадной задаче"));
 });

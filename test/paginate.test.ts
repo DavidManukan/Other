@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { after, test } from "node:test";
 import { readFileSync } from "node:fs";
-import { PAGE_H, PAGE_TALL, PAGE_W, PAGINATE, katexCss, pageHtml, textFont } from "../src/page.ts";
+import { MAX_PAGES, PAGE_H, PAGE_TALL, PAGE_W, PAGINATE, katexCss, pageHtml, textFont } from "../src/page.ts";
 import { texLeak } from "../src/tex.ts";
 import { splitAnswer } from "../src/text.ts";
 
@@ -320,4 +320,25 @@ test("число не отрывается от единицы: длинная �
   assert.equal(r.text, "м/с²");
   assert.ok(r.sameLine && r.after && r.inside && !r.loose, JSON.stringify(r));
   assert.ok(r.lines >= 2, JSON.stringify(r)); // формула перенесена, а не ужата в одну строку
+});
+
+test("заданий больше, чем бот шлёт картинок: короткие снова делят листы, ответ остаётся страницами", { skip }, async () => {
+  const { css, fonts } = real();
+  const run = async (n: number) => {
+    const parts = Array.from({ length: n }, (_, k) => `№${k + 1}\n$${k + 1}x + 3 = ${k + 4}$\n$x = 1$\nОтвет: $x = 1$`);
+    const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+    await page.setContent(pageHtml(parts, [], fonts, css));
+    await page.evaluate(() => document.fonts.ready);
+    const total = Number(await page.evaluate(PAGINATE));
+    const r = await page.evaluate(() => ({ heights: [...document.querySelectorAll(".sheet")].map((x) => Math.round(x.getBoundingClientRect().height)), heads: document.querySelectorAll("h2").length }));
+    await page.close();
+    return { total, ...r };
+  };
+  // до предела: у каждого задания свой лист
+  for (const n of [12, MAX_PAGES]) assert.equal((await run(n)).total, n);
+  // выше предела: листов меньше, чем заданий, и не больше предела; все задания на месте, лист обычной высоты
+  for (const n of [MAX_PAGES + 1, 40]) {
+    const r = await run(n);
+    assert.ok(r.total < n && r.total <= MAX_PAGES && r.heads === n && Math.max(...r.heights) <= PAGE_H + 120, `${n}: ${JSON.stringify(r)}`);
+  }
 });

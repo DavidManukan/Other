@@ -33,6 +33,7 @@ for (const [i, c] of got.entries()) {
   if (c.body && OUT) writeFileSync(`${OUT}/page-${i}.png`, c.body);
 }
 const pages = got.filter((c) => c.png && /^reshenie-/.test(c.fileName ?? ""));
-const good = pages.length === 2 && pages[0].bytes > 20_000 && (pages[0].caption ?? "").startsWith("✅ Ответы");
+// в ответе три задания: у каждого своя страница (один скрин на одно задание)
+const good = pages.length === 3 && pages[0].bytes > 20_000 && (pages[0].caption ?? "").startsWith("✅ Ответы");
 console.log(good ? "✅ браузер снял страницы решения" : "❌ страниц нет: бот ответил текстом", "| секунд:", Math.round((Date.now() - t0) / 1000));
 done(good ? 0 : 1);

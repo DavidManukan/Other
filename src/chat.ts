@@ -358,7 +358,10 @@ export class Chat extends DurableObject<Env> {
   }
 
   private async photoIn(chatId: string, shot: Shot, mark: Record<string, unknown>) {
-    const open = await this.openJob();
+    const style = (await this.options()).style;
+    const found = await this.openJob();
+    // Работа, принятая в другом режиме записи, новых фото не берёт: фото после смены режима решается в новом режиме отдельной работой
+    const open = found && (found.job.style ?? "plain") === style ? found : null;
     if (open && open.job.shots.length < MAX_SHOTS) {
       // Работа ещё решается: добавляем фото к ней. Ждём чуть дольше, чем был промежуток между прошлыми фото:
       // если идёт серия, следующее фото придёт в том же темпе, и решать лучше один раз всё сразу.
@@ -381,7 +384,7 @@ export class Chat extends DurableObject<Env> {
     }
     const busy = await this.enqueue({ kind: "image", id: shot.id, shots: [shot] }, mark, FIRST_WAIT);
     const what = shot.pdf ? "файл" : "фото";
-    const mode = STYLE_NAME[(await this.options()).style];
+    const mode = STYLE_NAME[style];
     await this.say(chatId, busy ? `📥 Принял ${what}, решу сразу после текущего. Режим: ${mode}.` : `📥 Принял ${what}, решаю. Режим: ${mode}.`);
   }
 
@@ -590,6 +593,10 @@ export class Chat extends DurableObject<Env> {
     const effort = EFFORT_WORDS[t] ?? (m ? (EFFORT_WORDS[m[1]] ?? m[1]) : isEffort(t) ? t : undefined);
     const f = t.match(/^fast\s+(вкл|выкл|on|off)$/);
     if (effort === undefined && !f) return false;
+    if (!f && !isEffort(effort)) {
+      await this.green.send(chatId, "Не понял режим. Запись решения: олимпиадный режим / обычный режим. Сколько думать (меняет хозяин): быстро, средне, умно, макс.");
+      return true;
+    }
     if (!(await this.isOwner(chatId))) {
       await this.green.send(chatId, `Режим меняет только хозяин бота. Если это ты, добавь в Cloudflare переменную OWNER со значением ${chatId}`);
       return true;
@@ -600,10 +607,7 @@ export class Chat extends DurableObject<Env> {
       await this.green.send(chatId, `Fast ${fast ? "включён ✅ (ответ пишется быстрее, токены вдвое дороже)" : "выключен ✅"}`);
       return true;
     }
-    if (!isEffort(effort)) {
-      await this.green.send(chatId, "Не понял режим. Есть: быстро, средне, умно, макс.");
-      return true;
-    }
+    if (!isEffort(effort)) return true; // (сюда не доходит: незнакомое слово разобрано выше)
     await this.db.put<Opts>("opts", { ...((await this.db.get<Opts>("opts")) ?? {}), effort });
     await this.green.send(chatId, `Режим: ${effort} ✅${effort === "low" ? " (быстрее и дешевле)" : effort === "xhigh" || effort === "max" ? " (дольше и дороже)" : ""}`);
     return true;
