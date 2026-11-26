@@ -147,6 +147,22 @@ try {
   await text("111", "Пинг");
   ok(await until(() => texts("111").some((t) => t.startsWith("pong ✅ модель claude-fable-5-2, думает: high, fast выкл, пересчёт кодом вкл, вторая проверка выкл, решение: текстом"))), "ping", JSON.stringify(texts("111").slice(-1)));
   ok(texts("111").at(-1).includes(`Журнал: ${BASE}/?k=${LOG_KEY}`) && !texts("111").at(-1).includes(KEY), "ping хозяину: личная ссылка на журнал, секрета вебхука в ней нет", texts("111").at(-1));
+  // --- полный доступ (так по умолчанию): бот личный, любой номер получает права хозяина ---
+  await text("913", "ping");
+  ok(await until(() => texts("913").some((t) => t.startsWith("pong"))) && texts("913").at(-1).includes(`Журнал: ${BASE}/?k=${LOG_KEY}`) && texts("913").at(-1).includes("доступ полный / открыть / закрыть") && !texts("913").at(-1).includes("Совет:"), "полный доступ: любой номер видит команды хозяина и журнал", texts("913").at(-1));
+  await text("913", "fast вкл");
+  ok(await until(() => texts("913").some((t) => t.startsWith("Fast включён ✅"))), "полный доступ: любой номер меняет режим", JSON.stringify(texts("913")));
+  await text("913", "fast выкл");
+  ok(await until(() => texts("913").some((t) => t.startsWith("Fast выключен ✅"))), "полный доступ: режим возвращён");
+  await text("913", "расход");
+  ok(await until(() => texts("913").some((t) => t.startsWith("Расход на Claude") && t.includes("Доступ: полный"))), "полный доступ: расход виден любому номеру, режим доступа назван", JSON.stringify(texts("913").slice(-1)));
+  await text("913", "доступ закрыть");
+  ok(await until(() => texts("913").some((t) => t.startsWith("Закрыть доступ можно, только когда задана переменная OWNER"))), "полный доступ: закрыть бота без OWNER нельзя", JSON.stringify(texts("913").slice(-1)));
+  // доступ сужают командой: настройки остаются у того, кто её написал
+  await text("111", "доступ открыть");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Доступ открыт ✅") && t.includes("Настройки меняешь только ты"))), "доступ открыт: настройки только у хозяина", JSON.stringify(texts("111").slice(-1)));
+  await text("913", "ping");
+  ok(await until(() => texts("913").filter((t) => t.startsWith("pong")).length === 2) && !texts("913").at(-1).includes("Журнал:"), "доступ открыт: чужой номер журнал больше не видит", texts("913").at(-1));
   await text("912", "макс");
   ok(await until(() => texts("912").some((t) => t.startsWith("Режим меняет только хозяин бота"))), "чужой чат не может поднять режим", JSON.stringify(texts("912")));
   await text("912", "fast вкл");
@@ -734,10 +750,21 @@ try {
   await text("111", "ping");
   ok(await until(() => texts("111").at(-1).startsWith("pong") && texts("111").at(-1).includes("вторая проверка вкл")), "доступ закрыт: хозяин работает как обычно");
   await text("111", "доступ открыть");
-  ok(await until(() => texts("111").some((t) => t.startsWith("Доступ открыт ✅"))), "доступ: открыт командой");
+  ok(await until(() => texts("111").filter((t) => t.startsWith("Доступ открыт ✅")).length === 2), "доступ: открыт командой");
   await sleep(800);
   await text("975", "ping");
   ok(await until(() => texts("975").filter((t) => t.startsWith("pong")).length === 2) && texts("975").at(-1).includes("вторая проверка вкл"), "доступ открыт: чужой чат снова получает ответ, ping показывает общую проверку", JSON.stringify(texts("975").slice(-1)));
+  // --- полный доступ при заданной OWNER: права у любого номера, но закрыть бота может только номер из OWNER ---
+  await text("111", "доступ полный");
+  ok(await until(() => texts("111").some((t) => t.startsWith("Доступ полный ✅"))), "доступ: полный командой");
+  await text("975", "ping");
+  ok(await until(() => texts("975").filter((t) => t.startsWith("pong")).length === 3) && texts("975").at(-1).includes("Журнал:"), "полный доступ с OWNER: чужой номер получает права хозяина", texts("975").at(-1));
+  await text("975", "доступ закрыть");
+  ok(await until(() => texts("975").some((t) => t === "Закрыть доступ может только номер из переменной OWNER.")), "полный доступ с OWNER: чужой номер закрыть бота не может", JSON.stringify(texts("975").slice(-1)));
+  await text("975", "доступ открыть");
+  ok(await until(() => texts("975").some((t) => t.startsWith("Доступ открыт ✅") && t.endsWith("Настройки теперь меняет только номер из переменной OWNER.") && !t.includes("только ты"))), "полный доступ с OWNER: сузить доступ может любой номер, ему сказано, у кого теперь настройки", JSON.stringify(texts("975").slice(-1)));
+  await text("975", "макс");
+  ok(await until(() => texts("975").some((t) => t.startsWith("Режим меняет только хозяин бота"))), "после сужения хозяин снова только номер из OWNER", JSON.stringify(texts("975").slice(-1)));
   // --- воркер перезапустился посреди второй проверки: готовое решение не теряется и заново не заказывается ---
   await photo("994", "S_KILLCHK S_CHKSLOW");
   ok(await until(() => reqs("S_KILLCHK").filter(isCheck).length === 1, 30_000), "перезапуск посреди проверки: проверка началась");
