@@ -95,7 +95,9 @@ export function inline(text: string): string {
   // «4-го» не рвётся по дефису, а знак между словами («пуля + брусок») не начинает строку
   const words = (t: string) => esc(prettyMath(stripTex(t), sheet || undefined))
     .replace(/(?<![\p{L}\d])(\d+-[а-яё]{1,3})(?![а-яё])/giu, '<span class="nb">$1</span>')
-    .replace(/(?<=[\p{L}\d)]) ([+=]) (?=[\p{L}\d(])/gu, "\u00a0$1 ");
+    .replace(/(?<=[\p{L}\d)]) ([+=]) (?=[\p{L}\d(])/gu, "\u00a0$1 ")
+    // единица с косой чертой («м/с²», «км/ч», «Дж/(кг·°C)») не рвётся после черты
+    .replace(/(?<![\p{L}\d/])([\p{L}°]{1,4}\/[\p{L}°(][\p{L}°·()]{0,7}[²³]?)(?![\p{L}\d/])/gu, '<span class="nb">$1</span>');
   for (let k = 0; k < segs.length; k++) {
     const s = segs[k];
     if (!s.math) {
@@ -104,9 +106,10 @@ export function inline(text: string): string {
     }
     // Короткий хвост сразу за формулой (единица «см.», «Н,», знак препинания) не уходит на новую строку один
     const next = segs[k + 1];
-    const m = next && !next.math && !next.lit ? /^(\s?)([^\s$]{1,4})(?=\s|$)/.exec(next.body) : null;
+    const m = next && !next.math && !next.lit ? /^(\s?)([^\s$]{1,9})(?=\s|$)/.exec(next.body) : null;
     // (и окончание порядкового сразу за формулой: «$n$-й член»)
-    if (m && (/^[\p{L}]{0,3}[.,;:!?)»]*$/u.test(m[2]) || (!m[1] && /^-[а-яё]{1,3}[.,;:!?)»]*$/iu.test(m[2])))) {
+    // (и единица с косой чертой: «$a = 2{,}8$ м/с²»)
+    if (m && (/^[\p{L}]{0,3}[.,;:!?)»]*$/u.test(m[2]) || /^[\p{L}°]{1,3}\/[\p{L}°]{1,3}[²³]?[.,;:!?)»]*$/u.test(m[2]) || (!m[1] && /^-[а-яё]{1,3}[.,;:!?)»]*$/iu.test(m[2])))) {
       out.push(`<span class="glue">${tex(s.body)}${m[1] ? "\u00a0" : ""}${words(m[2])}</span>`);
       segs[k + 1] = { ...next, body: next.body.slice(m[0].length) };
     } else out.push(tex(s.body));
