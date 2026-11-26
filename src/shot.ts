@@ -17,7 +17,7 @@ import size1 from "katex/dist/fonts/KaTeX_Size1-Regular.woff2";
 import size2 from "katex/dist/fonts/KaTeX_Size2-Regular.woff2";
 import size3 from "katex/dist/fonts/KaTeX_Size3-Regular.woff2";
 import size4 from "katex/dist/fonts/KaTeX_Size4-Regular.woff2";
-import { katexCss, PAGE_DPR, PAGE_W, pageHtml, PAGINATE, textFont } from "./page.ts";
+import { katexCss, MAX_PAGES, PAGE_DPR, PAGE_W, pageHtml, PAGINATE, textFont } from "./page.ts";
 import { base64 } from "./util.ts";
 
 const FONTS: Record<string, ArrayBuffer> = {
@@ -25,7 +25,7 @@ const FONTS: Record<string, ArrayBuffer> = {
   "KaTeX_Main-Italic": mainItalic, "KaTeX_Main-Regular": mainRegular, "KaTeX_Math-BoldItalic": mathBoldItalic, "KaTeX_Math-Italic": mathItalic,
   "KaTeX_Script-Regular": script, "KaTeX_Size1-Regular": size1, "KaTeX_Size2-Regular": size2, "KaTeX_Size3-Regular": size3, "KaTeX_Size4-Regular": size4,
 };
-export const MAX_PAGES = 30; // больше страниц картинками не шлём: такой ответ уходит текстом целиком
+export { MAX_PAGES };
 const SHOT_LIMIT = 60_000; // столько даём браузеру на всё решение
 const SHOT_MAX = 1_900_000; // байт на картинку страницы: с запасом до 2 МБ на запись в хранилище чата
 

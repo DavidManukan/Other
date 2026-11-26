@@ -121,7 +121,7 @@ try {
   await photo("111", "", "DUP1"); // шлюз прислал то же сообщение второй раз
   ok(await until(() => drawings("111").length === 1), "фото: пришли ответ и рисунок");
   const t1 = texts("111");
-  ok(t1.length === 2 && t1[0] === "📥 Принял фото, решаю.", "фото: одно «принял» и один ответ, повтор вебхука не задвоил", JSON.stringify(t1));
+  ok(t1.length === 2 && t1[0] === "📥 Принял фото, решаю. Режим: обычный.", "фото: одно «принял» и один ответ, повтор вебхука не задвоил", JSON.stringify(t1));
   const a1 = t1[1] ?? "";
   ok(a1.startsWith("✅ Ответы\n№1: 4 см²\n№2: 5\n" + RULE + "\n№1\n") && a1.includes(`Ответ: 4 см²\n${RULE}\n№2\nРешение второго.\nОтвет: 5`), "ответ одним сообщением: список ответов сверху, задания по порядку", a1);
   ok(a1.includes("v₀ = 5") && a1.includes("H₂SO₄") && a1.includes("x² + 2x"), "степени и индексы приведены в порядок", a1);
@@ -165,6 +165,40 @@ try {
   ok(await until(() => texts("913").filter((t) => t.startsWith("pong")).length === 2) && !texts("913").at(-1).includes("Журнал:"), "доступ открыт: чужой номер журнал больше не видит", texts("913").at(-1));
   await text("912", "макс");
   ok(await until(() => texts("912").some((t) => t.startsWith("Режим меняет только хозяин бота"))), "чужой чат не может поднять режим", JSON.stringify(texts("912")));
+  // --- режим записи решения: обычный по умолчанию; олимпиадный включается командой и держится, пока чат не вернёт обычный ---
+  await photo("914", "M914A");
+  ok(await until(() => answers("914").length === 1, 30_000) && texts("914")[0] === "📥 Принял фото, решаю. Режим: обычный.", "режим: при получении фото бот называет обычный режим", JSON.stringify(texts("914")));
+  const sysA = reqs("M914A")[0]?.system?.[0]?.text ?? "";
+  ok(sysA.includes("Названий законов, допущений и проверки единиц нет") && !sysA.includes("Включён олимпиадный режим"), "обычный режим: инструкция требует только формулы");
+  await text("914", "олимпиадынц режим"); // с опечаткой, как пишут в чате
+  ok(await until(() => texts("914").some((t) => t.startsWith("Режим: олимпиадный ✅"))), "олимпиадный режим включается командой, опечатка не мешает, права хозяина не нужны", JSON.stringify(texts("914").slice(-1)));
+  await text("914", "ping");
+  ok(await until(() => texts("914").some((t) => t.startsWith("pong") && t.includes("режим: олимпиадный"))), "ping показывает режим", JSON.stringify(texts("914").slice(-1)));
+  await photo("914", "M914B");
+  ok(await until(() => answers("914").filter((t) => t.includes("Ответ")).length === 2, 30_000) && texts("914").includes("📥 Принял фото, решаю. Режим: олимпиадный."), "олимпиадный режим: бот называет его при получении фото", JSON.stringify(texts("914")));
+  const sysB = reqs("M914B")[0]?.system?.[0]?.text ?? "";
+  ok(sysB.includes("Включён олимпиадный режим") && sysB.includes("Проверка единиц:") && !sysB.includes("Названий законов, допущений и проверки единиц нет"), "олимпиадный режим: инструкция требует подробную запись");
+  ok(sysA.slice(0, 2000) === sysB.slice(0, 2000) && sysB.length < 60_000, "общая часть инструкции у режимов одна");
+  await text("111", "ping");
+  ok(await until(() => texts("111").at(-1).startsWith("pong") && texts("111").at(-1).includes("режим: обычный")), "режим у каждого чата свой: соседний чат остался в обычном");
+  await text("914", "дефолтный режим");
+  ok(await until(() => texts("914").some((t) => t.startsWith("Режим: обычный ✅"))), "обычный режим возвращается командой");
+  await photo("914", "M914C");
+  ok(await until(() => reqs("M914C").length >= 1 && texts("914").filter((t) => t === "📥 Принял фото, решаю. Режим: обычный.").length === 2, 30_000) && !reqs("M914C")[0].system[0].text.includes("Включён олимпиадный режим"), "после возврата фото снова решается в обычном режиме", JSON.stringify(texts("914").filter((t) => t.startsWith("📥"))));
+  ok(await until(() => answers("914").filter((t) => t.includes("Ответ")).length === 3, 30_000), "режим: третья работа решена");
+  // фото сразу после смены режима не присоединяется к работе, принятой в прежнем режиме: оно решается в новом, отдельной работой
+  await photo("914", "S_WAIT M914D");
+  ok(await until(() => reqs("M914D").length === 1), "смена режима посреди работы: первая работа решается");
+  await text("914", "олимпиадный режим");
+  ok(await until(() => texts("914").filter((t) => t.startsWith("Режим: олимпиадный ✅")).length === 2), "смена режима посреди работы: режим включён");
+  await photo("914", "M914E");
+  ok(await until(() => texts("914").includes("📥 Принял фото, решу сразу после текущего. Режим: олимпиадный."), 5000) && !texts("914").some((t) => t.startsWith("➕")), "фото после смены режима: отдельная работа, бот называет новый режим", JSON.stringify(texts("914").slice(-3)));
+  ok(await until(() => reqs("M914E").length >= 1 && answers("914").filter((t) => t.includes("Ответ")).length === 5, 40_000), "фото после смены режима: обе работы решены", JSON.stringify(texts("914").slice(-4)));
+  ok(!reqs("M914D")[0].system[0].text.includes("Включён олимпиадный режим") && reqs("M914E")[0].system[0].text.includes("Включён олимпиадный режим"), "каждая работа решена в том режиме, в котором принята");
+  await text("914", "режим подробный");
+  ok(await until(() => texts("914").some((t) => t.startsWith("Не понял режим. Запись решения: олимпиадный режим / обычный режим."))), "незнакомый режим: подсказка называет оба режима записи и не требует прав хозяина", JSON.stringify(texts("914").slice(-1)));
+  await text("914", "обычный режим");
+  ok(await until(() => texts("914").filter((t) => t.startsWith("Режим: обычный ✅")).length === 2), "режим возвращён");
   await text("912", "fast вкл");
   await text("912", "ping");
   ok(await until(() => texts("912").some((t) => t.startsWith("pong"))) && texts("912").at(-1).includes("думает: high, fast выкл") && !texts("912").at(-1).includes("Журнал"), "чужой чат: режим прежний, ссылки на журнал нет", texts("912").at(-1));
@@ -202,7 +236,7 @@ try {
   ok(imgs(serie.messages.at(-1)) === 2 && sc[0].text === "Фото 1 из 2:" && sc[2].text === "Фото 2 из 2:", "серия: в запросе оба разных фото с подписями, повтор отброшен", JSON.stringify(sc.map((x) => x.text ?? x.type)));
   ok(lastText(serie).includes("Реши задания с этих 2 фото") && lastText(serie).includes("вторая страница") && lastText(serie).includes("Сообщения владельца к этим фото: мой вариант 2"), "серия: подписи и уточнение дошли до модели", lastText(serie));
   await photo("920", "S_WAIT серия920 новая", "A4");
-  ok(await until(() => answers("920").length === 2, 30_000) && texts("920").filter((t) => t === "📥 Принял фото, решаю.").length === 2, "фото после готового ответа: уже новая работа", JSON.stringify(texts("920")));
+  ok(await until(() => answers("920").length === 2, 30_000) && texts("920").filter((t) => t === "📥 Принял фото, решаю. Режим: обычный.").length === 2, "фото после готового ответа: уже новая работа", JSON.stringify(texts("920")));
 
   // --- длинный ответ: оборван по лимиту токенов, продолжается сам, приходит одним сообщением ---
   await photo("222", "S_CUT");
@@ -420,14 +454,14 @@ try {
   await Promise.all([photo("992", "S_ALB альбом992", "AL1"), photo("992", "вторая из альбома", "AL2", `http://127.0.0.1:${MOCK}/photo2.jpg`)]);
   ok(await until(() => answers("992").length === 1, 30_000), "альбом: ответ пришёл", JSON.stringify(texts("992")));
   ok(reqs("альбом992").length === 1 && imgs(reqs("альбом992")[0].messages.at(-1)) === 2 && lastText(reqs("альбом992")[0]).includes("определи по содержанию"), "альбом из двух фото: один запрос к Claude с обоими фото", String(reqs("альбом992").length));
-  ok(texts("992").filter((t) => ACK.test(t)).join("|") === "📥 Принял фото, решаю.|➕ Всего 2 фото, решаю одним ответом.", "альбом: одно «принял» и одно сообщение о числе фото, без «добавил» на каждое", JSON.stringify(texts("992")));
+  ok(texts("992").filter((t) => ACK.test(t)).join("|") === "📥 Принял фото, решаю. Режим: обычный.|➕ Всего 2 фото, решаю одним ответом.", "альбом: одно «принял» и одно сообщение о числе фото, без «добавил» на каждое", JSON.stringify(texts("992")));
 
   // --- фото приходит, когда модель думает уже дольше минуты: решение не выбрасывается, фото становится следующей работой ---
   await photo("993", "S_SLOWB окно993", "W1");
   ok(await until(() => reqs("окно993").length === 1), "окно добавления: решение началось");
   await sleep(4000); // окно добавления в проверках три секунды (время ускорено)
   await photo("993", "S_WAIT позже993", "W2", `http://127.0.0.1:${MOCK}/photo2.jpg`);
-  ok(await until(() => texts("993").includes("📥 Принял фото, решу сразу после текущего."), 5000) && !texts("993").some((t) => t.startsWith("➕")), "фото через минуту после начала: следующая работа", JSON.stringify(texts("993")));
+  ok(await until(() => texts("993").includes("📥 Принял фото, решу сразу после текущего. Режим: обычный."), 5000) && !texts("993").some((t) => t.startsWith("➕")), "фото через минуту после начала: следующая работа", JSON.stringify(texts("993")));
   const got = () => texts("993").filter((t) => t.includes("Ответ: 42")).length; // «ещё решаю» ответом не считаем
   ok(await until(() => got() === 2, 40_000), "окно добавления: оба ответа пришли", JSON.stringify(texts("993")));
   const late = reqs("позже993").at(-1);
@@ -516,7 +550,7 @@ try {
   const docs = (m) => (Array.isArray(m.content) ? m.content.filter((x) => x.type === "document") : []);
   await pdf("970", "S_PDF");
   ok(await until(() => answers("970").some((t) => t.includes("Ответ: 5"))), "PDF: задание решено", JSON.stringify(texts("970")));
-  ok(texts("970")[0] === "📥 Принял файл, решаю.", "PDF: подтверждение говорит про файл", texts("970")[0]);
+  ok(texts("970")[0] === "📥 Принял файл, решаю. Режим: обычный.", "PDF: подтверждение говорит про файл", texts("970")[0]);
   const rp = reqs("S_PDF")[0];
   const doc = docs(rp.messages.at(-1))[0];
   ok(doc?.source?.media_type === "application/pdf" && Buffer.from(doc.source.data, "base64").toString().startsWith("%PDF-1.4") && lastText(rp).startsWith("Реши задания из файла PDF."), "PDF: в запросе документ и просьба решить файл", lastText(rp));
@@ -592,7 +626,7 @@ try {
 
   // --- файл без понятного типа (application/octet-stream, имя без .pdf): решает содержимое ---
   await hook("979", { typeMessage: "documentMessage", fileMessageData: { downloadUrl: `http://127.0.0.1:${MOCK}/task.pdf`, caption: "S_OCTET", mimeType: "application/octet-stream", fileName: "scan" } });
-  ok(await until(() => answers("979").some((t) => t.includes("Ответ: 5"))) && texts("979")[0] === "📥 Принял файл, решаю.", "файл без типа: принят и решён", JSON.stringify(texts("979")));
+  ok(await until(() => answers("979").some((t) => t.includes("Ответ: 5"))) && texts("979")[0] === "📥 Принял файл, решаю. Режим: обычный.", "файл без типа: принят и решён", JSON.stringify(texts("979")));
   ok(docs(reqs("S_OCTET")[0]?.messages.at(-1) ?? { content: [] }).length === 1, "файл без типа ушёл в Claude документом PDF");
 
   // --- в работе из нескольких файлов один больше 5 МБ: понятное сообщение про размер, а не «не открылось» ---
@@ -621,7 +655,7 @@ try {
   await photo("981", "S_CHKOK");
   ok(await until(() => solved("981").length === 1, 30_000), "проверка до отправки: ответ пришёл", JSON.stringify(texts("981")));
   await sleep(1500);
-  ok(texts("981").length === 3 && texts("981")[0] === "📥 Принял фото, решаю." && texts("981")[1] === CHECKING && texts("981")[2].startsWith("✅ Ответы\n№1: 4 см²\n№2: 5\n"), "порядок сообщений: принял, «решение готово, перепроверяю», один ответ; больше ничего", JSON.stringify(texts("981").map((t) => t.slice(0, 40))));
+  ok(texts("981").length === 3 && texts("981")[0] === "📥 Принял фото, решаю. Режим: обычный." && texts("981")[1] === CHECKING && texts("981")[2].startsWith("✅ Ответы\n№1: 4 см²\n№2: 5\n"), "порядок сообщений: принял, «решение готово, перепроверяю», один ответ; больше ничего", JSON.stringify(texts("981").map((t) => t.slice(0, 40))));
   const c1 = reqs("S_CHKOK").filter(isCheck);
   ok(c1.length === 1 && c1[0].model === "claude-opus-5-5" && imgs(c1[0].messages[0]) === 1 && lastText(c1[0]).includes("Решение, которое нужно проверить:") && lastText(c1[0]).includes("Ответ: 5") && !lastText(c1[0]).includes("ВИД:"), "вторая проверка: другой моделью, с фото и готовым решением", JSON.stringify(c1.map((b) => [b.model, lastText(b).slice(0, 80)])));
   ok(reqs("S_CHKOK").filter(isJudge).length === 0 && reqs("S_CHKOK").filter(isSolve).length === 1, "решение подтверждено: основная модель второй раз не спрошена");
@@ -654,7 +688,7 @@ try {
   await photo("985", "S_CHKSLOW пара985");
   ok(await until(() => reqs("пара985").filter(isCheck).length === 1, 30_000), "медленная проверка началась");
   await photo("985", "S_PAR", undefined, `http://127.0.0.1:${MOCK}/photo2.jpg`);
-  ok(await until(() => texts("985").includes("📥 Принял фото, решу сразу после текущего."), 5000) && !texts("985").some((t) => t.startsWith("➕")), "фото во время проверки: следующая работа, а не добавка к готовой", JSON.stringify(texts("985")));
+  ok(await until(() => texts("985").includes("📥 Принял фото, решу сразу после текущего. Режим: обычный."), 5000) && !texts("985").some((t) => t.startsWith("➕")), "фото во время проверки: следующая работа, а не добавка к готовой", JSON.stringify(texts("985")));
   ok(await until(() => solved("985").length === 2, 40_000), "обе работы решены, каждая своим ответом", JSON.stringify(texts("985").map((t) => t.slice(0, 30))));
   ok(claude.filter((b) => isSolve(b) && lastText(b).includes("пара985")).length === 1 && solved("985")[0].includes("№2: 7") && noFix("985"), "первая работа решена один раз, её ошибка исправлена до отправки");
   // 6. «стоп» во время проверки: ответа нет, основная модель не спрошена
@@ -732,9 +766,9 @@ try {
   ok(await until(() => reqs("977a").filter(isCheck).length === 1, 30_000), "вторая проверка включена хозяином и идёт в чужом чате");
   await text("976", "S_SLOWB вопрос976");
   await photo("976", "S_CLOSEDQ");
-  ok(await until(() => texts("976").includes("📥 Принял фото, решу сразу после текущего.")), "чужое задание ждёт в очереди");
+  ok(await until(() => texts("976").includes("📥 Принял фото, решу сразу после текущего. Режим: обычный.")), "чужое задание ждёт в очереди");
   await photo("977", "S_CLSCHK 977b");
-  ok(await until(() => texts("977").includes("📥 Принял фото, решу сразу после текущего.")), "вторая работа чужого чата ждёт конца проверки первой", JSON.stringify(texts("977")));
+  ok(await until(() => texts("977").includes("📥 Принял фото, решу сразу после текущего. Режим: обычный.")), "вторая работа чужого чата ждёт конца проверки первой", JSON.stringify(texts("977")));
   await text("111", "доступ закрыть");
   ok(await until(() => texts("111").some((t) => t.startsWith("Доступ закрыт ✅"))), "доступ: закрыт командой (OWNER задана)");
   ok(await until(() => answers("976").some((t) => t.includes("Ответ: 42")), 30_000), "доступ закрыт: уже оплаченный ответ чужому чату доставлен", JSON.stringify(texts("976")));

@@ -11,7 +11,9 @@ import { esc } from "./util.ts";
 
 export const PAGE_W = 560; // ширина страницы в точках CSS
 export const PAGE_DPR = 3; // плотность снимка: 1680 пикселей в ширину, мелкие индексы читаются и при увеличении
-export const PAGE_H = 1000; // выше этого страницу делим: 9:16 занимает экран телефона целиком
+export const PAGE_H = 1000; // обычная высота листа: 9:16 занимает экран телефона целиком
+export const MAX_PAGES = 30; // больше страниц картинками не шлём: такой ответ уходит текстом целиком
+export const PAGE_TALL = 1800; // до этой высоты задание остаётся на одном листе: один скрин на одно задание; выше текст на телефоне уже мелкий
 
 // (после номера допускается короткая пометка в скобках: «№1 (2 балла)»; номер с буквой без знака №: «A1», «В2.»)
 const HEAD = /^\s*(([^·\n]{1,30}·\s*){0,2}(№|Задание|Задача)\s*\S*(\s*\([^()\n]{1,30}\))?[.:]?|Исправляю\b.*|Вариант\s+\S+.*|[A-ZА-ЯЁ]\d{1,2}[.)]?)\s*$/;
@@ -345,10 +347,12 @@ export function pageHtml(parts: string[], svgs: string[], fonts: string, css: st
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:"><style>${fonts}${css}${pageCss()}</style></head><body>${INK}<div id="flow" class="sheet">${body}</div></body></html>`;
 }
 
-// Выполняется внутри страницы в браузере: делит поток на листы не выше PAGE_H и возвращает их число.
+// Выполняется внутри страницы в браузере: кладёт каждое задание на свой лист (не выше PAGE_TALL) и возвращает их число.
 // Задание целиком переносится на новый лист, если помещается на нём; длинное задание делится между строками.
 export const PAGINATE = `(() => {
   const H = ${PAGE_H};
+  const TALL = ${PAGE_TALL};
+  const MANY = ${MAX_PAGES};
   const flow = document.getElementById("flow");
   // 0. Таблица шире листа: уменьшаем её шрифт, пока не поместится (иначе правый край обрежется). Слова и числа в ячейках
   // при этом не рвутся. Не помогло и самое мелкое читаемое письмо: тогда разрешаем перенос внутри слова.
@@ -619,6 +623,7 @@ export const PAGINATE = `(() => {
   // 6. Делим поток на листы
   const top = flow.getBoundingClientRect().top;
   const tasks = [...flow.querySelectorAll(".task")];
+  const solo = tasks.length <= MANY;
   const pages = [[]];
   let start = null;
   // строка, после которой сразу идёт её продолжение: заголовок, «Решение:», «3) Площадь через …:»
@@ -626,13 +631,24 @@ export const PAGINATE = `(() => {
   for (const task of tasks) {
     const r = task.getBoundingClientRect();
     const blocks = [...task.children];
-    const cur = pages[pages.length - 1];
-    if (start !== null && cur.length && r.bottom - top - start > H - 60 && r.height <= H - 90) { pages.push([]); start = null; }
+    // Одно задание = один лист: чужое задание на лист не попадает, а своё не уходит на второй, пока оно не выше TALL.
+    // Задание выше TALL делится на равные части, а не на полный лист и огрызок.
+    // Заданий больше, чем бот шлёт картинок: короткие снова делят лист между собой, иначе весь ответ ушёл бы текстом.
+    if (solo) {
+      if (pages[pages.length - 1].length) pages.push([]);
+      start = null;
+    } else if (start !== null && pages[pages.length - 1].length && r.bottom - top - start > H - 60 && r.height <= H - 90) {
+      pages.push([]);
+      start = null;
+    }
+    const count = Math.ceil(r.height / (TALL - 60));
+    // (запас сверх равной доли нужен на то, что блоки не делятся: иначе хвост ушёл бы на лишний лист)
+    const limit = !solo ? H - 60 : count <= 1 ? Infinity : Math.min(TALL - 60, Math.max(H - 60, r.height / count + 160));
     for (const b of blocks) {
       const br = b.getBoundingClientRect();
       const page = pages[pages.length - 1];
       if (start === null) start = br.top - top;
-      else if (br.bottom - top - start > H - 60 && page.length) {
+      else if (br.bottom - top - start > limit && page.length) {
         const moved = [];
         const last = () => page[page.length - 1];
         const take = () => moved.unshift(page.pop());
@@ -649,13 +665,12 @@ export const PAGINATE = `(() => {
       pages[pages.length - 1].push({ b, task, first: b === task.firstElementChild });
     }
   }
-  // Лист-огрызок (две-три строки и рамка ответа) не идёт отдельной картинкой, если помещается под предыдущим листом.
-  // Мерка та же, что у обычного листа (H - 60), с небольшим допуском: шапка продолжения, поля и номер листа добавляются сверх неё.
+  // Лист-огрызок того же задания (две-три строки и рамка ответа) не идёт отдельной картинкой, если помещается под предыдущим листом
   const edge = (p, last) => p[last ? p.length - 1 : 0].b.getBoundingClientRect();
   for (let i = pages.length - 1; i > 0; i--) {
     const cur = pages[i], prev = pages[i - 1];
-    if (!cur.length || !prev.length) continue;
-    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= H - 45) {
+    if (!cur.length || !prev.length || (solo && cur[0].task !== prev[prev.length - 1].task)) continue;
+    if (edge(cur, true).bottom - edge(cur, false).top < 260 && edge(cur, true).bottom - edge(prev, false).top <= (solo ? TALL : H) - 45) {
       prev.push(...cur);
       pages.splice(i, 1);
     }

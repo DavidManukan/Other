@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { after, test } from "node:test";
 import { readFileSync } from "node:fs";
-import { PAGE_H, PAGE_W, PAGINATE, katexCss, pageHtml, textFont } from "../src/page.ts";
+import { MAX_PAGES, PAGE_H, PAGE_TALL, PAGE_W, PAGINATE, katexCss, pageHtml, textFont } from "../src/page.ts";
 import { texLeak } from "../src/tex.ts";
 import { splitAnswer } from "../src/text.ts";
 
@@ -29,6 +29,7 @@ async function lay(parts: string[], svgs: string[] = []) {
     moved: [...document.querySelectorAll("text[data-moved]")].map((t) => (t.textContent ?? "").trim()),
     text: [...document.querySelectorAll(".sheet")].map((s) => (s as HTMLElement).innerText).join(" ").replace(/\s+/g, " ").trim(),
     lone: [...document.querySelectorAll(".sheet")].some((s) => s.querySelectorAll(".b").length === 1 && s.querySelector("h2.b") !== null),
+    perSheet: [...document.querySelectorAll(".sheet")].map((s) => s.querySelectorAll("section.task").length),
   }));
   await page.close();
   return { total: Number(total), before, ...out };
@@ -57,15 +58,15 @@ test("кривая без fill=\"none\" подложкой не считаетс
   assert.deepEqual(r.moved, ["y = x2"]);
 });
 
-test("длинный абзац и длинный листинг режутся на листы обычной высоты, текст при этом не теряется", { skip }, async () => {
+test("очень длинный абзац и длинный листинг режутся на листы не выше предела, текст при этом не теряется", { skip }, async () => {
   const essay = "Литература · №1\n" + Array.from({ length: 40 }, (_, i) => `Предложение номер ${i + 1} рассказывает о герое и его поступках подробно, с примерами из текста и выводом.`).join(" ") + "\nОтвет: герой меняется.";
   const e = await lay([essay]);
-  assert.ok(e.total >= 3 && Math.max(...e.heights) <= PAGE_H + 120, JSON.stringify(e.heights));
+  assert.ok(e.total >= 2 && Math.max(...e.heights) <= PAGE_TALL + 120, JSON.stringify(e.heights));
   for (let i = 1; i <= 40; i++) assert.ok(e.text.includes(`Предложение номер ${i} рассказывает`), `пропало предложение ${i}`);
   assert.equal(e.lone, false); // заголовок не остался на листе один
   const code = "Информатика · №2\n```\n" + Array.from({ length: 90 }, (_, i) => `x_${i} = ${i} * 2  # строка ${i}`).join("\n") + "\n```\nОтвет: 178";
   const c = await lay([code]);
-  assert.ok(c.total >= 3 && Math.max(...c.heights) <= PAGE_H + 120, JSON.stringify(c.heights));
+  assert.ok(c.total >= 2 && Math.max(...c.heights) <= PAGE_TALL + 120, JSON.stringify(c.heights));
   for (const i of [0, 1, 44, 45, 88, 89]) assert.ok(c.text.includes(`x_${i} = ${i} * 2`), `пропала строка ${i}`);
 });
 
@@ -94,14 +95,14 @@ test("рисунок с вырожденным преобразованием н
 test("абзац с чертой внутри скобок это обычный текст: он режется по листам, а не становится узкой колонкой", { skip }, async () => {
   const para = "Вероятность · №1\nУсловная вероятность P(A | B) показывает, как часто событие A наступает при условии B. " + Array.from({ length: 40 }, (_, i) => `Рассуждение ${i + 1}: в опыте ${i + 1} мы считаем исходы и делим одно число на другое.`).join(" ") + "\nОтвет: 0,5";
   const r = await lay([para]);
-  assert.ok(r.total >= 3 && Math.max(...r.heights) <= PAGE_H + 120, JSON.stringify(r.heights));
+  assert.ok(r.total >= 2 && Math.max(...r.heights) <= PAGE_TALL + 120, JSON.stringify(r.heights));
   for (let i = 1; i <= 40; i++) assert.ok(r.text.includes(`Рассуждение ${i}: в опыте`), `пропало рассуждение ${i}`);
 });
 
 test("листинг с одной очень длинной строкой тоже режется по листам", { skip }, async () => {
   const data = Array.from({ length: 700 }, (_, i) => i * 7 % 1000).join(", ");
   const r = await lay(["Информатика · №5\nПрограмма:\n```\ndata = [" + data + "]\nprint(sum(data))\n```\nОтвет: 1"]);
-  assert.ok(r.total >= 2 && Math.max(...r.heights) <= PAGE_H + 120, JSON.stringify(r.heights));
+  assert.ok(r.total >= 2 && Math.max(...r.heights) <= PAGE_TALL + 120, JSON.stringify(r.heights));
   // шапки продолжения и номера листов в сравнение не идут
   const body = r.text.replace(/Информатика · №5 \(продолжение\)/g, "").replace(/\d+ \/ \d+/g, "");
   assert.ok(body.replace(/\s+/g, "").includes(data.replace(/\s+/g, "")), "числа из листинга потерялись");
@@ -152,7 +153,7 @@ test("таблица выше листа режется по строкам, ш�
     widths: [...document.querySelectorAll(".tbl")].map((t) => Math.round((t as HTMLTableElement).rows[0].cells[1].getBoundingClientRect().width)),
   }));
   await page.close();
-  assert.ok(total >= 3 && Math.max(...out.heights) <= PAGE_H + 120, JSON.stringify(out.heights));
+  assert.ok(total >= 2 && Math.max(...out.heights) <= PAGE_TALL + 120, JSON.stringify(out.heights));
   assert.ok(out.tables >= 3 && out.heads.every((h) => h === "n"), JSON.stringify(out.heads));
   for (let i = 1; i <= 70; i++) assert.ok(out.text.includes(`строка ${i}`), `пропала строка ${i}`);
   assert.ok(Math.max(...out.widths) - Math.min(...out.widths) <= 2, JSON.stringify(out.widths)); // столбцы на всех частях одной ширины
@@ -208,10 +209,27 @@ test("единица, приклеенная к широкой формуле, �
   assert.ok(r.loose > 0 && r.glued > 0, JSON.stringify(r)); // длинным хвост отпущен, у коротких остался приклеен
 });
 
-test("лист-огрызок присоединяется к предыдущему, только если общий лист не выше обычного предела", { skip }, async () => {
-  for (const n of [38, 41, 43, 45, 47, 50]) {
-    const r = await lay(["№1\n" + Array.from({ length: n }, (_, i) => `$x_{${i + 1}} = \\dfrac{${i + 3}}{${i + 7}}$`).join("\n") + "\nОтвет: $x = \\dfrac{1}{2}$"]);
-    assert.ok(Math.max(...r.heights) <= PAGE_H + 120, `${n}: ${JSON.stringify(r.heights)}`);
+test("одно задание на одном листе, пока оно не выше предела; длиннее делится на близкие по высоте части", { skip }, async () => {
+  const { css, fonts } = real();
+  const one = async (n: number) => {
+    const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+    await page.setContent(pageHtml(["№1\n" + Array.from({ length: n }, (_, i) => `$x_{${i + 1}} = \\dfrac{${i + 3}}{${i + 7}}$`).join("\n") + "\nОтвет: $x = \\dfrac{1}{2}$"], [], fonts, css));
+    await page.evaluate(() => document.fonts.ready);
+    await page.evaluate(PAGINATE);
+    const r = await page.evaluate(() => ({ heights: [...document.querySelectorAll(".sheet")].map((x) => Math.round(x.getBoundingClientRect().height)), conts: document.querySelectorAll(".cont").length }));
+    await page.close();
+    return r;
+  };
+  // выше обычного листа, но ниже предела: один скрин, без «(продолжение)»
+  for (const n of [10, 16, 20]) {
+    const r = await one(n);
+    assert.ok(r.heights.length === 1 && r.conts === 0 && r.heights[0] <= PAGE_TALL + 60, `${n}: ${JSON.stringify(r)}`);
+  }
+  assert.ok((await one(20)).heights[0] > PAGE_H, "задание выше обычного листа остаётся целым");
+  // выше предела: листов несколько, ни один не выше предела, последний не огрызок
+  for (const n of [30, 38, 45, 50, 70]) {
+    const r = await one(n);
+    assert.ok(r.heights.length >= 2 && Math.max(...r.heights) <= PAGE_TALL + 120 && Math.min(...r.heights) >= 500, `${n}: ${JSON.stringify(r)}`);
   }
 });
 
@@ -244,29 +262,29 @@ test("знак препинания после широкой формулы н�
   assert.equal(r.over, 0, JSON.stringify(r));
 });
 
-test("смешанные решения: после присоединения листа-огрызка ни один лист не выше предела", { skip }, async () => {
+test("несколько заданий: у каждого свой лист, чужое задание на лист не попадает", { skip }, async () => {
   const { css, fonts } = real();
   let seed = 7;
   const rnd = (n: number) => (seed = (seed * 1103515245 + 12345) % 2147483648) % n;
   const kinds = [
     (i: number) => `$x_{${i}} = \\dfrac{${i + 3}}{${i + 7}}$`,
-    (i: number) => `Подставим значение в формулу и получим $a_{${i}} = ${i} \\cdot 3 + 1$ для каждого шага решения.`,
+    (i: number) => `$a_{${i}} = ${i} \\cdot 3 + 1$`,
     (i: number) => `$${i}x^2 - ${i + 2}x = 0$ | возводим в квадрат, обе части неотрицательны`,
     (i: number) => `Так как левая часть неотрицательна при всех допустимых значениях переменной, правая часть тоже должна быть неотрицательной, поэтому отбираем только подходящие корни номер ${i}.`,
   ];
-  const tall: string[] = [];
-  for (let run = 0; run < 40; run++) {
-    const parts = Array.from({ length: 1 + rnd(3) }, (_, t) => `№${t + 1}\n` + Array.from({ length: 12 + rnd(26) }, (_, i) => kinds[rnd(4)](i + 1)).join("\n") + `\nОтвет: $x = \\dfrac{1}{2}$`);
+  for (let run = 0; run < 30; run++) {
+    const sizes = Array.from({ length: 1 + rnd(4) }, () => 2 + rnd(14));
+    const parts = sizes.map((n, t) => `№${t + 1}\n` + Array.from({ length: n }, (_, i) => kinds[rnd(4)](i + 1)).join("\n") + `\nОтвет: $x = \\dfrac{1}{2}$`);
     const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
     await page.setContent(pageHtml(parts, [], fonts, css));
     await page.evaluate(() => document.fonts.ready);
     await page.evaluate(PAGINATE);
-    const heights = await page.evaluate(() => [...document.querySelectorAll(".sheet")].map((x) => Math.round(x.getBoundingClientRect().height)));
+    const r = await page.evaluate(() => [...document.querySelectorAll(".sheet")].map((x) => ({ h: Math.round(x.getBoundingClientRect().height), tasks: x.querySelectorAll("section.task").length, head: x.querySelector("h2")?.textContent ?? "", cont: !!x.querySelector(".cont") })));
     await page.close();
-    // обычный лист с шапкой и номером не выше PAGE_H + 65; слитый не должен быть заметно выше него
-    if (Math.max(...heights) > PAGE_H + 90) tall.push(JSON.stringify(heights));
+    // задания короткие (до 15 строк): листов ровно столько, сколько заданий, по порядку, без продолжений
+    assert.deepEqual(r.map((x) => x.head), sizes.map((_, t) => `№${t + 1}`), JSON.stringify(r));
+    assert.ok(r.every((x) => x.tasks === 1 && !x.cont && x.h <= PAGE_TALL + 60), JSON.stringify(r));
   }
-  assert.deepEqual(tall, []);
 });
 
 test("длинная формула в ячейке таблицы переносится: таблица не выходит за край листа", { skip }, async () => {
@@ -302,4 +320,25 @@ test("число не отрывается от единицы: длинная �
   assert.equal(r.text, "м/с²");
   assert.ok(r.sameLine && r.after && r.inside && !r.loose, JSON.stringify(r));
   assert.ok(r.lines >= 2, JSON.stringify(r)); // формула перенесена, а не ужата в одну строку
+});
+
+test("заданий больше, чем бот шлёт картинок: короткие снова делят листы, ответ остаётся страницами", { skip }, async () => {
+  const { css, fonts } = real();
+  const run = async (n: number) => {
+    const parts = Array.from({ length: n }, (_, k) => `№${k + 1}\n$${k + 1}x + 3 = ${k + 4}$\n$x = 1$\nОтвет: $x = 1$`);
+    const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+    await page.setContent(pageHtml(parts, [], fonts, css));
+    await page.evaluate(() => document.fonts.ready);
+    const total = Number(await page.evaluate(PAGINATE));
+    const r = await page.evaluate(() => ({ heights: [...document.querySelectorAll(".sheet")].map((x) => Math.round(x.getBoundingClientRect().height)), heads: document.querySelectorAll("h2").length }));
+    await page.close();
+    return { total, ...r };
+  };
+  // до предела: у каждого задания свой лист
+  for (const n of [12, MAX_PAGES]) assert.equal((await run(n)).total, n);
+  // выше предела: листов меньше, чем заданий, и не больше предела; все задания на месте, лист обычной высоты
+  for (const n of [MAX_PAGES + 1, 40]) {
+    const r = await run(n);
+    assert.ok(r.total < n && r.total <= MAX_PAGES && r.heads === n && Math.max(...r.heights) <= PAGE_H + 120, `${n}: ${JSON.stringify(r)}`);
+  }
 });

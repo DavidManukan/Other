@@ -244,3 +244,28 @@ test("инструкция после разбора критиков: новы�
   for (const must of ["сомнение:", "читаются двояко", "сделайте рисунок", "обоснуйте", "ВЕРДИКТ: ВЕРНО", "ВЕРДИКТ: ОШИБКА"]) assert.ok(CHECK_PROMPT.includes(must), must);
   assert.ok(judgeText("x").includes("ДОПОЛНЕНО") && judgeText("x").includes("ВСЁ ВЕРНО"));
 });
+
+test("два режима записи: обычный требует только формулы, олимпиадный подробную запись; общая часть одна", async () => {
+  const { PROMPT_OLYMP, promptFor, checkPromptFor, CHECK_PROMPT_OLYMP } = await import("../src/prompt.ts");
+  assert.equal(promptFor(), PROMPT);
+  assert.equal(promptFor("plain"), PROMPT);
+  assert.equal(promptFor("olymp"), PROMPT_OLYMP);
+  // обычный: без названий законов, допущений, пояснений букв и проверки единиц
+  for (const must of ["слов в нём почти нет", "Названий законов, допущений и проверки единиц нет", "В «Дано» только величины, без пояснений в скобках", "олимпиадный режим, сейчас он выключен"]) assert.ok(PROMPT.includes(must), must);
+  for (const no of ["Включён олимпиадный режим", "Проверка единиц:", "Расчетная формула:", "Автомобиль считаем материальной точкой"]) assert.ok(!PROMPT.includes(no), no);
+  // олимпиадный: законы словами, обоснование, проверка единиц
+  for (const must of ["Включён олимпиадный режим", "закон назван словами перед исходной формулой", "После «Решение:» идёт «Обоснование:»", "Проверка единиц:", "Каждую новую букву поясняй"]) assert.ok(PROMPT_OLYMP.includes(must), must);
+  assert.ok(!PROMPT_OLYMP.includes("слов в нём почти нет") && !PROMPT_OLYMP.includes("сейчас он выключен"));
+  // у обеих версий одно начало и один предел длины; незаполненных мест нет
+  assert.equal(PROMPT.slice(0, 3000), PROMPT_OLYMP.slice(0, 3000));
+  for (const t of [PROMPT, PROMPT_OLYMP]) assert.ok(t.length < 60_000 && !/\$\{P\.|%РЕЖИМ%|undefined/.test(t), String(t.length));
+  // проверяющий знает режим: в обычном краткость не ошибка, в олимпиадном неполное обоснование ошибка
+  assert.ok(checkPromptFor().includes("Краткость тоже не ошибка") && !checkPromptFor().includes("решение обязано быть полным"));
+  assert.ok(checkPromptFor("olymp") === CHECK_PROMPT_OLYMP && CHECK_PROMPT_OLYMP.includes("решение обязано быть полным") && !CHECK_PROMPT_OLYMP.includes("Краткость тоже не ошибка"));
+  assert.ok(!/%РЕЖИМ%/.test(CHECK_PROMPT + CHECK_PROMPT_OLYMP));
+  // в олимпиадном режиме полнота главнее общих послаблений проверяющего; в обычном этой оговорки нет
+  assert.ok(CHECK_PROMPT_OLYMP.includes("главнее правил о недочётах оформления") && !CHECK_PROMPT.includes("главнее правил о недочётах"));
+  // метка формулы в лабораторной нужна только в олимпиадном режиме; обычный важнее и правил олимпиадной задачи
+  assert.ok(!PROMPT.includes("Формулу метода назови меткой") && !PROMPT.includes("формулу метода назови меткой") && PROMPT_OLYMP.includes("формулу метода назови меткой"));
+  assert.ok(PROMPT.includes("и к олимпиадной задаче"));
+});
