@@ -284,3 +284,22 @@ test("длинная формула в ячейке таблицы перено�
   assert.ok(r.right <= r.edge - 10, JSON.stringify(r));
   assert.ok(r.text.includes("29+30"), JSON.stringify(r));
 });
+
+test("число не отрывается от единицы: длинная формула переносится перед знаком отношения, единица остаётся при числе", { skip }, async () => {
+  const { css, fonts } = real();
+  const page = await (await open()).newPage({ viewport: { width: PAGE_W, height: 800 } });
+  await page.setContent(pageHtml(["№3\n$a = \\dfrac{10 \\cdot 0{,}866 - 0{,}2 \\cdot (20 - 5)}{2} = \\dfrac{8{,}66 - 3}{2} \\approx 2{,}8$ м/с²\nОтвет: $a \\approx 2{,}8$ м/с²."], [], fonts, css));
+  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(PAGINATE);
+  const r = await page.evaluate(() => {
+    const g = document.querySelector(".b:not(.ans) .glue") as HTMLElement;
+    const unit = (g.querySelector(".nb") as HTMLElement).getBoundingClientRect();
+    const pieces = [...g.querySelectorAll(".fx")].map((x) => x.getBoundingClientRect());
+    const last = pieces[pieces.length - 1], box = (g.closest(".b") as HTMLElement).getBoundingClientRect();
+    return { text: g.querySelector(".nb")!.textContent, sameLine: unit.top < last.bottom && unit.bottom > last.top, after: unit.left >= last.right - 1, inside: unit.right <= box.right + 1, lines: new Set(pieces.map((x) => Math.round(x.top / 20))).size, loose: g.classList.contains("loose") };
+  });
+  await page.close();
+  assert.equal(r.text, "м/с²");
+  assert.ok(r.sameLine && r.after && r.inside && !r.loose, JSON.stringify(r));
+  assert.ok(r.lines >= 2, JSON.stringify(r)); // формула перенесена, а не ужата в одну строку
+});

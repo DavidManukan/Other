@@ -374,6 +374,12 @@ export const PAGINATE = `(() => {
   // Формула с приклеенным хвостом («кДж.») шире строки: хвост отпускаем на следующую строку, иначе край листа его обрежет
   // Хвост из одного знака препинания один на строку не уходит: он остаётся при формуле, а место под него учитывается при её ужатии.
   for (const g of flow.querySelectorAll(".glue")) if (g.getBoundingClientRect().width > room(g) + 1) {
+    // Формула из нескольких кусков переносится сама, перед знаком отношения: тогда «≈ 2,8 м/с²» остаётся вместе на новой строке
+    const f = g.querySelector(".f");
+    if (f && f.querySelector("wbr") && !f.classList.contains("brk")) {
+      f.classList.add("brk");
+      if ([...g.getClientRects()].every((r) => r.width <= room(g) + 1)) continue;
+    }
     const tail = [...g.childNodes].filter((t) => t.nodeType === 3);
     if (/^[\\s\u00a0]*[.,;:!?)»]+$/.test(tail.map((t) => t.data).join(""))) {
       const r = document.createRange();
