@@ -16,7 +16,7 @@ import { DurableObject } from "cloudflare:workers";
 import type Anthropic from "@anthropic-ai/sdk";
 import { type Cfg, type Effort, type Env, chatStub, config, hider, isEffort, logKey, lower } from "./config.ts";
 import { type Answer, type Spent, ask, Busy, Fatal, inputTokens, judgeReply, Stopped, tasks, Timeout } from "./claude.ts";
-import { CHECK_PROMPT, judgeText } from "./prompt.ts";
+import { checkPromptFor, judgeText, promptFor, type Style } from "./prompt.ts";
 import { CAPTION_MAX, Green, GreenError, permanent, TooBig } from "./green.ts";
 import { renderPng } from "./render.ts";
 import { type SelfTest, SAMPLE_PARTS, SAMPLE_SVG, status } from "./status.ts";
@@ -67,6 +67,9 @@ export const STATUS = "__status"; // имя служебного объекта:
 
 const NUDGE = new Set(["videoMessage", "audioMessage", "documentMessage", "stickerMessage", "locationMessage", "contactMessage"]);
 const EFFORT_WORDS: Record<string, Effort> = { быстро: "low", средне: "medium", умно: "high", макс: "xhigh" };
+const STYLE_NAME: Record<Style, string> = { plain: "обычный", olymp: "олимпиадный" };
+// «олимпиадный режим», «режим олимпиада», «дефолтный режим», «обычный»: слово узнаём по началу, опечатки в окончании не мешают
+const STYLE_WORD = /^(?:режим\s+)?(олимп[а-яё]*|дефолт[а-яё]*|обычн[а-яё]*|стандартн[а-яё]*|default)(?:\s+режим)?$/;
 
 type Block = { type: "text"; text: string } | { type: "photo"; id: string };
 interface Turn {
@@ -81,6 +84,7 @@ interface Opts {
   effort?: Effort;
   fast?: boolean;
   look?: "auto" | "pages" | "text"; // вид ответа: по содержанию, всегда страницами или всегда текстом
+  style?: Style; // режим записи решения: обычный (только формулы) или олимпиадный (подробно); держится, пока чат не сменит
   pages?: boolean; // прежняя запись настройки: false значило «текстом»
 }
 // Расход за сутки (UTC). Лежит в служебном объекте.
@@ -137,6 +141,7 @@ interface Outcome {
 interface Job {
   id: string;
   at: number;
+  style?: Style; // режим записи, с которым работа принята: её проверка и разбор замечаний идут с ним же
   kind: "image" | "text";
   text?: string;
   fwd?: boolean; // текст переслан из другого чата
@@ -376,7 +381,8 @@ export class Chat extends DurableObject<Env> {
     }
     const busy = await this.enqueue({ kind: "image", id: shot.id, shots: [shot] }, mark, FIRST_WAIT);
     const what = shot.pdf ? "файл" : "фото";
-    await this.say(chatId, busy ? `📥 Принял ${what}, решу сразу после текущего.` : `📥 Принял ${what}, решаю.`);
+    const mode = STYLE_NAME[(await this.options()).style];
+    await this.say(chatId, busy ? `📥 Принял ${what}, решу сразу после текущего. Режим: ${mode}.` : `📥 Принял ${what}, решаю. Режим: ${mode}.`);
   }
 
   private async textIn(chatId: string, id: string, text: string, fwd: boolean, mark: Record<string, unknown>) {
@@ -401,11 +407,11 @@ export class Chat extends DurableObject<Env> {
     await this.db.put({ seen: id ? [...seen.filter((x) => x !== id), id].slice(-200) : seen, meta });
   }
 
-  private async options(): Promise<{ effort: Effort; fast: boolean; look: "auto" | "pages" | "text"; check: boolean }> {
+  private async options(): Promise<{ effort: Effort; fast: boolean; look: "auto" | "pages" | "text"; check: boolean; style: Style }> {
     const o = (await this.db.get<Opts>("opts")) ?? {};
     // Вид ответа выбирается по содержанию, пока чат не попросил другое. PAGES=0 делает видом по умолчанию текст.
     const look = o.look ?? (o.pages === false || !this.c.pages ? "text" : "auto");
-    return { effort: o.effort ?? this.c.effort, fast: o.fast ?? this.c.fast, look, check: (await this.gate()).check };
+    return { effort: o.effort ?? this.c.effort, fast: o.fast ?? this.c.fast, look, check: (await this.gate()).check, style: o.style === "olymp" ? "olymp" : "plain" };
   }
 
   // Общие настройки (доступ, дневной лимит, сегодняшний расход) лежат в служебном объекте; чат помнит их полминуты
@@ -476,10 +482,10 @@ export class Chat extends DurableObject<Env> {
       const mine = await this.isOwner(chatId);
       await this.green.send(
         chatId,
-        `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}, пересчёт кодом ${this.c.code ? "вкл" : "выкл"}, вторая проверка ${o.check ? "вкл" : "выкл"}, решение: ${o.look === "auto" ? "авто (математика и физика картинкой, остальное текстом)" : o.look === "pages" ? "картинкой" : "текстом"}${queue ? `, в работе: ${queue}` : ""}\n` +
+        `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}, пересчёт кодом ${this.c.code ? "вкл" : "выкл"}, вторая проверка ${o.check ? "вкл" : "выкл"}, решение: ${o.look === "auto" ? "авто (математика и физика картинкой, остальное текстом)" : o.look === "pages" ? "картинкой" : "текстом"}, режим: ${STYLE_NAME[o.style]}${queue ? `, в работе: ${queue}` : ""}\n` +
           (mine
-            ? `Команды: решай, стоп, сброс, авто / картинкой / текстом, быстро / средне / умно / макс, fast вкл / fast выкл, проверка вкл / выкл, расход, лимит 3 / лимит выкл, доступ полный / открыть / закрыть\nЖурнал: ${origin}/?k=${await logKey(this.c)}`
-            : "Команды: решай, стоп, сброс, авто / картинкой / текстом") +
+            ? `Команды: решай, стоп, сброс, авто / картинкой / текстом, олимпиадный режим / обычный режим, быстро / средне / умно / макс, fast вкл / fast выкл, проверка вкл / выкл, расход, лимит 3 / лимит выкл, доступ полный / открыть / закрыть\nЖурнал: ${origin}/?k=${await logKey(this.c)}`
+            : "Команды: решай, стоп, сброс, авто / картинкой / текстом, олимпиадный режим / обычный режим") +
           // хозяин по первому сообщению это временно: постоянным его делает переменная
           (mine && !this.c.owners.length && !(await this.gate()).anyone ? `\nСовет: добавь в Cloudflare переменную OWNER со значением ${chatId}, тогда хозяином не сможет стать никто другой.` : ""),
       );
@@ -511,6 +517,16 @@ export class Chat extends DurableObject<Env> {
         await this.db.setAlarm(Date.now());
       }
       await this.green.send(chatId, "Решаю ✅");
+      return true;
+    }
+    // режим записи решения: держится, пока чат не переключит обратно; доступен любому чату
+    const st = t.match(STYLE_WORD);
+    if (st) {
+      const style: Style = st[1].startsWith("олимп") ? "olymp" : "plain";
+      await this.db.put<Opts>("opts", { ...((await this.db.get<Opts>("opts")) ?? {}), style: style === "olymp" ? style : undefined });
+      await this.green.send(chatId, style === "olymp"
+        ? "Режим: олимпиадный ✅ Расписываю подробно: законы, обоснования, проверка единиц. Вернуть короткую запись: обычный режим."
+        : "Режим: обычный ✅ Только решение, без лишних слов. Подробная запись: олимпиадный режим.");
       return true;
     }
     // вид ответа: расходов не меняет, поэтому доступен любому чату
@@ -610,8 +626,8 @@ export class Chat extends DurableObject<Env> {
     const queue = (await this.db.list({ prefix: "job:", limit: MAX_QUEUE })).size;
     if (queue >= MAX_QUEUE) throw new Error("Слишком много заданий в очереди. Подожди ответов или напиши «стоп».");
     const seq = ((await this.db.get<number>("seq")) ?? 0) + 1;
-    const { effort } = await this.options();
-    const job: Job = { ...j, at: Date.now(), notes: [], quotes: [], fetches: 0, phase: "solve", step: 0, tries: 0, effort, acc: "", sent: 0, outbox: [], shot: 0, pages: 0, down: 0, svgs: [], drawn: 0, msgs: 0, tokens: 0, checks: 0 };
+    const { effort, style } = await this.options();
+    const job: Job = { ...j, ...(style === "olymp" ? { style } : {}), at: Date.now(), notes: [], quotes: [], fetches: 0, phase: "solve", step: 0, tries: 0, effort, acc: "", sent: 0, outbox: [], shot: 0, pages: 0, down: 0, svgs: [], drawn: 0, msgs: 0, tokens: 0, checks: 0 };
     // (нижняя граница нужна только в локальных проверках, где время ускорено: в работе ожидание и так дольше)
     if (wait > 0) job.after = Date.now() + Math.max(wait / this.k, 300);
     await this.db.put({ ...mark, seq, [`job:${String(seq).padStart(9, "0")}`]: job });
@@ -819,7 +835,7 @@ export class Chat extends DurableObject<Env> {
         const bills: Spent[] = [];
         const t0 = Date.now();
         try {
-          a = await ask(this.c, { messages, effort: job.effort, fast, until: end - SEGMENT_TAIL / this.k, stop, spent: (s) => bills.push(s) });
+          a = await ask(this.c, { messages, effort: job.effort, fast, until: end - SEGMENT_TAIL / this.k, stop, system: promptFor(job.style), spent: (s) => bills.push(s) });
         } finally {
           lap(job, "solve", t0);
           clearTimeout(hello);
@@ -1319,7 +1335,7 @@ export class Chat extends DurableObject<Env> {
         if (chk.phase === "check") {
           const a = await ask(this.c, {
             messages: [...before, { role: "user", content: [...question, { type: "text", text: `Решение, которое нужно проверить:\n\n${body}` }] }],
-            effort: job.effort, fast, until, stop, system: CHECK_PROMPT, model: this.c.checkModel, spent,
+            effort: job.effort, fast, until, stop, system: checkPromptFor(job.style), model: this.c.checkModel, spent,
           });
           // вердикт ищем во всём ходе: проверяющий пересчитывает кодом, и итоговая строка стоит после заметок со своими «Ответ:»
           const all = a.all ?? a.text;
@@ -1342,7 +1358,7 @@ export class Chat extends DurableObject<Env> {
         }
         const a = await ask(this.c, {
           messages: [...before, { role: "user", content: question }, { role: "assistant", content: lookLine(job.look) + body }, { role: "user", content: judgeText(chk.issues ?? "") }],
-          effort: job.effort, fast, until, stop, spent,
+          effort: job.effort, fast, until, stop, system: promptFor(job.style), spent,
         });
         job.checks += a.checks;
         const r = judgeReply(a, body);
