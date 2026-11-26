@@ -94,6 +94,7 @@ interface Day {
 // Общие настройки бота из служебного объекта
 interface Gate {
   closed: boolean; // доступ закрыт: бот отвечает только хозяину
+  anyone: boolean; // доступ полный: настройки меняет любой номер, хозяин не выделен
   cap: number | null; // дневной лимит расходов, доллары
   today: number; // потрачено сегодня
   owner: string | null;
@@ -241,7 +242,6 @@ export class Chat extends DurableObject<Env> {
   private posting: string | null = null; // ответ этого задания уже уходит в чат: добавить к нему фото нельзя
   private page = new Map<boolean, { at: number; html: string }>();
   private epoch = 0; // растёт на «сброс»: решение, начатое до сброса, память уже не трогает
-  private owner: boolean | undefined; // этот чат принадлежит хозяину бота
   private k: number; // масштаб времени: 1 в работе, больше только в локальных тестах
   private gateAt = 0;
   private gateVal: Gate;
@@ -252,7 +252,7 @@ export class Chat extends DurableObject<Env> {
     this.green = new Green(this.c);
     this.hide = hider(this.c);
     this.k = Math.max(1, Number(env.TIME_SCALE) || 1);
-    this.gateVal = { closed: false, cap: null, today: 0, owner: null, check: this.c.check };
+    this.gateVal = { closed: false, anyone: false, cap: null, today: 0, owner: null, check: this.c.check };
   }
 
   private get db() {
@@ -423,8 +423,12 @@ export class Chat extends DurableObject<Env> {
 
   // Чат хозяина? В отличие от isOwner, никого хозяином не назначает
   private mine(chatId: string, g: Gate): boolean {
-    const same = (o: string) => o === chatId || o.replace(/\D/g, "") === chatId.replace(/\D/g, "");
-    return this.c.owners.length ? this.c.owners.some(same) : g.owner === chatId;
+    return g.anyone || (this.c.owners.length ? this.listed(chatId) : g.owner === chatId);
+  }
+
+  // Чат назван в переменной OWNER (номер или id чата)
+  private listed(chatId: string): boolean {
+    return this.c.owners.some((o) => o === chatId || o.replace(/\D/g, "") === chatId.replace(/\D/g, ""));
   }
 
   // Записывает расход: в работу (для журнала) и в общий счёт за сутки
@@ -444,10 +448,17 @@ export class Chat extends DurableObject<Env> {
     }
   }
 
-  // Режим (а значит и расходы) меняет только хозяин: чаты из OWNER, а без неё первый чат, который написал боту «ping» или сменил режим
+  // Кто меняет режим и видит расходы. При полном доступе любой номер: бот личный, о нём знает только хозяин.
+  // Если доступ сузили («доступ открыть», «доступ закрыть»), то только хозяин: чаты из OWNER, а без неё первый чат,
+  // который написал боту «ping» или сменил режим. Настройки читаем заново: их могли поменять из другого чата.
   private async isOwner(chatId: string): Promise<boolean> {
-    if (this.c.owners.length) return this.c.owners.some((o) => o === chatId || o.replace(/\D/g, "") === chatId.replace(/\D/g, ""));
-    return (this.owner ??= await chatStub(this.env, STATUS).claim(chatId));
+    const g = await this.gate(true);
+    if (g.anyone) return true;
+    if (this.c.owners.length) return this.listed(chatId);
+    if (g.owner) return g.owner === chatId;
+    const got = await chatStub(this.env, STATUS).claim(chatId);
+    this.gateAt = 0;
+    return got;
   }
 
   async claim(chatId: string): Promise<boolean> {
@@ -467,10 +478,10 @@ export class Chat extends DurableObject<Env> {
         chatId,
         `pong ✅ модель ${this.c.model}, думает: ${o.effort}, fast ${o.fast ? "вкл" : "выкл"}, пересчёт кодом ${this.c.code ? "вкл" : "выкл"}, вторая проверка ${o.check ? "вкл" : "выкл"}, решение: ${o.look === "auto" ? "авто (математика и физика картинкой, остальное текстом)" : o.look === "pages" ? "картинкой" : "текстом"}${queue ? `, в работе: ${queue}` : ""}\n` +
           (mine
-            ? `Команды: решай, стоп, сброс, авто / картинкой / текстом, быстро / средне / умно / макс, fast вкл / fast выкл, проверка вкл / выкл, расход, лимит 3 / лимит выкл, доступ закрыть / открыть\nЖурнал: ${origin}/?k=${await logKey(this.c)}`
+            ? `Команды: решай, стоп, сброс, авто / картинкой / текстом, быстро / средне / умно / макс, fast вкл / fast выкл, проверка вкл / выкл, расход, лимит 3 / лимит выкл, доступ полный / открыть / закрыть\nЖурнал: ${origin}/?k=${await logKey(this.c)}`
             : "Команды: решай, стоп, сброс, авто / картинкой / текстом") +
           // хозяин по первому сообщению это временно: постоянным его делает переменная
-          (mine && !this.c.owners.length ? `\nСовет: добавь в Cloudflare переменную OWNER со значением ${chatId}, тогда хозяином не сможет стать никто другой.` : ""),
+          (mine && !this.c.owners.length && !(await this.gate()).anyone ? `\nСовет: добавь в Cloudflare переменную OWNER со значением ${chatId}, тогда хозяином не сможет стать никто другой.` : ""),
       );
       return true;
     }
@@ -513,7 +524,7 @@ export class Chat extends DurableObject<Env> {
     // расходы, лимит, доступ и вторая проверка: всё это про деньги хозяина, поэтому только ему
     const spendWord = /^(расход|расходы|траты|стоимость)$/.test(t);
     const lim = t.match(/^лимит\s+(\S+)$/);
-    const acc = t.match(/^доступ\s+(закрыть|закрой|закрыт|открыть|открой|открыт)$/);
+    const acc = t.match(/^доступ\s+(закрыть|закрой|закрыт|открыть|открой|открыт|полный|всем|все)$/);
     const chk = t.match(/^(?:проверка|перепроверка)\s+(вкл|выкл|on|off)$/);
     if (spendWord || lim || acc || chk) {
       if (!(await this.isOwner(chatId))) {
@@ -533,15 +544,22 @@ export class Chat extends DurableObject<Env> {
         this.gateAt = 0;
         await this.green.send(chatId, cap === null ? "Дневной лимит снят ✅" : `Дневной лимит: ${money(cap)} ✅ Когда он исчерпан, бот ждёт следующих суток (сутки считаются по UTC).`);
       } else if (acc) {
-        const closed = acc[1].startsWith("закр");
+        const closed = acc[1].startsWith("закр"), anyone = !closed && !acc[1].startsWith("откр");
         // Без OWNER хозяином считается первый, кто написал команду: закрытый им бот запер бы настоящего хозяина
         if (closed && !this.c.owners.length) {
           await this.green.send(chatId, `Закрыть доступ можно, только когда задана переменная OWNER. Добавь в Cloudflare переменную OWNER со значением ${chatId}`);
           return true;
         }
-        await hub.setGate({ closed });
+        // При полном доступе команду мог написать любой номер: закрыть бота вправе только номер из OWNER, иначе он запер бы сам себя
+        if (closed && !this.listed(chatId)) {
+          await this.green.send(chatId, "Закрыть доступ может только номер из переменной OWNER.");
+          return true;
+        }
+        // Доступ сужают без OWNER: хозяином становится тот, кто написал команду, иначе настройки остались бы у старого номера
+        const owner = !anyone && !this.c.owners.length && (await this.gate(true)).anyone ? chatId : undefined;
+        await hub.setGate({ closed, anyone, ...(owner ? { owner } : {}) });
         this.gateAt = 0;
-        await this.green.send(chatId, closed ? "Доступ закрыт ✅ Бот отвечает только тебе." : "Доступ открыт ✅ Бот отвечает всем, кто ему напишет.");
+        await this.green.send(chatId, closed ? "Доступ закрыт ✅ Бот отвечает только тебе." : anyone ? "Доступ полный ✅ Бот отвечает любому номеру, настройки тоже меняет любой номер." : "Доступ открыт ✅ Бот отвечает всем, кто ему напишет. Настройки меняешь только ты.");
       } else if (chk) {
         const check = chk[1] === "вкл" || chk[1] === "on";
         await hub.setGate({ check });
@@ -1376,18 +1394,23 @@ export class Chat extends DurableObject<Env> {
 
   async gateInfo(): Promise<Gate> {
     const key = `spend:${day(Date.now())}`;
-    const got = await this.db.get<unknown>(["closed", "cap", "owner", "check", key]);
+    const got = await this.db.get<unknown>(["closed", "anyone", "cap", "owner", "check", key]);
     const cap = got.get("cap"), check = got.get("check");
-    return { closed: got.get("closed") === true, cap: typeof cap === "number" ? cap : null, today: (got.get(key) as Day | undefined)?.usd ?? 0, owner: (got.get("owner") as string | undefined) ?? null, check: typeof check === "boolean" ? check : this.c.check };
+    // Полный доступ действует, пока его явно не сузили командой: бот личный, и писать ему хозяин хочет с любого номера.
+    // Закрытый доступ, выбранный до появления этого режима, тоже уступает ему: закрыть заново можно командой.
+    const anyone = got.get("anyone") !== false;
+    return { closed: got.get("closed") === true && !anyone, anyone, cap: typeof cap === "number" ? cap : null, today: (got.get(key) as Day | undefined)?.usd ?? 0, owner: (got.get("owner") as string | undefined) ?? null, check: typeof check === "boolean" ? check : this.c.check };
   }
 
-  async setGate(p: { closed?: boolean; cap?: number | null; check?: boolean }): Promise<void> {
+  async setGate(p: { closed?: boolean; anyone?: boolean; owner?: string; cap?: number | null; check?: boolean }): Promise<void> {
     if (p.closed !== undefined) await this.db.put("closed", p.closed);
+    if (p.anyone !== undefined) await this.db.put("anyone", p.anyone);
+    if (p.owner !== undefined) await this.db.put("owner", p.owner);
     if (p.check !== undefined) await this.db.put("check", p.check);
     if (p.cap === null) await this.db.delete("cap");
     else if (typeof p.cap === "number") await this.db.put("cap", p.cap);
     await this.log(
-      p.closed !== undefined ? (p.closed ? "доступ закрыт: бот отвечает только хозяину" : "доступ открыт")
+      p.closed !== undefined ? (p.closed ? "доступ закрыт: бот отвечает только хозяину" : p.anyone ? "доступ полный: бот отвечает всем, настройки меняет любой номер" : "доступ открыт: бот отвечает всем, настройки меняет хозяин")
       : p.check !== undefined ? `вторая проверка ${p.check ? "включена" : "выключена"} для всех чатов`
       : p.cap === null ? "дневной лимит снят" : `дневной лимит: ${money(p.cap ?? 0)}`,
     );
@@ -1408,7 +1431,7 @@ export class Chat extends DurableObject<Env> {
       `за 30 дней: ${money(sum(30))}`,
       `Браузер для страниц сегодня: ${Math.round((today?.browser ?? 0) / 1000)} с из 600 бесплатных`,
       `Дневной лимит: ${g.cap === null ? "не задан" : money(g.cap)} (команды: лимит 3, лимит выкл)`,
-      `Доступ: ${g.closed ? "закрыт, бот отвечает только тебе" : "открыт"} (команды: доступ закрыть, доступ открыть)`,
+      `Доступ: ${g.anyone ? "полный, бот отвечает любому номеру, настройки меняет любой номер" : g.closed ? "закрыт, бот отвечает только тебе" : "открыт, бот отвечает всем, настройки меняешь только ты"} (команды: доступ полный, доступ открыть, доступ закрыть)`,
       `Вторая проверка: ${g.check ? `вкл, модель ${this.c.checkModel}` : "выкл"} (команды: проверка вкл, проверка выкл)`,
       today?.unpriced ? `(запросов посчитано примерно: ${today.unpriced}. Модель с неизвестной ценой считается по цене заказанной, оборванный поток по написанному)` : "",
     ].filter(Boolean).join("\n");
