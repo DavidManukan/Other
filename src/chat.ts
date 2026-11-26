@@ -559,7 +559,9 @@ export class Chat extends DurableObject<Env> {
         const owner = !anyone && !this.c.owners.length && (await this.gate(true)).anyone ? chatId : undefined;
         await hub.setGate({ closed, anyone, ...(owner ? { owner } : {}) });
         this.gateAt = 0;
-        await this.green.send(chatId, closed ? "Доступ закрыт ✅ Бот отвечает только тебе." : anyone ? "Доступ полный ✅ Бот отвечает любому номеру, настройки тоже меняет любой номер." : "Доступ открыт ✅ Бот отвечает всем, кто ему напишет. Настройки меняешь только ты.");
+        // доступ сузил номер не из OWNER: права уходят к номеру из OWNER, а не к нему
+        const who = this.c.owners.length && !this.listed(chatId) ? "Настройки теперь меняет только номер из переменной OWNER." : "Настройки меняешь только ты.";
+        await this.green.send(chatId, closed ? "Доступ закрыт ✅ Бот отвечает только тебе." : anyone ? "Доступ полный ✅ Бот отвечает любому номеру, настройки тоже меняет любой номер." : `Доступ открыт ✅ Бот отвечает всем, кто ему напишет. ${who}`);
       } else if (chk) {
         const check = chk[1] === "вкл" || chk[1] === "on";
         await hub.setGate({ check });
