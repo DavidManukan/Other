@@ -95,7 +95,9 @@ export function inline(text: string): string {
   // «4-го» не рвётся по дефису, а знак между словами («пуля + брусок») не начинает строку
   const words = (t: string) => esc(prettyMath(stripTex(t), sheet || undefined))
     .replace(/(?<![\p{L}\d])(\d+-[а-яё]{1,3})(?![а-яё])/giu, '<span class="nb">$1</span>')
-    .replace(/(?<=[\p{L}\d)]) ([+=]) (?=[\p{L}\d(])/gu, "\u00a0$1 ");
+    .replace(/(?<=[\p{L}\d)]) ([+=]) (?=[\p{L}\d(])/gu, "\u00a0$1 ")
+    // единица с косой чертой («м/с²», «км/ч», «Дж/(кг·°C)») не рвётся после черты
+    .replace(/(?<![\p{L}\d/])([\p{L}°]{1,4}\/[\p{L}°(][\p{L}°·()]{0,7}[²³]?)(?![\p{L}\d/])/gu, '<span class="nb">$1</span>');
   for (let k = 0; k < segs.length; k++) {
     const s = segs[k];
     if (!s.math) {
@@ -104,9 +106,10 @@ export function inline(text: string): string {
     }
     // Короткий хвост сразу за формулой (единица «см.», «Н,», знак препинания) не уходит на новую строку один
     const next = segs[k + 1];
-    const m = next && !next.math && !next.lit ? /^(\s?)([^\s$]{1,4})(?=\s|$)/.exec(next.body) : null;
+    const m = next && !next.math && !next.lit ? /^(\s?)([^\s$]{1,9})(?=\s|$)/.exec(next.body) : null;
     // (и окончание порядкового сразу за формулой: «$n$-й член»)
-    if (m && (/^[\p{L}]{0,3}[.,;:!?)»]*$/u.test(m[2]) || (!m[1] && /^-[а-яё]{1,3}[.,;:!?)»]*$/iu.test(m[2])))) {
+    // (и единица с косой чертой: «$a = 2{,}8$ м/с²»)
+    if (m && (/^[\p{L}]{0,3}[.,;:!?)»]*$/u.test(m[2]) || /^[\p{L}°]{1,3}\/[\p{L}°]{1,3}[²³]?[.,;:!?)»]*$/u.test(m[2]) || (!m[1] && /^-[а-яё]{1,3}[.,;:!?)»]*$/iu.test(m[2])))) {
       out.push(`<span class="glue">${tex(s.body)}${m[1] ? "\u00a0" : ""}${words(m[2])}</span>`);
       segs[k + 1] = { ...next, body: next.body.slice(m[0].length) };
     } else out.push(tex(s.body));
@@ -330,6 +333,7 @@ pre.go{border-bottom:0;border-radius:6px 6px 0 0;padding-bottom:0;margin-bottom:
 .f{white-space:nowrap}.f wbr{display:none}.f.brk{white-space:normal}.f.brk wbr{display:inline}.fx{white-space:nowrap}.fx.wide{white-space:normal}
 .f.brk .base{margin:4px 0}
 .katex{font-size:1.08em;-webkit-text-stroke:.35px #fff}.katex svg{stroke:#fff;stroke-width:14px}
+.katex .text{font-family:'DejaVu Sans',sans-serif;font-size:.926em;-webkit-text-stroke:0}
 .katex .frac-line,.katex .overline-line,.katex .underline-line{border-bottom-width:.06em}.katex-display{margin:0;text-align:left}.katex-display>.katex{text-align:left}
 .foot{font-size:14px;text-align:right;margin-top:6px}`;
 }
@@ -370,6 +374,12 @@ export const PAGINATE = `(() => {
   // Формула с приклеенным хвостом («кДж.») шире строки: хвост отпускаем на следующую строку, иначе край листа его обрежет
   // Хвост из одного знака препинания один на строку не уходит: он остаётся при формуле, а место под него учитывается при её ужатии.
   for (const g of flow.querySelectorAll(".glue")) if (g.getBoundingClientRect().width > room(g) + 1) {
+    // Формула из нескольких кусков переносится сама, перед знаком отношения: тогда «≈ 2,8 м/с²» остаётся вместе на новой строке
+    const f = g.querySelector(".f");
+    if (f && f.querySelector("wbr") && !f.classList.contains("brk")) {
+      f.classList.add("brk");
+      if ([...g.getClientRects()].every((r) => r.width <= room(g) + 1)) continue;
+    }
     const tail = [...g.childNodes].filter((t) => t.nodeType === 3);
     if (/^[\\s\u00a0]*[.,;:!?)»]+$/.test(tail.map((t) => t.data).join(""))) {
       const r = document.createRange();

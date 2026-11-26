@@ -658,3 +658,13 @@ test("отсылка «в решении»: знак вопроса остаёт
     assert.equal(kept(line), `Ответ: ${line}`, line);
   }
 });
+
+test("единица с косой чертой не рвётся и держится за формулу", () => {
+  const h = inline("$a \\approx 2{,}8$ м/с², тогда");
+  assert.ok(h.includes('class="glue"') && h.endsWith(' <span class="nb">м/с²</span>,</span> тогда'), h.slice(-80));
+  assert.ok(inline("скорость 72 км/ч и 20 м/с.").includes('72 <span class="nb">км/ч</span> и 20 <span class="nb">м/с</span>.'));
+  assert.ok(inline("$c = 4200$ Дж/(кг·°C)").endsWith('<span class="nb">Дж/(кг·°C)</span>'));
+  // дробь из чисел и путь с косой чертой единицей не считаются
+  assert.ok(!inline("ответ 3/4 или 1/2").includes('class="nb"'));
+  assert.ok(!inline("файл data/input/17.txt").includes('class="nb">data'));
+});
