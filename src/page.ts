@@ -330,6 +330,7 @@ pre.go{border-bottom:0;border-radius:6px 6px 0 0;padding-bottom:0;margin-bottom:
 .f{white-space:nowrap}.f wbr{display:none}.f.brk{white-space:normal}.f.brk wbr{display:inline}.fx{white-space:nowrap}.fx.wide{white-space:normal}
 .f.brk .base{margin:4px 0}
 .katex{font-size:1.08em;-webkit-text-stroke:.35px #fff}.katex svg{stroke:#fff;stroke-width:14px}
+.katex .text{font-family:'DejaVu Sans',sans-serif;font-size:.926em;-webkit-text-stroke:0}
 .katex .frac-line,.katex .overline-line,.katex .underline-line{border-bottom-width:.06em}.katex-display{margin:0;text-align:left}.katex-display>.katex{text-align:left}
 .foot{font-size:14px;text-align:right;margin-top:6px}`;
 }
