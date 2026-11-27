@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { taskHtml } from "../src/page.ts";
-import { CHECK_PROMPT, judgeText, PROMPT } from "../src/prompt.ts";
+import { CHECK_PROMPT, judgeText, PROMPT, PROMPT_OLYMP } from "../src/prompt.ts";
 import { texLeak } from "../src/tex.ts";
 import { brief, card, cells, compose, headOf, lookLine, lookOf, mergeFix, plainText, splitAnswer, tableAt, textTable } from "../src/text.ts";
 
@@ -40,7 +40,42 @@ test("краткое задание: заголовок и строка отве
   assert.equal(brief("Ответ: 5"), false); // без заголовка это не задание из теста
   assert.equal(brief("№1\nОтвет:"), false);
   assert.equal(brief(`№1\nОтвет: ${"очень длинный ответ ".repeat(10)}`), false); // список ответов такой обрезал бы
-  assert.equal(brief("№1\nРешено выше.\nОтвет: 5"), false);
+  // пометка «Решено выше.» блоком не становится: задание остаётся строкой списка
+  assert.equal(brief("№1\nРешено выше.\nОтвет: 5"), true);
+  assert.equal(brief("№3\nРешено выше."), true);
+  assert.equal(brief("№3"), false);
+  assert.equal(brief("№1\nРешено выше.\nx = 5\nОтвет: 5"), false);
+  // два прочтения с ответом под каждым: оба стоят в списке
+  assert.equal(brief("№6\nЕсли в условии 28:\nОтвет: 5 м\nЕсли в условии 23:\nОтвет: 4 м"), true);
+  assert.equal(brief("№6\nЕсли в условии 28:\n$v = 5$\nОтвет: 5 м\nЕсли в условии 23:\nОтвет: 4 м"), false); // в ветке есть решение
+  assert.equal(brief("№6\nЕсли в условии 28:\nЕсли в условии 23:\nОтвет: 4 м"), false);
+  assert.equal(brief("№6\nЕсли в условии 28:"), false);
+  assert.equal(brief("№6\nОтвет: 5\nОтвет: 7"), false); // два ответа без прочтений это решение по пунктам
+  assert.equal(brief("№6\nОтвет: 5\nЕсли в условии 23:\nОтвет: 4 м"), false);
+  assert.equal(brief(`№6\nЕсли в условии ${"длинное прочтение ".repeat(5)}:\nОтвет: 5\nЕсли в условии ${"другое прочтение ".repeat(5)}:\nОтвет: 7`), false); // список обрезал бы
+});
+
+test("информатика всегда с решением; решённое в прошлом ответе идёт строкой списка", () => {
+  for (const text of [PROMPT, PROMPT_OLYMP]) {
+    assert.ok(text.includes("Информатика исключение: в ней решение пиши всегда"));
+    assert.ok(text.includes("- Решение пиши всегда, даже в тесте и в части с кратким ответом ЕГЭ и ОГЭ"));
+    assert.ok(!text.includes("Решено выше"));
+    assert.ok(text.includes("заголовок «№3» и сразу строка «Ответ: …» с прежним ответом"));
+  }
+  // настоящий ответ бота: задания 5–7 были решены в прошлом ответе, у №6 два прочтения
+  const parts = ["№1\nОтвет: 22", "№5\nРешено выше.\nОтвет: 33",
+    "№6\nРешено выше.\nЕсли в условии алфавит из 82 563 символов:\nОтвет: 18390834\nЕсли в условии алфавит из 62 563 символов:\nОтвет: 19549921",
+    "№7\nРешено выше.\nОтвет: 15"];
+  assert.deepEqual(compose(parts, 4000), ["✅ Ответы\n№1: 22\n№5: 33\n№6: если алфавит из 82 563 символов: 18390834; если алфавит из 62 563 символов: 19549921\n№7: 15"]);
+  // прочтение числом или формулой подписано по-прежнему
+  assert.equal(card(["№1\nЕсли в условии 28:\nОтвет: 5 м\nЕсли в условии $f(1) = 2$:\nОтвет: 4 м", "№2\nОтвет: 1"]), "✅ Ответы\n№1: при 28: 5 м; при $f(1) = 2$: 4 м\n№2: 1");
+  // подпись не дублируется, если ответ уже начинается с неё
+  assert.equal(card(["№1\nЕсли в условии масса 5 кг:\nОтвет: если масса 5 кг: 10 Н", "№2\nОтвет: 1"]), "✅ Ответы\n№1: если масса 5 кг: 10 Н\n№2: 1");
+  // решение информатики с программой остаётся блоком под списком
+  const inf = ["№1\n2¹⁶ < 82 563 ≤ 2¹⁷, i = 17 бит\nОтвет: 17", "№2\n```python\nprint(sum(1 for x in range(100) if x % 7 == 0))\n```\nОтвет: 15"];
+  assert.deepEqual(inf.map(brief), [false, false]);
+  const out = compose(inf, 4000)[0];
+  assert.ok(out.startsWith("✅ Ответы\n№1: 17\n№2: 15\n") && out.includes("i = 17 бит") && out.includes("```python"));
 });
 
 test("тест уходит списком ответов, без повторения каждого задания блоком", () => {
@@ -246,7 +281,7 @@ test("инструкция после разбора критиков: новы�
 });
 
 test("два режима записи: обычный требует только формулы, олимпиадный подробную запись; общая часть одна", async () => {
-  const { PROMPT_OLYMP, promptFor, checkPromptFor, CHECK_PROMPT_OLYMP } = await import("../src/prompt.ts");
+  const { promptFor, checkPromptFor, CHECK_PROMPT_OLYMP } = await import("../src/prompt.ts");
   assert.equal(promptFor(), PROMPT);
   assert.equal(promptFor("plain"), PROMPT);
   assert.equal(promptFor("olymp"), PROMPT_OLYMP);
