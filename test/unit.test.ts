@@ -668,3 +668,17 @@ test("единица с косой чертой не рвётся и держи�
   assert.ok(!inline("ответ 3/4 или 1/2").includes('class="nb"'));
   assert.ok(!inline("файл data/input/17.txt").includes('class="nb">data'));
 });
+
+test("дробь из чисел с пробелом между разрядами пишется делением, без скобок вокруг числа", () => {
+  assert.equal(plainText("$i = \\dfrac{I}{K} = \\dfrac{24\\,576}{4096} = 6$ бит"), "i = I/K = 24 576 : 4096 = 6 бит");
+  assert.equal(plainText("$\\dfrac{131\\,072}{32\\,768} = 4$"), "131 072 : 32 768 = 4");
+  assert.equal(plainText("$2 \\cdot \\dfrac{24\\,576}{4096}$"), "2 · 24 576 : 4096");
+  // там, где порядок действий изменился бы, деление стоит в скобках
+  assert.equal(plainText("$8 : \\dfrac{24\\,576}{4096}$"), "8 : (24 576 : 4096)");
+  assert.equal(plainText("$\\dfrac{1\\,000}{3}x$"), "(1 000 : 3)x");
+  // обычные дроби записаны по-прежнему
+  assert.equal(plainText("$\\dfrac{24576}{4096}$"), "24576/4096");
+  assert.equal(plainText("$2\\dfrac{1}{3}$"), "2 1/3");
+  assert.equal(plainText("$\\dfrac{5 \\cdot 4}{2}$"), "(5 · 4)/2");
+  assert.equal(plainText("$\\dfrac{1\\,000 + x}{3}$"), "(1 000 + x)/3");
+});
