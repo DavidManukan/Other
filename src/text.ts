@@ -57,7 +57,7 @@ export function splitAnswer(raw: string): { text: string; svgs: string[] } {
     let t = piece.replace(drawn(), (m) => (svgs.push(m), ""));
     if (i === last) t = t.replace(new RegExp(`${DRAWING}[\\s\\S]*$`, "i"), ""); // недописанный рисунок в самом конце
     // запись формул приводим к одному виду («$…$» в одной строке) здесь, один раз для страниц, подписи и текста
-    return normalizeMath(t.replace(/\*\*([^*\n]+)\*\*/g, "$1").replace(/^#{1,6}\s+/gm, ""));
+    return normalizeMath(t.replace(/\*\*([^*\n]+)\*\*/g, "$1").replace(/^([ \t]*)(?:\*|__)Ответ:?(?:\*|__):?/gm, "$1Ответ:").replace(/^#{1,6}\s+/gm, ""));
   }).join("").replace(/\n{3,}/g, "\n\n").trim();
   return { text, svgs };
 }
@@ -260,16 +260,17 @@ function answersOf(rows: string[]): string[] {
     const a = answerAt(rows, i);
     // отсылку «в решении» убираем у каждого ответа отдельно: «да» рядом с «в решении.» остаётся в списке
     const v = a.value ? valueOf(a.value) : null;
-    // словами названо и прочтение с предлогом или в кавычках: «в алфавите 64 символа», «„алфавит из 64“»
-    const lead = /^[«"„(]?(?:[а-яё]\s+)?[а-яё]{2,}/i.test(branch) ? "если" : "при";
-    if (v) answers.push(branch && !v.startsWith(`при ${branch}`) && !v.startsWith(`если ${branch}`) ? `${lead} ${branch}: ${v}` : v);
+    // словами названо и прочтение с предлогом или в кавычках: «в алфавите 64 символа», «в 28», «„алфавит из 64“»
+    const lead = /^[«"„(]?(?:[вскуо]\s+\S|[а-яё]{2,})/i.test(branch) ? "если" : "при";
+    const low = v?.toLowerCase() ?? "", label = branch.toLowerCase();
+    if (v) answers.push(branch && !low.startsWith(`при ${label}`) && !low.startsWith(`если ${label}`) ? `${lead} ${branch}: ${v}` : v);
     branch = "";
     i = a.last;
   }
   return answers;
 }
 // несколько ответов идут через «;», точка в конце каждого перед ним не нужна
-const joined = (answers: string[]): string => (answers.length > 1 ? answers.map((a, k) => (k < answers.length - 1 ? a.replace(/[.;]+$/, "") : a)).join("; ") : answers[0] ?? "");
+const joined = (answers: string[]): string => (answers.length > 1 ? answers.map((a, k) => (k < answers.length - 1 ? a.replace(/(?<!\.)\.$|;+$/, "") : a)).join("; ") : answers[0] ?? "");
 
 // Заголовок задания в виде ключа: по нему исправленное задание встаёт на место прежнего, а рисунок находит своё задание
 // (точка внутри номера остаётся: «№1.2» и «№12» это разные задания)
@@ -458,6 +459,12 @@ function valueOf(answer: string): string | null {
   const tail = m[1].trim(), rest = a.slice(0, m.index + (/^[.!?]/.test(m[0]) ? 1 : 0)).trim();
   if (!rest) return null;
   if (tail && !POINTER.test(tail)) return answer;
+  // хвост стоял внутри скобки, которая открыта раньше: срезаем её целиком, если и она начинается со слова-отсылки
+  const open = rest.lastIndexOf("(");
+  if (open > rest.lastIndexOf(")")) {
+    const before = rest.slice(0, open).trim();
+    return before && POINTER.test(rest.slice(open + 1).trim()) ? before : answer;
+  }
   if (!tail && !VALUE.test(rest) && STUFF.test(rest)) return null; // «электронный баланс и уравнение – в решении.»
   return /[.!?…]$/.test(rest) ? rest : rest + m[2];
 }

@@ -681,4 +681,13 @@ test("дробь из чисел с пробелом между разрядам
   assert.equal(plainText("$2\\dfrac{1}{3}$"), "2 1/3");
   assert.equal(plainText("$\\dfrac{5 \\cdot 4}{2}$"), "(5 · 4)/2");
   assert.equal(plainText("$\\dfrac{1\\,000 + x}{3}$"), "(1 000 + x)/3");
+  // после буквы, степени, скобки дробь это множитель: число остаётся в своих скобках, как раньше
+  assert.equal(plainText("$x\\dfrac{24\\,576}{4096}$"), "x(24 576)/4096");
+  assert.equal(plainText("$2^3\\dfrac{1\\,000}{8}$"), "2³(1 000)/8");
+  assert.equal(plainText("$(2+3)\\dfrac{1\\,000}{8}$"), "(2+3)(1 000)/8");
+  assert.equal(plainText("$\\pi\\dfrac{1\\,000}{8}$"), "π(1 000)/8");
+  // после знака и перед косой чертой порядок действий не меняется
+  assert.equal(plainText("$1 - \\dfrac{24\\,576}{4096}$"), "1 − 24 576 : 4096");
+  assert.equal(plainText("$\\dfrac{24\\,576}{4096} / 3$"), "(24 576 : 4096) / 3");
+  assert.equal(plainText("$\\dfrac{30\\,720\\,000}{8}$ байт"), "30 720 000 : 8 байт");
 });
