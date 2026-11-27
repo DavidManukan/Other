@@ -93,6 +93,11 @@ const KNOWN = new Set<string>([...Object.keys(SYM), ...WRAP, ...TWO, ...THREE, .
 const map = (s: string, m: Record<string, string>) => [...s].every((c) => c in m) ? [...s].map((c) => m[c]).join("") : null;
 const simple = (s: string) => /^[\p{L}\p{N}.,°′√∞π⁰¹²³⁴-⁹₀-₉ₐₑₒₓₙₘₖₜᵢⱼⁿ]*$/u.test(s) || /^\([^()]*\)(?:[⁰¹²³⁴-⁹ⁿ]+|\^\d+|\^\{[^{}]*\})?$/.test(s) || /^√\([^()]*\)$/.test(s) || /^\p{L}+\([^()]*\)$/u.test(s);
 const paren = (s: string) => (simple(s) ? s : `(${s})`);
+// число с пробелом между разрядами («24 576», «1 000,5») и число вообще
+const GROUPED = /^\d{1,3}(?:\s\d{3})+(?:,\d+)?$/;
+const NUMBER = /^\d+(?:\s\d{3})*(?:,\d+)?$/;
+// перед дробью пусто или знак действия, сравнения, открывающая скобка
+const AFTER_SIGN = /(?:^|[=+−\-·×(≈<>≤≥≠,;:\/÷])\s*$/;
 // Знаменатель без скобок только если это одно число, одна буква или имя отрезка: a/2a читалось бы неверно
 const below = (s: string) => (/^(\d+(,\d+)?|\p{Lu}+[₀-₉]*|\p{L}[⁰¹²³⁴-⁹₀-₉ₐₑₒₓₙₘₖₜᵢⱼⁿ]*|d\p{Ll}|\p{L}+\([^()]*\)|√\d+|π)$/u.test(s) || /^\([^()]*\)(?:[⁰¹²³⁴-⁹ⁿ]+|\^\d+|\^\{[^{}]*\})?$/.test(s) ? s : `(${s})`); // «(R+h)²» уже в своих скобках
 // После дроби сразу идёт множитель (буква, число, скобка, корень, степень): без скобок «1/2x» читалось бы как деление на 2x
@@ -173,9 +178,17 @@ function conv(s: string): string {
       if (name === "frac" || name === "dfrac" || name === "tfrac" || name === "cfrac" || name === "sfrac" || name === "nicefrac") {
         const fn = AFTER_FN.test(out);
         const a = group(), b = group();
-        const f = `${paren(a)}/${below(b)}`;
-        // смешанное число: 2\dfrac{1}{3} это «2 1/3», а не «21/3»
-        out += (/\d$/.test(out) && /^\d/.test(f) ? " " : "") + (fn || factorNext(s.slice(i)) ? `(${f})` : f);
+        if ((GROUPED.test(a) || GROUPED.test(b)) && NUMBER.test(a) && NUMBER.test(b) && AFTER_SIGN.test(out)) {
+          // оба числа простые, но хотя бы одно записано с пробелом между разрядами: скобки вокруг него читались бы хуже,
+          // а без скобок «24 576/4096» похоже на смешанное число. Пишем деление знаком «:», как в школьной строчной записи.
+          // Только там, где перед дробью стоит знак (или ничего): после буквы, степени, скобки дробь это множитель,
+          // и число без своих скобок приклеилось бы к нему. Рядом с другим делением «a : b» берём в скобки.
+          out += fn || factorNext(s.slice(i)) || /[:\/÷]\s*$/.test(out) || /^\s*\//.test(s.slice(i)) ? `(${a} : ${b})` : `${a} : ${b}`;
+        } else {
+          const f = `${paren(a)}/${below(b)}`;
+          // смешанное число: 2\dfrac{1}{3} это «2 1/3», а не «21/3»
+          out += (/\d$/.test(out) && /^\d/.test(f) ? " " : "") + (fn || factorNext(s.slice(i)) ? `(${f})` : f);
+        }
       }
       else if (name === "sqrt") { const n = optional(), x = group(); out += (n === null || n === "2" ? "√" : n === "3" ? "∛" : n === "4" ? "∜" : (map(n, SUP) ?? `(${n})`) + "√") + (/^[\p{L}\p{N},]+$/u.test(x) ? x + (afterRoot(s.slice(i)) ? "·" : "") : `(${x})`); }
       else if (name === "mathbb" || name === "Bbb") { const x = group(); out += BB[x] ?? x; }

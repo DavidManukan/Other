@@ -57,7 +57,7 @@ export function splitAnswer(raw: string): { text: string; svgs: string[] } {
     let t = piece.replace(drawn(), (m) => (svgs.push(m), ""));
     if (i === last) t = t.replace(new RegExp(`${DRAWING}[\\s\\S]*$`, "i"), ""); // недописанный рисунок в самом конце
     // запись формул приводим к одному виду («$…$» в одной строке) здесь, один раз для страниц, подписи и текста
-    return normalizeMath(t.replace(/\*\*([^*\n]+)\*\*/g, "$1").replace(/^#{1,6}\s+/gm, ""));
+    return normalizeMath(t.replace(/\*\*([^*\n]+)\*\*/g, "$1").replace(/^([ \t]*)(?:\*|__)Ответ:?(?:\*|__):?/gm, "$1Ответ:").replace(/^#{1,6}\s+/gm, ""));
   }).join("").replace(/\n{3,}/g, "\n\n").trim();
   return { text, svgs };
 }
@@ -211,13 +211,66 @@ export function answerAt(rows: string[], i: number): { value: string; last: numb
 
 // Задание из одного заголовка и строки ответа (тест, краткий ответ): в списке ответов оно видно целиком,
 // отдельным блоком его не повторяем. Длинный ответ список обрезал бы, поэтому такое задание кратким не считается.
+// Задание с двумя прочтениями («Если в условии 28:» и ответ под каждым) тоже краткое: оба ответа стоят в списке.
+// Пометка «Решено выше.» читателю ничего не даёт: с ней задание остаётся строкой списка, а не отдельным блоком.
+// Правило осторожное: кратким считается только задание, которое список показывает целиком. Строки берём те же,
+// что и список (с пустыми: на пустой строке ответ кончается), и любая строка, которой в списке не будет, оставляет задание блоком.
+const DONE = /^решено\s+(?:выше|ранее|раньше)[.!]?$/i;
+// строка прочтения целиком: двоеточие внутри неё («отношение 3:4») остаётся в подписи
+const LABEL = /^Если в условии\s+(.+):$/;
 export function brief(part: string): boolean {
   if (part.includes("```")) return false;
-  const rows = part.split("\n").map((l) => l.trim()).filter(Boolean);
-  if (rows.length < 2 || rows.length > 4 || !HEAD.test(rows[0]) || rows[0].replace(/[:.]+$/, "").length > 40 || !/^Ответ:/.test(rows[1])) return false;
-  const a = answerAt(rows, 1);
-  return a.last === rows.length - 1 && a.value.length > 0 && a.value.length <= 140;
+  const rows = part.split("\n").map((l) => l.trim());
+  const first = rows.findIndex(Boolean);
+  if (first < 0 || !HEAD.test(rows[first]) || rows[first].replace(/[:.]+$/, "").length > 40) return false;
+  let done = false, labelled = 0, bare = 0;
+  for (let i = first + 1; i < rows.length; i++) {
+    if (!rows[i]) continue;
+    if (DONE.test(rows[i])) {
+      done = true;
+      continue;
+    }
+    if (LABEL.test(rows[i])) {
+      labelled++;
+      i++;
+    } else bare++;
+    if (i >= rows.length || !/^Ответ:/.test(rows[i])) return false;
+    const a = answerAt(rows, i);
+    if (!a.value) return false;
+    i = a.last;
+  }
+  const count = labelled + bare;
+  if (!count) return done; // «№3» и «Решено выше.»: в списке стоит «решено выше»
+  if (bare && (bare > 1 || labelled)) return false; // два ответа без прочтений это уже решение по пунктам, а не строка теста
+  // каждый ответ дошёл до списка (отсылка «программа в решении» туда не идёт), и список его не обрежет
+  const answers = answersOf(rows);
+  return answers.length === count && joined(answers).length <= 140;
 }
+
+// Ответы задания в том виде, в каком они стоят в списке. Прочтение неразборчивого условия («Если в условии 28:»)
+// подписывает свой ответ: «при 28: 5 м». Прочтение, названное словами, после «при» стояло бы не в том падеже,
+// поэтому оно идёт с «если»: «если алфавит из 64 символов: 300».
+function answersOf(rows: string[]): string[] {
+  const answers: string[] = [];
+  let branch = "";
+  for (let i = 0; i < rows.length; i++) {
+    const b = LABEL.exec(rows[i]) ?? /^Если в условии\s+(.+?):/.exec(rows[i]);
+    if (b) branch = b[1];
+    if (!/^Ответ:/.test(rows[i])) continue;
+    const a = answerAt(rows, i);
+    // отсылку «в решении» убираем у каждого ответа отдельно: «да» рядом с «в решении.» остаётся в списке
+    const v = a.value ? valueOf(a.value) : null;
+    // словами названо и прочтение с предлогом или в кавычках: «в алфавите 64 символа», «в 28», «„алфавит из 64“»
+    const lead = /^[«"„(]?(?:[вскуо]\s+\S|[а-яё]{2,})/i.test(branch) ? "если" : "при";
+    const low = v?.toLowerCase() ?? "", label = branch.toLowerCase();
+    if (v) answers.push(branch && !low.startsWith(`при ${label}`) && !low.startsWith(`если ${label}`) ? `${lead} ${branch}: ${v}` : v);
+    branch = "";
+    i = a.last;
+  }
+  return answers;
+}
+// несколько ответов идут через «;», точка в конце каждого перед ним не нужна
+const joined = (answers: string[]): string => (answers.length > 1 ? answers.map((a, k) => (k < answers.length - 1 ? a.replace(/(?<!\.)\.$|;+$/, "") : a)).join("; ") : answers[0] ?? "");
 
 // Заголовок задания в виде ключа: по нему исправленное задание встаёт на место прежнего, а рисунок находит своё задание
 // (точка внутри номера остаётся: «№1.2» и «№12» это разные задания)
@@ -307,23 +360,9 @@ export function card(parts: string[], title = "✅ Ответы"): string {
   const lines = parts.map((p, n) => {
     const rows = p.replace(/```[\s\S]*?```/g, "").split("\n").map((l) => l.trim());
     const head = (rows.find((l) => HEAD.test(l) && l.length <= 60) ?? `Задание ${n + 1}`).replace(/[:.]+$/, "").slice(0, 40);
-    const answers: string[] = [];
-    let branch = ""; // прочтение неразборчивого условия («Если в условии 28:»), к которому относится следующий ответ
-    for (let i = 0; i < rows.length; i++) {
-      const b = /^Если в условии\s+(.+?):/.exec(rows[i]);
-      if (b) branch = b[1];
-      if (!/^Ответ:/.test(rows[i])) continue;
-      const a = answerAt(rows, i);
-      // отсылку «в решении» убираем у каждого ответа отдельно: «да» рядом с «в решении.» остаётся в списке
-      const v = a.value ? valueOf(a.value) : null;
-      if (v) answers.push(branch && !v.startsWith(`при ${branch}`) ? `при ${branch}: ${v}` : v);
-      branch = "";
-      i = a.last;
-    }
     // задания без ответа: условие не видно целиком (нужно переснять) или это доказательство
-    // несколько ответов идут через «;», точка в конце каждого перед ним не нужна
-    let answer = answers.length > 1 ? answers.map((a, k) => (k < answers.length - 1 ? a.replace(/[.;]+$/, "") : a)).join("; ") : answers[0]
-      ?? (rows.some((l) => /^Не видно:/.test(l)) ? "не видно условия, пересними ближе" : rows.some((l) => /решено выше/i.test(l)) ? "решено выше" : "см. решение");
+    let answer = joined(answersOf(rows))
+      || (rows.some((l) => /^Не видно:/.test(l)) ? "не видно условия, пересними ближе" : rows.some((l) => DONE.test(l) || /решено выше/i.test(l)) ? "решено выше" : "см. решение");
     // («уравнения 1)–4) в решении.» в списке ничего не говорит: такой ответ выше отброшен, и здесь стоит «см. решение»)
     if (answer.length > 140) {
       // режем по смыслу: после целого пункта, иначе после запятой, и только потом по слову
@@ -420,6 +459,12 @@ function valueOf(answer: string): string | null {
   const tail = m[1].trim(), rest = a.slice(0, m.index + (/^[.!?]/.test(m[0]) ? 1 : 0)).trim();
   if (!rest) return null;
   if (tail && !POINTER.test(tail)) return answer;
+  // хвост стоял внутри скобки, которая открыта раньше: срезаем её целиком, если и она начинается со слова-отсылки
+  const open = rest.lastIndexOf("(");
+  if (open > rest.lastIndexOf(")")) {
+    const before = rest.slice(0, open).trim();
+    return before && POINTER.test(rest.slice(open + 1).trim()) ? before : answer;
+  }
   if (!tail && !VALUE.test(rest) && STUFF.test(rest)) return null; // «электронный баланс и уравнение – в решении.»
   return /[.!?…]$/.test(rest) ? rest : rest + m[2];
 }
